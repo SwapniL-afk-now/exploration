@@ -92,6 +92,8 @@ class FEPOSingleGPUConfig:
     vllm_max_num_seqs: int = 16
     vllm_client_concurrency: int = 1
     loss_micro_batch_size: int = 8
+    max_token_per_micro_batch: int = 8192  # Token budget for dynamic batching
+    use_token_based_batching: bool = False  # Toggle between fixed sample vs token-based batching
     console_sample_count: int = 3
     vllm_attention_backend: str = "XFORMERS"
     request_timeout_s: int = 240
@@ -396,6 +398,45 @@ class FEPOSingleGPUTrainer:
             return torch.cat([tensor.to(device=device) for tensor in tensors], dim=0)
         return torch.cat([tensor.to(device=device, dtype=dtype) for tensor in tensors], dim=0)
 
+    def _compute_token_budget_batches(
+        self,
+        items: list[dict[str, Any]],
+        valid_indices: list[int],
+    ) -> list[list[int]]:
+        """Split items by token budget instead of fixed sample count.
+        
+        Returns list of index lists, each batch under max_token_per_micro_batch tokens.
+        """
+        if not self.config.use_token_based_batching:
+            # Fall back to fixed sample count batching
+            micro_batch_size = max(1, int(self.config.loss_micro_batch_size))
+            return [valid_indices[i:i + micro_batch_size] for i in range(0, len(valid_indices), micro_batch_size)]
+        
+        max_tokens = self.config.max_token_per_micro_batch
+        batches = []
+        current_batch = []
+        current_tokens = 0
+        
+        for idx in valid_indices:
+            item = items[idx]
+            token_count = int(item.get("valid_token_count", 0))
+            if not token_count:
+                continue
+                
+            # If adding this item exceeds budget and we have items, start new batch
+            if current_tokens + token_count > max_tokens and current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+            
+            current_batch.append(idx)
+            current_tokens += token_count
+        
+        if current_batch:
+            batches.append(current_batch)
+        
+        return batches if batches else [valid_indices[:1]]  # Ensure at least one batch
+
     def detached_adapter_completion_logprobs(self, adapter_name: str, encoded: dict[str, Any]) -> torch.Tensor:
         self.set_active_adapter(adapter_name, train=False)
         with torch.no_grad():
@@ -691,9 +732,9 @@ class FEPOSingleGPUTrainer:
         if not active_indices:
             return records
 
-        micro_batch_size = max(1, int(self.config.loss_micro_batch_size))
-        for chunk_start in range(0, len(active_indices), micro_batch_size):
-            chunk_indices = active_indices[chunk_start : chunk_start + micro_batch_size]
+        # Use token-budget batching if enabled, otherwise fixed sample count
+        batch_chunks = self._compute_token_budget_batches(items, active_indices)
+        for chunk_indices in batch_chunks:
             chunk_items = [items[idx] for idx in chunk_indices]
             encoded_items = [item["encoded"] for item in chunk_items]
 

@@ -62,6 +62,8 @@ vllm_lora_name: train_lora
 launch_vllm: true
 vllm_gpu_memory_utilization: 0.45
 loss_micro_batch_size: 8
+max_token_per_micro_batch: 8192
+use_token_based_batching: false
 console_sample_count: 3
 vllm_client_concurrency: 1
 vllm_max_num_seqs: 32
