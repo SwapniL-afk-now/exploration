@@ -1,0 +1,13 @@
+defaults:
+  - fepo_trainer
+  - _self_
+
+model_id: Qwen/Qwen2.5-7B-Instruct
+output_dir: checkpoints/fepo/qwen25_7b
+lora_r: 64
+lora_alpha: 128
+train_prompt_batch_size: 1
+num_generations: 8
+vllm_gpu_memory_utilization: 0.30
+vllm_max_num_seqs: 16
+experiment_name: qwen25-7b-fepo-single-gpu

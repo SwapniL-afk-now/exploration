@@ -1,0 +1,13 @@
+defaults:
+  - fepo_trainer
+  - _self_
+
+model_id: Qwen/Qwen2.5-3B-Instruct
+output_dir: checkpoints/fepo/qwen25_3b
+lora_r: 128
+lora_alpha: 256
+train_prompt_batch_size: 1
+num_generations: 8
+vllm_gpu_memory_utilization: 0.35
+vllm_max_num_seqs: 16
+experiment_name: qwen25-3b-fepo-single-gpu
