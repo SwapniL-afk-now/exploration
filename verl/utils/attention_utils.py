@@ -14,7 +14,31 @@
 
 from typing import Callable
 
+import torch
+from einops import rearrange as _einops_rearrange
+
 _index_first_axis, _pad_input, _rearrange, _unpad_input = None, None, None, None
+
+
+def _torch_index_first_axis(a, indices):
+    return a.index_select(0, indices.to(device=a.device, dtype=torch.long))
+
+
+def _torch_unpad_input(hidden_states, attention_mask):
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten().to(torch.int64)
+    batch_size, seqlen = attention_mask.shape
+    hidden_states = hidden_states.reshape(batch_size * seqlen, *hidden_states.shape[2:])
+    hidden_states_unpad = _torch_index_first_axis(hidden_states, indices)
+    cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    max_seqlen_in_batch = int(seqlens_in_batch.max().item()) if seqlens_in_batch.numel() else 0
+    return hidden_states_unpad, indices, cu_seqlens, max_seqlen_in_batch
+
+
+def _torch_pad_input(hidden_states, indices, batch_size, seqlen):
+    output = hidden_states.new_zeros((batch_size * seqlen, *hidden_states.shape[1:]))
+    output.index_copy_(0, indices.to(device=hidden_states.device, dtype=torch.long), hidden_states)
+    return output.reshape(batch_size, seqlen, *hidden_states.shape[1:])
 
 
 def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
@@ -27,7 +51,13 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
     if is_torch_npu_available(check_device=False):
         from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
     else:
-        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        try:
+            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        except ModuleNotFoundError:
+            index_first_axis = _torch_index_first_axis
+            pad_input = _torch_pad_input
+            rearrange = _einops_rearrange
+            unpad_input = _torch_unpad_input
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 

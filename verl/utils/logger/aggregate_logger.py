@@ -18,18 +18,69 @@ A Ray logger will receive logging info from different processes.
 import datetime
 import logging
 import numbers
+import os
 import pprint
 
 import torch
 
 
 def concat_dict_to_str(dict: dict, step):
+    if os.environ.get("VERL_CONSOLE_FULL_METRICS", "0") == "1":
+        output = [f"step:{step}"]
+        for k, v in dict.items():
+            if isinstance(v, numbers.Number):
+                output.append(f"{k}:{pprint.pformat(v)}")
+        return " - ".join(output)
+
+    preferred = [
+        "actor/loss",
+        "actor/pg_loss",
+        "actor/kl_loss",
+        "actor/grad_norm",
+        "actor/entropy",
+        "fepo/solver_loss",
+        "fepo/solver_pg_loss",
+        "fepo/failure_sft_loss",
+        "solver_grad_norm",
+        "failure_grad_norm",
+        "train/accuracy",
+        "train/failure_rate",
+        "train/pass_at_1",
+        "train/pass_at_8",
+        "train/unique_answer_ratio_at_k",
+        "train/exploration_collapse_rate",
+        "val/amc23/pass_at_1",
+        "val/amc23/pass_at_8",
+        "val/amc23/avg_at_k",
+        "val/amc23/maj_at_8",
+        "perf/time_per_step",
+        "perf/step_seconds",
+        "perf/responses_per_second",
+        "timing_s/step",
+    ]
     output = [f"step:{step}"]
-    for k, v in dict.items():
-        if isinstance(v, numbers.Number):
-            output.append(f"{k}:{pprint.pformat(v)}")
-    output_str = " - ".join(output)
-    return output_str
+    seen = set()
+    for k in preferred:
+        if k in dict and isinstance(dict[k], numbers.Number):
+            output.append(f"{k}:{float(dict[k]):.4g}")
+            seen.add(k)
+
+    val_suffixes = {"pass_at_1", "pass_at_8", "avg_at_k", "maj_at_8"}
+    for k in sorted(dict):
+        parts = k.split("/")
+        if len(parts) == 3 and parts[0] == "val" and parts[2] in val_suffixes and k not in seen:
+            v = dict[k]
+            if isinstance(v, numbers.Number):
+                output.append(f"{k}:{float(v):.4g}")
+                seen.add(k)
+
+    if len(output) == 1:
+        for k, v in dict.items():
+            if isinstance(v, numbers.Number):
+                output.append(f"{k}:{float(v):.4g}")
+                if len(output) >= 12:
+                    break
+    return " - ".join(output)
 
 
 class LocalLogger:

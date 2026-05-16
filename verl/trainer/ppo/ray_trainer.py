@@ -21,6 +21,9 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import math
+import re
+from collections import Counter
 from collections import defaultdict
 from pprint import pprint
 from typing import Any, Optional
@@ -427,6 +430,68 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _print_generation_samples(self, inputs, outputs, gts, scores, *, label: str, sample_count: int = 3):
+        """Print a compact rollout preview for console-only monitoring."""
+        n = min(sample_count, len(outputs))
+        if n <= 0:
+            return
+
+        correct = sum(float(score > 0) for score in scores)
+        batch_acc = correct / len(scores) if scores else 0.0
+        for i in range(n):
+            response_preview = " ".join(str(outputs[i]).split())[:360]
+            prompt_preview = " ".join(str(inputs[i]).split())[:180]
+            print(
+                f"{label} sample step={self.global_steps} sample_index={i} "
+                f"batch_acc={batch_acc:.3f} score={float(scores[i]):.3f} "
+                f"gt={gts[i]} prompt={prompt_preview} response={response_preview}",
+                flush=True,
+            )
+
+    def _print_metric_summary(self, label: str, metrics: dict, step: int) -> None:
+        """Print a compact progress line with the metrics humans watch live."""
+        if not metrics:
+            return
+        preferred = [
+            "actor/loss",
+            "actor/pg_loss",
+            "actor/kl_loss",
+            "actor/grad_norm",
+            "actor/entropy",
+            "train/accuracy",
+            "train/failure_rate",
+            "train/pass_at_1",
+            "train/pass_at_8",
+            "train/unique_answer_ratio_at_k",
+            "train/exploration_collapse_rate",
+            "val/amc23/pass_at_1",
+            "val/amc23/pass_at_8",
+            "val/amc23/avg_at_k",
+            "val/amc23/maj_at_8",
+            "perf/time_per_step",
+            "timing_s/step",
+        ]
+        parts = [f"progress {label} step={step}"]
+        seen = set()
+        for key in preferred:
+            if key in metrics:
+                value = metrics[key]
+                if isinstance(value, (int, float, np.floating, np.integer)):
+                    parts.append(f"{key}={float(value):.4g}")
+                else:
+                    parts.append(f"{key}={value}")
+                seen.add(key)
+
+        val_suffixes = {"pass_at_1", "pass_at_8", "avg_at_k", "maj_at_8"}
+        for key in sorted(metrics):
+            key_parts = key.split("/")
+            if len(key_parts) == 3 and key_parts[0] == "val" and key_parts[2] in val_suffixes and key not in seen:
+                value = metrics[key]
+                if isinstance(value, (int, float, np.floating, np.integer)):
+                    parts.append(f"{key}={float(value):.4g}")
+                    seen.add(key)
+        print(" | ".join(parts), flush=True)
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -451,6 +516,8 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+
+            self._print_generation_samples(inputs, outputs, sample_gts, scores, label="rollout")
 
             self._dump_generations(
                 inputs=inputs,
@@ -611,6 +678,14 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            self._print_generation_samples(
+                sample_inputs,
+                sample_outputs,
+                sample_gts,
+                sample_scores,
+                label="validation",
+                sample_count=self.config.trainer.log_val_generations or 3,
+            )
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -632,11 +707,160 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns, sample_outputs)
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+
+    def _text_repetition_rate(self, text: str, ngram: int = 4) -> float:
+        tokens = re.findall(r"\S+", str(text).lower())
+        if len(tokens) < ngram * 2:
+            return 0.0
+        ngrams = [tuple(tokens[i : i + ngram]) for i in range(len(tokens) - ngram + 1)]
+        return float(1.0 - (len(set(ngrams)) / len(ngrams))) if ngrams else 0.0
+
+    def _entropy_from_counts(self, counts: dict[str, int]) -> float:
+        total = sum(counts.values())
+        if total <= 0:
+            return 0.0
+        entropy = 0.0
+        for count in counts.values():
+            if count <= 0:
+                continue
+            p = count / total
+            entropy -= p * math.log(p)
+        return float(entropy)
+
+    def _compute_grouped_accuracy_metrics(self, data_sources, sample_uids, reward_extra_infos_dict, prefix: str, outputs=None):
+        """Create FEPO-compatible pass@K/avg@K/maj@K and exploration metrics."""
+        acc_values = reward_extra_infos_dict.get("acc") or reward_extra_infos_dict.get("score") or []
+        pred_values = reward_extra_infos_dict.get("pred") or []
+        outputs = outputs or []
+        groups: dict[str, dict[str, list]] = {}
+        for idx, uid in enumerate(sample_uids):
+            source = str(data_sources[idx]) if idx < len(data_sources) else "unknown"
+            key = f"{source}\t{uid}"
+            group = groups.setdefault(key, {"source": source, "acc": [], "pred": [], "output": []})
+            if idx < len(acc_values):
+                acc = acc_values[idx]
+                group["acc"].append(float(acc > 0 if isinstance(acc, (int, float, np.floating, np.integer)) else bool(acc)))
+            if idx < len(pred_values):
+                pred = pred_values[idx]
+                group["pred"].append(str(pred if pred is not None else "<unparsed>"))
+            if idx < len(outputs):
+                group["output"].append(str(outputs[idx]))
+
+        by_source: dict[str, list[dict[str, list]]] = {}
+        for group in groups.values():
+            by_source.setdefault(group["source"], []).append(group)
+
+        metrics = {}
+        cutoffs = (1, 4, 8, 16)
+        for source, source_groups in by_source.items():
+            prompt_total = len(source_groups)
+            generation_total = sum(len(group["acc"]) for group in source_groups)
+            correct_total = sum(sum(group["acc"]) for group in source_groups)
+            unique_response_rates = []
+            unique_answer_rates = []
+            answer_entropies = []
+            majority_shares = []
+            collapse_flags = []
+            reward_stds = []
+            repetition_rates = []
+            response_lengths = []
+            all_wrong = 0.0
+            all_correct = 0.0
+            mixed = 0.0
+            pass_counts = {cutoff: 0.0 for cutoff in cutoffs}
+            maj_counts = {cutoff: 0.0 for cutoff in cutoffs}
+            for group in source_groups:
+                vals = group["acc"]
+                preds = group["pred"]
+                outputs_group = group["output"]
+                if vals:
+                    all_wrong += float(not any(vals))
+                    all_correct += float(all(vals))
+                    mixed += float(any(vals) and not all(vals))
+                    mean_val = sum(vals) / len(vals)
+                    reward_stds.append((sum((val - mean_val) ** 2 for val in vals) / len(vals)) ** 0.5)
+                if outputs_group:
+                    unique_response_rates.append(len(set(outputs_group)) / len(outputs_group))
+                    repetition_rates.extend(self._text_repetition_rate(output) for output in outputs_group)
+                    response_lengths.extend(float(len(output.split())) for output in outputs_group)
+                if preds:
+                    counts = dict(Counter(preds))
+                    unique_answer_rates.append(len(counts) / len(preds))
+                    answer_entropies.append(self._entropy_from_counts(counts))
+                    majority_shares.append(max(counts.values()) / len(preds))
+                    collapse_flags.append(float(len(counts) <= 1))
+                for cutoff in cutoffs:
+                    subset_vals = vals[:cutoff]
+                    subset_preds = preds[:cutoff]
+                    pass_counts[cutoff] += float(any(value > 0.0 for value in subset_vals)) if subset_vals else 0.0
+                    if subset_vals and subset_preds:
+                        pred_counts = Counter(subset_preds)
+                        majority_answer = sorted(pred_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+                        maj_counts[cutoff] += float(
+                            any(pred == majority_answer and value > 0.0 for pred, value in zip(subset_preds, subset_vals, strict=False))
+                        )
+
+            def mean(values):
+                return float(sum(values) / len(values)) if values else 0.0
+
+            def std(values):
+                if not values:
+                    return 0.0
+                avg = mean(values)
+                return float((sum((value - avg) ** 2 for value in values) / len(values)) ** 0.5)
+
+            base = f"{prefix}/{source}"
+            metrics[f"{base}/avg_at_k"] = float(correct_total / generation_total) if generation_total else 0.0
+            metrics[f"{base}/total_prompts"] = int(prompt_total)
+            metrics[f"{base}/total_generations"] = int(generation_total)
+            for cutoff in cutoffs:
+                metrics[f"{base}/pass_at_{cutoff}"] = float(pass_counts[cutoff] / prompt_total) if prompt_total else 0.0
+                metrics[f"{base}/maj_at_{cutoff}"] = float(maj_counts[cutoff] / prompt_total) if prompt_total else 0.0
+            metrics[f"{base}/pass_at_k"] = metrics[f"{base}/pass_at_{max(cutoffs)}"]
+            metrics[f"{base}/maj_at_k"] = metrics[f"{base}/maj_at_{max(cutoffs)}"]
+            metrics[f"{base}/unique_response_ratio_at_k"] = mean(unique_response_rates)
+            metrics[f"{base}/unique_answer_ratio_at_k"] = mean(unique_answer_rates)
+            metrics[f"{base}/answer_entropy_at_k"] = mean(answer_entropies)
+            metrics[f"{base}/exploration_unique_prediction_rate"] = mean(unique_answer_rates)
+            metrics[f"{base}/exploration_majority_prediction_share"] = mean(majority_shares)
+            metrics[f"{base}/exploration_collapse_rate"] = mean(collapse_flags)
+            metrics[f"{base}/exploration_reward_std_mean"] = mean(reward_stds)
+            metrics[f"{base}/all_wrong_group_rate"] = float(all_wrong / prompt_total) if prompt_total else 0.0
+            metrics[f"{base}/all_correct_group_rate"] = float(all_correct / prompt_total) if prompt_total else 0.0
+            metrics[f"{base}/mixed_group_rate"] = float(mixed / prompt_total) if prompt_total else 0.0
+            metrics[f"{base}/response_length_mean"] = mean(response_lengths)
+            metrics[f"{base}/response_length_std"] = std(response_lengths)
+            metrics[f"{base}/repetition_rate"] = mean(repetition_rates)
+        return metrics
+
+    def _compute_train_comparison_metrics(self, batch: DataProto) -> dict[str, float | int]:
+        scores = batch.batch["token_level_scores"].sum(-1).detach().cpu().float().tolist()
+        uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [])]
+        data_sources = [str(src) for src in batch.non_tensor_batch.get("data_source", ["unknown"] * len(scores))]
+        preds = [str(pred if pred is not None else "<unparsed>") for pred in batch.non_tensor_batch.get("pred", [])]
+        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+        reward_extra = {"score": scores, "acc": [float(score > 0.0) for score in scores], "pred": preds}
+        grouped = self._compute_grouped_accuracy_metrics(data_sources, uids, reward_extra, prefix="train-dataset", outputs=outputs)
+        correct_count = sum(float(score > 0.0) for score in scores)
+        total = len(scores)
+        metrics: dict[str, float | int] = {
+            "train/accuracy": float(correct_count / total) if total else 0.0,
+            "train/failure_rate": float(1.0 - (correct_count / total)) if total else 0.0,
+            "train/correct_count": int(correct_count),
+            "train/response_count": int(total),
+        }
+        groups = self._compute_grouped_accuracy_metrics(["all"] * len(uids), uids, reward_extra, prefix="train", outputs=outputs)
+        for key, value in groups.items():
+            if key.startswith("train/all/"):
+                metrics[key.replace("train/all/", "train/")] = value
+        metrics.update(grouped)
+        return metrics
+
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns, sample_outputs=None):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
-        metric_dict = {}
+        metric_dict = self._compute_grouped_accuracy_metrics(data_sources, sample_uids, reward_extra_infos_dict, prefix="val", outputs=sample_outputs)
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
@@ -1302,7 +1526,8 @@ class RayPPOTrainer:
         if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
+            if os.environ.get("VERL_VERBOSE_METRICS", "0") == "1":
+                pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
@@ -1625,6 +1850,7 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                metrics.update(self._compute_train_comparison_metrics(batch))
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
@@ -1654,7 +1880,9 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
-                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    if os.environ.get("VERL_VERBOSE_METRICS", "0") == "1":
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                    self._print_metric_summary("final_val", last_val_metrics, self.global_steps)
                     progress_bar.close()
                     return
 

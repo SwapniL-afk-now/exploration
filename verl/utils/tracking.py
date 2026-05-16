@@ -28,6 +28,29 @@ import orjson
 
 logger = logging.getLogger(__name__)
 
+
+def _wandb_safe_data(data: dict[str, Any]) -> dict[str, Any]:
+    import math
+
+    import numpy as np
+
+    safe = {}
+    for key, value in data.items():
+        if isinstance(value, np.ndarray):
+            if value.size == 1:
+                value = value.item()
+            else:
+                continue
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, bool):
+            safe[key] = int(value)
+        elif isinstance(value, int | float):
+            if math.isfinite(float(value)):
+                safe[key] = value
+    return safe
+
+
 MLFLOW_MAX_ATTEMPTS = 3
 MLFLOW_SLEEP_SECONDS = 5
 
@@ -181,7 +204,8 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                payload = _wandb_safe_data(data) if default_backend in {"wandb", "tracking", "vemlp_wandb"} else data
+                logger_instance.log(data=payload, step=step)
 
     def __del__(self):
         if "wandb" in self.logger:

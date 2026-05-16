@@ -95,7 +95,8 @@ class FEPOSingleGPUConfig:
     max_token_per_micro_batch: int = 8192  # Token budget for dynamic batching
     use_token_based_batching: bool = False  # Toggle between fixed sample vs token-based batching
     console_sample_count: int = 3
-    vllm_attention_backend: str = "XFORMERS"
+    actor_attention_impl: str = "flash_attention_2"
+    vllm_attention_backend: str = "FLASHINFER"
     request_timeout_s: int = 240
     keep_last_adapters: int = 1
 
@@ -224,7 +225,7 @@ class FEPOSingleGPUTrainer:
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
             trust_remote_code=False,
-            attn_implementation="sdpa",
+            attn_implementation=self.config.actor_attention_impl,
         ).to(self.config.device)
         self.policy_model.config.use_cache = False
         self.policy_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -250,7 +251,7 @@ class FEPOSingleGPUTrainer:
                 torch_dtype=dtype,
                 low_cpu_mem_usage=True,
                 trust_remote_code=False,
-                attn_implementation="sdpa",
+                attn_implementation=self.config.actor_attention_impl,
             ).to(self.config.device)
             self.reference_model.config.use_cache = False
             self.reference_model.eval()

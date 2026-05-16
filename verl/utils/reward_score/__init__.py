@@ -56,10 +56,25 @@ def default_compute_score(
 
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
-        from . import math_dapo
+    elif data_source in [
+        "math_dapo",
+        "math",
+        "math_dapo_reasoning",
+        "dapo-math-17k",
+        "amc23",
+        "math500",
+        "olympiadbench",
+    ] or data_source.startswith("aime"):
+        from verl.experimental.fepo.math_parser import compute_math_reward
 
-        res = math_dapo.compute_score(solution_str, ground_truth)
+        parsed = compute_math_reward(solution_str, ground_truth, dataset_kind=data_source)
+        res = {
+            "score": 1.0 if parsed.is_correct else -1.0,
+            "acc": parsed.is_correct,
+            "pred": parsed.prediction_normalized,
+            "has_parseable_answer": parsed.has_parseable_answer,
+            "ground_truth_normalized": parsed.ground_truth_normalized,
+        }
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",

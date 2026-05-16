@@ -118,7 +118,7 @@ def _zero_token_fepo_metrics(prefix: str, reference_beta: float = 0.0, escape_al
         f"{prefix}_total_loss": 0.0,
         f"{prefix}_clip_fraction": 0.0,
         "failure_escape_kl_failed": 0.0,
-        "reference_kl_failed": 0.0,
+        "reference_kl_all": 0.0,
         "failed_token_count": 0.0,
         "escape_alpha": float(escape_alpha),
         "reference_beta": float(reference_beta),
@@ -199,27 +199,27 @@ def token_solver_fepo_loss(
     pg_loss_abs = pg_terms.abs().mean()
     clip_fraction = ((ratio < (1.0 - clip_eps)) | (ratio > (1.0 + clip_eps))).float().mean()
 
+    # Reference KL: ALL tokens (not just failed) - keeps solver globally anchored
+    ref_minus_current = ref_logps - current_logps
+    reference_kl_all = (torch.exp(ref_minus_current) - ref_minus_current - 1.0).mean()
+
+    # Failure escape KL: failed tokens only - encourages divergence from failure
     failed_count = int(failed_token_mask.sum().detach().cpu())
     if failed_count > 0:
         failed_current_logps = current_logps[failed_token_mask]
         failed_failure_logps = failure_logps[failed_token_mask]
-        failed_ref_logps = ref_logps[failed_token_mask]
 
         failure_minus_current = failed_failure_logps - failed_current_logps
         failure_escape_kl_failed = (torch.exp(failure_minus_current) - failure_minus_current - 1.0).mean()
-
-        ref_minus_current_failed = failed_ref_logps - failed_current_logps
-        reference_kl_failed = (torch.exp(ref_minus_current_failed) - ref_minus_current_failed - 1.0).mean()
     else:
         failure_escape_kl_failed = current_logps.sum() * 0.0
-        reference_kl_failed = current_logps.sum() * 0.0
 
-    loss = pg_loss + float(reference_beta) * reference_kl_failed - float(escape_alpha) * failure_escape_kl_failed
+    loss = pg_loss + float(reference_beta) * reference_kl_all - float(escape_alpha) * failure_escape_kl_failed
     metrics = {
         "solver_pg_loss": float(pg_loss.detach().cpu()),
         "solver_pg_loss_abs": float(pg_loss_abs.detach().cpu()),
         "failure_escape_kl_failed": float(failure_escape_kl_failed.detach().cpu()),
-        "reference_kl_failed": float(reference_kl_failed.detach().cpu()),
+        "reference_kl_all": float(reference_kl_all.detach().cpu()),
         "failed_token_count": float(failed_count),
         "escape_alpha": float(escape_alpha),
         "reference_beta": float(reference_beta),

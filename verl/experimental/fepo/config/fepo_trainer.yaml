@@ -67,7 +67,7 @@ use_token_based_batching: false
 console_sample_count: 3
 vllm_client_concurrency: 1
 vllm_max_num_seqs: 32
-vllm_attention_backend: XFORMERS
+vllm_attention_backend: FLASHINFER
 request_timeout_s: 240
 keep_last_adapters: 1
 checkpoint_every_steps: 1

@@ -234,7 +234,8 @@ class TaskRunner:
         from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))
+        if os.environ.get("VERL_PRINT_CONFIG", "0") == "1":
+            pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
