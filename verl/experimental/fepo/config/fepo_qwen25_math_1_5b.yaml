@@ -1,0 +1,7 @@
+defaults:
+  - fepo_trainer
+  - _self_
+
+model_id: Qwen/Qwen2.5-Math-1.5B-Instruct
+output_dir: checkpoints/fepo/qwen25_math_1_5b
+experiment_name: qwen25-math-1.5b-fepo-single-gpu

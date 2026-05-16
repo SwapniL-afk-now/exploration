@@ -2,8 +2,8 @@ defaults:
   - fepo_trainer
   - _self_
 
-model_id: Qwen/Qwen2.5-7B-Instruct
-output_dir: checkpoints/fepo/qwen25_7b
+model_id: Qwen/Qwen2.5-Math-7B-Instruct
+output_dir: checkpoints/fepo/qwen25_math_7b
 lora_r: 64
 lora_alpha: 128
 train_prompt_batch_size: 1
@@ -14,4 +14,4 @@ loss_micro_batch_size: 4
 console_sample_count: 3
 vllm_client_concurrency: 1
 vllm_max_num_seqs: 16
-experiment_name: qwen25-7b-fepo-single-gpu
+experiment_name: qwen25-math-7b-fepo-single-gpu

@@ -106,6 +106,8 @@ under `recipe/` instead.
 |------------------------------------|--------------------------------|-----------------------------------------------------|
 | `ppo_trainer/`                     | PPO (actor + critic)           | `adv_estimator=gae`                                 |
 | `grpo_trainer/`                    | GRPO                           | `adv_estimator=grpo`                                |
+| `drgrpo_trainer/`                  | Dr.GRPO                        | `adv_estimator=grpo`, `norm_adv_by_std_in_grpo=False` |
+| `fepo_trainer/`                    | FEPO / failure-escape          | `verl.experimental.fepo.main_fepo`                 |
 | `rloo_trainer/`                    | RLOO                           | `adv_estimator=rloo`                                |
 | `remax_trainer/`                   | ReMax                          | `adv_estimator=remax`                               |
 | `reinforce_plus_plus_trainer/`     | REINFORCE++ / baseline         | `adv_estimator=reinforce_plus_plus[_baseline]`      |

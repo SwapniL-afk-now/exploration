@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -89,6 +90,9 @@ class FEPOSingleGPUConfig:
     launch_vllm: bool = True
     vllm_gpu_memory_utilization: float = 0.35
     vllm_max_num_seqs: int = 16
+    vllm_client_concurrency: int = 1
+    loss_micro_batch_size: int = 8
+    console_sample_count: int = 3
     vllm_attention_backend: str = "XFORMERS"
     request_timeout_s: int = 240
     keep_last_adapters: int = 1
@@ -341,6 +345,56 @@ class FEPOSingleGPUTrainer:
         token_logps = F.log_softmax(shifted_logits, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
         start = max(0, completion_start - 1)
         return token_logps[0, start:].float()
+
+    def batch_completion_logprobs(
+        self,
+        model: torch.nn.Module,
+        encoded_items: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        if not encoded_items:
+            device = torch.device(self.config.device)
+            return torch.zeros((0,), dtype=torch.float32, device=device), torch.zeros((0,), dtype=torch.bool, device=device), []
+
+        pad_id = int(self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id)
+        lengths = [int(item["input_ids"].shape[1]) for item in encoded_items]
+        max_len = max(lengths)
+        batch_size = len(encoded_items)
+        device = torch.device(self.config.device)
+        input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+        completion_starts = [int(item["completion_start"]) for item in encoded_items]
+        completion_lengths = [int(item["completion_length"]) for item in encoded_items]
+        for row, item in enumerate(encoded_items):
+            row_ids = item["input_ids"].to(device=device).view(-1)
+            input_ids[row, : row_ids.numel()] = row_ids
+            attention_mask[row, : row_ids.numel()] = 1
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        shifted_logits = outputs.logits[:, :-1, :]
+        labels = input_ids[:, 1:]
+        token_logps = F.log_softmax(shifted_logits, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1).float()
+
+        shifted_positions = torch.arange(max_len - 1, device=device).unsqueeze(0)
+        starts = torch.tensor([max(0, start - 1) for start in completion_starts], device=device).unsqueeze(1)
+        ends = torch.tensor([max(0, length - 1) for length in lengths], device=device).unsqueeze(1)
+        completion_mask = (shifted_positions >= starts) & (shifted_positions < ends)
+        completion_mask &= attention_mask[:, 1:].bool()
+        return token_logps[completion_mask], completion_mask, completion_lengths
+
+    def _concat_item_tensors(
+        self,
+        items: list[dict[str, Any]],
+        key: str,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        tensors = [item[key] for item in items]
+        if device is None:
+            device = torch.device(self.config.device)
+        if dtype is None:
+            return torch.cat([tensor.to(device=device) for tensor in tensors], dim=0)
+        return torch.cat([tensor.to(device=device, dtype=dtype) for tensor in tensors], dim=0)
 
     def detached_adapter_completion_logprobs(self, adapter_name: str, encoded: dict[str, Any]) -> torch.Tensor:
         self.set_active_adapter(adapter_name, train=False)
@@ -627,44 +681,109 @@ class FEPOSingleGPUTrainer:
                     "failure_scaled_loss": 0.0,
                 }
             )
-            encoded = item["encoded"]
-            if encoded is None:
-                records.append(record)
-                continue
+            records.append(record)
+
+        active_indices = [
+            idx
+            for idx, item in enumerate(items)
+            if item.get("encoded") is not None and int(item.get("valid_token_count", 0)) > 0
+        ]
+        if not active_indices:
+            return records
+
+        micro_batch_size = max(1, int(self.config.loss_micro_batch_size))
+        for chunk_start in range(0, len(active_indices), micro_batch_size):
+            chunk_indices = active_indices[chunk_start : chunk_start + micro_batch_size]
+            chunk_items = [items[idx] for idx in chunk_indices]
+            encoded_items = [item["encoded"] for item in chunk_items]
 
             self.set_active_adapter(self.config.solver_adapter_name, train=True)
-            current = self.completion_logprobs(self.policy_model, encoded["input_ids"], encoded["completion_start"])
+            current, _, _ = self.batch_completion_logprobs(self.policy_model, encoded_items)
+            old_logps = self._concat_item_tensors(chunk_items, "old_solver_logps", dtype=current.dtype, device=current.device)
+            ref_logps = self._concat_item_tensors(chunk_items, "ref_logps", dtype=current.dtype, device=current.device)
+            failure_logps = self._concat_item_tensors(
+                chunk_items, "failure_logps_for_escape", dtype=current.dtype, device=current.device
+            )
+            advantages = self._concat_item_tensors(chunk_items, "token_advantages", dtype=current.dtype, device=current.device)
+            failed_token_mask = self._concat_item_tensors(
+                chunk_items, "failed_token_mask", dtype=torch.bool, device=current.device
+            )
+            loss_mask = self._concat_item_tensors(chunk_items, "token_loss_mask", dtype=torch.bool, device=current.device)
             solver_loss, solver_metrics = token_solver_fepo_loss(
                 current,
-                item["old_solver_logps"],
-                item["ref_logps"],
-                item["failure_logps_for_escape"],
-                item["token_advantages"],
-                item["failed_token_mask"],
+                old_logps,
+                ref_logps,
+                failure_logps,
+                advantages,
+                failed_token_mask,
                 clip_eps=self.config.clip_eps,
                 reference_beta=self.config.fepo_reference_beta,
                 escape_alpha=self.config.fepo_escape_alpha,
-                loss_mask=item["token_loss_mask"],
+                loss_mask=loss_mask,
                 token_log_ratio_clip=self.config.token_log_ratio_clip,
             )
             (solver_loss * solver_scale).backward()
-            record["solver_scaled_loss"] = float((solver_loss.detach() * float(solver_scale)).cpu())
 
             self.set_active_adapter(self.config.failure_adapter_name, train=True)
-            failure_current = self.completion_logprobs(
-                self.policy_model, encoded["input_ids"], encoded["completion_start"]
+            failure_current, _, _ = self.batch_completion_logprobs(self.policy_model, encoded_items)
+            failed_response_mask = self._concat_item_tensors(
+                chunk_items, "failed_token_mask", dtype=torch.bool, device=failure_current.device
             )
+            failure_loss_mask = loss_mask.to(device=failure_current.device) & failed_response_mask
             failure_loss, failure_metrics = token_failure_sft_loss(
                 failure_current,
-                is_failed=float(item["reward"]) == 0.0,
-                loss_mask=item["token_loss_mask"],
+                is_failed=bool(failure_loss_mask.any().detach().cpu()),
+                loss_mask=failure_loss_mask,
             )
             (failure_loss * failure_scale).backward()
-            record["failure_scaled_loss"] = float((failure_loss.detach() * float(failure_scale)).cpu())
-            record.update(solver_metrics)
-            record.update(failure_metrics)
-            records.append(record)
+
+            for record_index in chunk_indices:
+                item = items[record_index]
+                valid_token_count = float(item.get("valid_token_count", 0.0))
+                failed_token_count = valid_token_count if float(item.get("reward", 0.0)) == 0.0 else 0.0
+                records[record_index].update(solver_metrics)
+                records[record_index].update(failure_metrics)
+                records[record_index]["loss_token_count"] = valid_token_count
+                records[record_index]["failed_token_count"] = failed_token_count
+                records[record_index]["failure_sft_token_count"] = failed_token_count
+                records[record_index]["failure_is_sft_active"] = float(failed_token_count > 0.0)
+                records[record_index]["solver_scaled_loss"] = float((solver_loss.detach() * float(solver_scale)).cpu())
+                records[record_index]["failure_scaled_loss"] = float((failure_loss.detach() * float(failure_scale)).cpu())
         return records
+
+    def rollout_prompt_batch(
+        self,
+        batch: list[dict[str, Any]],
+        batch_start: int,
+        accumulation_index: int,
+    ) -> list[tuple[str, int, list[dict[str, Any]]]]:
+        jobs: list[tuple[str, int, dict[str, Any]]] = []
+        for prompt_index, example in enumerate(batch):
+            extra = example.get("extra_info", {})
+            row_index = extra.get("index", (batch_start + prompt_index) % len(self.train_rows))
+            prompt_uid = (
+                f"step{self.global_step + 1}:accum{accumulation_index}:"
+                f"prompt{prompt_index}:row{row_index}"
+            )
+            jobs.append((prompt_uid, prompt_index, example))
+
+        concurrency = max(1, int(self.config.vllm_client_concurrency))
+        if self.config.generation_backend != "vllm_openai" or concurrency <= 1 or len(jobs) <= 1:
+            return [
+                (prompt_uid, prompt_index, self.rollout_prompt(example, prompt_uid=prompt_uid))
+                for prompt_uid, prompt_index, example in jobs
+            ]
+
+        max_workers = min(concurrency, len(jobs))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(self.rollout_prompt, example, prompt_uid=prompt_uid)
+                for prompt_uid, _, example in jobs
+            ]
+            return [
+                (prompt_uid, prompt_index, future.result())
+                for (prompt_uid, prompt_index, _), future in zip(jobs, futures, strict=True)
+            ]
 
     def optimizer_step(self) -> dict[str, float]:
         solver_norm = torch.nn.utils.clip_grad_norm_(
@@ -686,6 +805,8 @@ class FEPOSingleGPUTrainer:
         cursor = self.train_cursor
         while self.global_step < self.config.max_optimizer_steps:
             step_start = time.perf_counter()
+            rollout_wall_seconds = 0.0
+            loss_wall_seconds = 0.0
             step_records: list[dict[str, float | int | str]] = []
             for accumulation_index in range(self.config.gradient_accumulation_steps):
                 batch_start = cursor
@@ -694,15 +815,13 @@ class FEPOSingleGPUTrainer:
                     for offset in range(self.config.train_prompt_batch_size)
                 ]
                 cursor += self.config.train_prompt_batch_size
-                rollouts: list[tuple[str, int, list[dict[str, Any]]]] = []
-                for prompt_index, example in enumerate(batch):
-                    extra = example.get("extra_info", {})
-                    row_index = extra.get("index", (batch_start + prompt_index) % len(self.train_rows))
-                    prompt_uid = (
-                        f"step{self.global_step + 1}:accum{accumulation_index}:"
-                        f"prompt{prompt_index}:row{row_index}"
-                    )
-                    rollouts.append((prompt_uid, prompt_index, self.rollout_prompt(example, prompt_uid=prompt_uid)))
+                rollout_start = time.perf_counter()
+                rollouts = self.rollout_prompt_batch(
+                    batch=batch,
+                    batch_start=batch_start,
+                    accumulation_index=accumulation_index,
+                )
+                rollout_wall_seconds += time.perf_counter() - rollout_start
 
                 active_response_count = sum(self._active_response_count(items) for _, _, items in rollouts)
                 failure_active_response_count = sum(
@@ -718,6 +837,7 @@ class FEPOSingleGPUTrainer:
                     if failure_active_response_count > 0
                     else 0.0
                 )
+                loss_start = time.perf_counter()
                 for prompt_uid, prompt_index, items in rollouts:
                     step_records.extend(
                         self.train_on_items(
@@ -731,6 +851,8 @@ class FEPOSingleGPUTrainer:
                             train_prompt_batch_size=len(batch),
                         )
                     )
+                loss_wall_seconds += time.perf_counter() - loss_start
+                self._print_step_samples(self.global_step + 1, rollouts)
             self.global_step += 1
             self.train_cursor = cursor
             grad_metrics = self.optimizer_step()
@@ -743,6 +865,8 @@ class FEPOSingleGPUTrainer:
                     "checkpoint/solver_adapter": str(solver_dir),
                     "checkpoint/failure_adapter": str(failure_dir),
                     "perf/step_seconds": float(step_seconds),
+                    "perf/rollout_wall_seconds": float(rollout_wall_seconds),
+                    "perf/loss_wall_seconds": float(loss_wall_seconds),
                     "perf/responses_per_second": float(len(step_records) / step_seconds) if step_seconds > 0 else 0.0,
                 }
             )
@@ -754,6 +878,35 @@ class FEPOSingleGPUTrainer:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _response_preview(self, text: Any, limit: int = 180) -> str:
+        preview = " ".join(str(text).split())
+        if len(preview) > limit:
+            preview = preview[: limit - 3] + "..."
+        return preview
+
+    def _print_step_samples(self, step: int, rollouts: list[tuple[str, int, list[dict[str, Any]]]]) -> None:
+        sample_limit = max(0, int(self.config.console_sample_count))
+        if sample_limit <= 0:
+            return
+        printed = 0
+        for prompt_uid, prompt_index, items in rollouts:
+            if not items:
+                continue
+            first = items[0]
+            print(
+                "sample "
+                f"step={step} prompt_index={prompt_index} "
+                f"batch_acc={sum(float(item.get('reward', 0.0)) for item in items) / max(len(items), 1):.3f} "
+                f"gt={first.get('ground_truth_normalized')} "
+                f"pred={first.get('prediction_normalized')} "
+                f"correct={bool(first.get('is_correct', False))} "
+                f"response={self._response_preview(first.get('response', ''))}",
+                flush=True,
+            )
+            printed += 1
+            if printed >= sample_limit:
+                break
 
     def _summarize_step(self, records: list[dict[str, float | int | str]]) -> dict[str, float | int]:
         return summarize_training_records(records)
