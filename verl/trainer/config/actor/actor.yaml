@@ -81,8 +81,13 @@ wasserstein_guidance:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.WassersteinGuidanceConfig
 
+  # Enable Wasserstein guidance
   enable: false
+
+  # Weight for Wasserstein guidance loss
   lambda_wg: 0.01
+
+  # Transport coefficient for Wasserstein guidance
   alpha_transport: 0.2
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
