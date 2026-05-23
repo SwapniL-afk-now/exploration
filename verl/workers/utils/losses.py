@@ -23,6 +23,7 @@ from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
+from verl.workers.utils.wasserstein_guidance import compute_wasserstein_guidance_loss, _as_list
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -82,12 +83,20 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     metrics = {}
 
+    wasserstein_guidance = getattr(config, "wasserstein_guidance", {})
+    wg_enabled = bool(wasserstein_guidance.get("enable", False))
+    wg_group_ids = _as_list(data.get("uid", None)) if wg_enabled else []
+
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    if wg_enabled:
+        for field in ("responses", "rm_scores", "token_level_rewards"):
+            if field in data:
+                fields.append(field)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
@@ -117,7 +126,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     metrics.update(pg_metrics)
     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
-    policy_loss = pg_loss
+    ppo_loss_coef = float(getattr(config, "ppo_loss_coef", 1.0))
+    policy_loss = ppo_loss_coef * pg_loss
+    metrics["actor/ppo_loss_coef"] = ppo_loss_coef
 
     # add entropy loss
     if entropy is not None:
@@ -129,6 +140,28 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
 
     # add kl loss
+    if wg_enabled:
+        rewards = None
+        if "rm_scores" in data:
+            rewards = data["rm_scores"].sum(dim=-1)
+        elif "token_level_rewards" in data:
+            rewards = data["token_level_rewards"].sum(dim=-1)
+        wg_stats = compute_wasserstein_guidance_loss(
+            log_prob=log_prob,
+            response_mask=response_mask,
+            responses=data.get("responses", None),
+            rewards=rewards,
+            group_ids=wg_group_ids,
+            alpha_transport=float(wasserstein_guidance.get("alpha_transport", 0.2)),
+        )
+        lambda_wg = float(wasserstein_guidance.get("lambda_wg", 0.01))
+        policy_loss += lambda_wg * wg_stats.loss
+        metrics["wasserstein_guidance/loss"] = Metric(value=wg_stats.loss, aggregation=metric_aggregation)
+        metrics["wasserstein_guidance/lambda_wg"] = lambda_wg
+        metrics["wasserstein_guidance/active_groups"] = wg_stats.active_groups
+        metrics["wasserstein_guidance/mixed_group_fraction"] = wg_stats.mixed_group_fraction
+        metrics["wasserstein_guidance/mean_wrong_mass"] = wg_stats.mean_wrong_mass
+
     if config.use_kl_loss:
         ref_log_prob = data["ref_log_prob"]
         # compute kl loss

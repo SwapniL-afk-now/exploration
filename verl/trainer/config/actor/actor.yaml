@@ -75,6 +75,16 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+# Token-weighted sequence-level Wasserstein guidance auxiliary loss
+wasserstein_guidance:
+
+  # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.WassersteinGuidanceConfig
+
+  enable: false
+  lambda_wg: 0.01
+  alpha_transport: 0.2
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
@@ -84,6 +94,9 @@ loss_agg_mode: token-mean
 # Scale factor for "seq-mean-token-sum-norm" loss aggregation mode.
 # If null, uses response_length. Set to a constant to ensure consistent normalization.
 loss_scale_factor: null
+
+# Coefficient for the PPO/GRPO policy-gradient loss
+ppo_loss_coef: 1.0
 
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0

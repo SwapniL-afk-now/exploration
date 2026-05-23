@@ -34,6 +34,7 @@ from .optimizer import OptimizerConfig
 
 __all__ = [
     "PolicyLossConfig",
+    "WassersteinGuidanceConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -100,6 +101,15 @@ class PolicyLossConfig(BaseConfig):
 
 
 @dataclass
+class WassersteinGuidanceConfig(BaseConfig):
+    """Auxiliary token-weighted sequence-level Wasserstein guidance."""
+
+    enable: bool = False
+    lambda_wg: float = 0.01
+    alpha_transport: float = 0.2
+
+
+@dataclass
 class ActorConfig(BaseConfig):
     """Configuration for actor model training.
 
@@ -121,6 +131,7 @@ class ActorConfig(BaseConfig):
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
             If None, uses response_length. Set to a constant to ensure consistent normalization.
+        ppo_loss_coef (float): Coefficient for the PPO/GRPO policy-gradient loss.
         entropy_coeff (float): Entropy coefficient for regularization.
         tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
         tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
@@ -159,9 +170,11 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+    wasserstein_guidance: WassersteinGuidanceConfig = field(default_factory=WassersteinGuidanceConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
+    ppo_loss_coef: float = 1.0
     entropy_coeff: float = 0
     tau_pos: float = 1.0
     tau_neg: float = 1.05

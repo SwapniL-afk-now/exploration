@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# FEPO-style | Qwen2.5-1.5B-Instruct | FSDP training | NVIDIA GPUs
-# This launcher uses the existing verl PPO/FSDP stack, matching the DRGRPO launcher shape.
+# Wesserstein | Qwen2.5-1.5B-Instruct | FSDP training | NVIDIA GPUs
+# Dr.GRPO plus token-weighted sequence-level Wasserstein guidance.
 
 set -euo pipefail
 if [[ "${DEBUG_LAUNCH:-0}" == "1" ]]; then
@@ -61,68 +61,18 @@ MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 TRAIN_DATASET=${TRAIN_DATASET:-zhuzilin/dapo-math-17k}
 TRAIN_DATASET_CONFIG=${TRAIN_DATASET_CONFIG:-default}
 TRAIN_SPLIT=${TRAIN_SPLIT:-train}
-TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-256}
-TRAIN_FILE=${TRAIN_FILE:-"${WORKSPACE_ROOT}/failure-escape-runs/data/dapo_math_17k_train_${TRAIN_MAX_SAMPLES}.parquet"}
+TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:--1}
+TRAIN_FILE=${TRAIN_FILE:-"${WORKSPACE_ROOT}/failure-escape-runs/data/dapo_math_17k_train_full.parquet"}
 PREPARE_TRAIN_DATA=${PREPARE_TRAIN_DATA:-true}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
 
-EVAL_DATA_DIR=${EVAL_DATA_DIR:-"${WORKSPACE_ROOT}/failure-escape-runs/data/fepo_eval"}
+EVAL_DATA_DIR=${EVAL_DATA_DIR:-"${WORKSPACE_ROOT}/failure-escape-runs/data/wesserstein_eval"}
 PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-true}
 if [[ -z "${VAL_FILES:-}" ]]; then
-    # Note: olympiadbench excluded due to List[string] ground_truth_raw vs string in others.
+    # Note: olympiadbench excluded due to List[string] ground_truth_raw vs string in others
     VAL_FILES="[${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet]"
 fi
-
-# 64 prompts x 8 generations = 512 generated responses per optimizer step.
-# max_num_seqs=1024 leaves enough headroom for all responses to be scheduled together.
-TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}
-NUM_GENERATIONS=${NUM_GENERATIONS:-8}
-GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
-ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
-FEPO_USE_LORA=${FEPO_USE_LORA:-true}
-LORA_RANK=${LORA_RANK:-128}
-LORA_ALPHA=${LORA_ALPHA:-256}
-LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
-
-ACTOR_LR=${ACTOR_LR:-5e-7}
-ENTROPY_COEFF=${ENTROPY_COEFF:-0}
-CLIP_RATIO=${CLIP_RATIO:-0.2}
-KL_LOSS_COEF=${KL_LOSS_COEF:-0.01}
-
-ROLLOUT_TP=${ROLLOUT_TP:-1}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.45}
-ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
-VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
-ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}
-ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
-VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
-VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
-VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
-VAL_TOP_P=${VAL_TOP_P:-0.95}
-
-MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-3000}
-SAVE_FREQ=${SAVE_FREQ:-20}
-TEST_FREQ=${TEST_FREQ:-10}
-VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
-
-PROJECT_NAME=${PROJECT_NAME:-verl_fepo_dapo_math}
-RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
-LOGGER=${LOGGER:-'["console","wandb"]'}
-TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-${MAX_OPTIMIZER_STEPS}}
-LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
-ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-null}
-VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-null}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_1_5b_fepo_fsdp-${RUN_TIMESTAMP}}
-CKPTS_DIR=${CKPTS_DIR:-"${REPO_ROOT}/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
-########################### end user-adjustable ###########################
-
 if [[ "${PREPARE_TRAIN_DATA}" == "true" && ! -f "${TRAIN_FILE}" ]]; then
     mkdir -p "$(dirname "${TRAIN_FILE}")"
     "$PYTHON_BIN" -m verl.experimental.fepo.data \
@@ -155,7 +105,64 @@ if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
     fi
 fi
 
+
+# Dr.GRPO uses data.train_batch_size as prompts per optimizer step.
+# On the local 96GB Blackwell GPU, 64 prompts x 8 rollouts gave the best tested utilization.
+TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}
+NUM_GENERATIONS=${NUM_GENERATIONS:-8}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
+ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
+DRGRPO_USE_LORA=${DRGRPO_USE_LORA:-true}
+LORA_RANK=${LORA_RANK:-128}
+LORA_ALPHA=${LORA_ALPHA:-256}
+LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
+
+ACTOR_LR=${ACTOR_LR:-5e-7}
+ENTROPY_COEFF=${ENTROPY_COEFF:-0}
+PPO_LOSS_COEF=${PPO_LOSS_COEF:-0}
+CLIP_RATIO=${CLIP_RATIO:-0.2}
+KL_LOSS_COEF=${KL_LOSS_COEF:-0.01}
+
+ROLLOUT_TP=${ROLLOUT_TP:-1}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
+# ROLLOUT_N matches NUM_GENERATIONS for consistency
+ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
+VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}
+ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
+
+WESSERSTEIN_GUIDANCE_ENABLE=${WESSERSTEIN_GUIDANCE_ENABLE:-true}
+WESSERSTEIN_LAMBDA_WG=${WESSERSTEIN_LAMBDA_WG:-0.05}
+WESSERSTEIN_ALPHA_TRANSPORT=${WESSERSTEIN_ALPHA_TRANSPORT:-0.3}
+VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
+VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
+VAL_TOP_P=${VAL_TOP_P:-0.95}
+
+MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
+SAVE_FREQ=${SAVE_FREQ:-20}
+TEST_FREQ=${TEST_FREQ:-10}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
+
+PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_dapo_math}
+RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
+LOGGER=${LOGGER:-'["console","wandb"]'}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-${MAX_OPTIMIZER_STEPS}}
+LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
+ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-null}
+VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-null}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_1_5b_wesserstein_fsdp-${RUN_TIMESTAMP}}
+CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
+########################### end user-adjustable ###########################
+
 ########################### parameter arrays ###########################
+
 DATA=(
     algorithm.adv_estimator=grpo
     algorithm.norm_adv_by_std_in_grpo=False
@@ -177,7 +184,7 @@ MODEL=(
     +actor_rollout_ref.model.override_config.attn_implementation=${ACTOR_ATTENTION_IMPL}
 )
 
-if [[ "${FEPO_USE_LORA}" == "true" ]]; then
+if [[ "${DRGRPO_USE_LORA}" == "true" ]]; then
     MODEL+=(
         actor_rollout_ref.model.lora_rank=${LORA_RANK}
         actor_rollout_ref.model.lora_alpha=${LORA_ALPHA}
@@ -187,17 +194,22 @@ fi
 
 ACTOR=(
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
+    # FEPO-style: token-mean for per-token gradient signals
     actor_rollout_ref.actor.loss_agg_mode=token-mean
     actor_rollout_ref.actor.clip_ratio=${CLIP_RATIO}
     actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO}
     actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO}
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
+    actor_rollout_ref.actor.ppo_loss_coef=${PPO_LOSS_COEF}
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.actor.use_kl_loss=True
     actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF}
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
+    actor_rollout_ref.actor.wasserstein_guidance.enable=${WESSERSTEIN_GUIDANCE_ENABLE}
+    actor_rollout_ref.actor.wasserstein_guidance.lambda_wg=${WESSERSTEIN_LAMBDA_WG}
+    actor_rollout_ref.actor.wasserstein_guidance.alpha_transport=${WESSERSTEIN_ALPHA_TRANSPORT}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 )

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -97,6 +98,10 @@ class FEPOSingleGPUConfig:
     console_sample_count: int = 3
     actor_attention_impl: str = "flash_attention_2"
     vllm_attention_backend: str = "FLASHINFER"
+    vllm_sleep_enabled: bool = True
+    vllm_sleep_level: int = 1
+    vllm_sleep_timeout_s: int = 120
+    vllm_wake_timeout_s: int = 180
     request_timeout_s: int = 240
     keep_last_adapters: int = 1
 
@@ -141,6 +146,8 @@ class FEPOSingleGPUTrainer:
         self.global_step = 0
         self.train_cursor = 0
         self.vllm_process: Optional[subprocess.Popen] = None
+        self.vllm_sleeping = False
+        self.vllm_sleep_lock = Lock()
 
         self.tokenizer = None
         self.policy_model = None
@@ -164,6 +171,10 @@ class FEPOSingleGPUTrainer:
     @property
     def vllm_base_url(self) -> str:
         return f"http://{self.config.vllm_host}:{self.config.vllm_port}/v1"
+
+    @property
+    def vllm_server_url(self) -> str:
+        return f"http://{self.config.vllm_host}:{self.config.vllm_port}"
 
     def setup(self) -> None:
         torch.manual_seed(self.config.seed)
@@ -465,6 +476,8 @@ class FEPOSingleGPUTrainer:
             return
         env = os.environ.copy()
         env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        if self.config.vllm_sleep_enabled:
+            env["VLLM_SERVER_DEV_MODE"] = "1"
         env.setdefault("TOKENIZERS_PARALLELISM", "false")
         if self.config.vllm_attention_backend:
             env["VLLM_ATTENTION_BACKEND"] = self.config.vllm_attention_backend
@@ -496,9 +509,13 @@ class FEPOSingleGPUTrainer:
             "1",
             "--disable-log-requests",
         ]
+        if self.config.vllm_sleep_enabled:
+            cmd.append("--enable-sleep-mode")
         log_path = self.output_dir / "vllm_server.log"
         log_file = open(log_path, "a", buffering=1)
-        self.vllm_process = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+        self.vllm_process = subprocess.Popen(
+            cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT, text=True, start_new_session=True
+        )
         deadline = time.time() + 600
         while time.time() < deadline:
             if self._vllm_is_ready():
@@ -524,6 +541,67 @@ class FEPOSingleGPUTrainer:
         response.raise_for_status()
         return response
 
+    def _post_vllm_server(self, path: str, timeout_s: int, params: Optional[dict[str, Any]] = None):
+        import requests
+
+        response = requests.post(f"{self.vllm_server_url}{path}", params=params, timeout=timeout_s)
+        response.raise_for_status()
+        return response
+
+    def _vllm_is_sleeping(self) -> bool:
+        import requests
+
+        response = requests.get(f"{self.vllm_server_url}/is_sleeping", timeout=10)
+        response.raise_for_status()
+        return bool(response.json().get("is_sleeping", False))
+
+    def _wait_for_vllm_sleep_state(self, sleeping: bool, timeout_s: int) -> None:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._vllm_is_sleeping() == sleeping:
+                return
+            time.sleep(1)
+        state = "sleep" if sleeping else "wake"
+        raise TimeoutError(f"Timed out waiting for vLLM to {state}.")
+
+    def sleep_vllm_if_enabled(self) -> None:
+        if self.config.generation_backend != "vllm_openai" or not self.config.vllm_sleep_enabled:
+            return
+        with self.vllm_sleep_lock:
+            if self.vllm_process is not None and self.vllm_process.poll() is not None:
+                return
+            if self.vllm_sleeping:
+                return
+            self._post_vllm_server(
+                "/sleep",
+                timeout_s=self.config.vllm_sleep_timeout_s,
+                params={"level": int(self.config.vllm_sleep_level)},
+            )
+            self._wait_for_vllm_sleep_state(True, self.config.vllm_sleep_timeout_s)
+            self.vllm_sleeping = True
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def wake_vllm_if_needed(self) -> None:
+        if self.config.generation_backend != "vllm_openai" or not self.config.vllm_sleep_enabled:
+            return
+        with self.vllm_sleep_lock:
+            if self.vllm_process is not None and self.vllm_process.poll() is not None:
+                raise RuntimeError("vLLM process exited before wake_up.")
+            if not self.vllm_sleeping:
+                try:
+                    self.vllm_sleeping = self._vllm_is_sleeping()
+                except Exception:
+                    self.vllm_sleeping = False
+            if not self.vllm_sleeping:
+                return
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self._post_vllm_server("/wake_up", timeout_s=self.config.vllm_wake_timeout_s)
+            self._wait_for_vllm_sleep_state(False, self.config.vllm_wake_timeout_s)
+            self.vllm_sleeping = False
+
     def save_named_lora_adapter(self, adapter_name: str, adapter_dir: Path) -> Path:
         if adapter_dir.exists():
             shutil.rmtree(adapter_dir)
@@ -545,6 +623,7 @@ class FEPOSingleGPUTrainer:
         return adapter_dir
 
     def reload_vllm_lora(self, adapter_dir: Path) -> None:
+        self.wake_vllm_if_needed()
         try:
             self._post_vllm("/unload_lora_adapter", {"lora_name": self.config.vllm_lora_name}, timeout_s=120)
         except Exception:
@@ -581,6 +660,7 @@ class FEPOSingleGPUTrainer:
 
     def generate(self, messages: list[dict[str, str]], n: int, temperature: float, top_p: float) -> list[str]:
         if self.config.generation_backend == "vllm_openai":
+            self.wake_vllm_if_needed()
             payload = {
                 "model": self.config.vllm_lora_name,
                 "messages": messages,
@@ -850,6 +930,8 @@ class FEPOSingleGPUTrainer:
             rollout_wall_seconds = 0.0
             loss_wall_seconds = 0.0
             step_records: list[dict[str, float | int | str]] = []
+            accumulation_rollouts: list[tuple[int, int, list[tuple[str, int, list[dict[str, Any]]]]]] = []
+
             for accumulation_index in range(self.config.gradient_accumulation_steps):
                 batch_start = cursor
                 batch = [
@@ -864,7 +946,12 @@ class FEPOSingleGPUTrainer:
                     accumulation_index=accumulation_index,
                 )
                 rollout_wall_seconds += time.perf_counter() - rollout_start
+                accumulation_rollouts.append((accumulation_index, len(batch), rollouts))
+                self._print_step_samples(self.global_step + 1, rollouts)
 
+            self.sleep_vllm_if_enabled()
+
+            for _, train_prompt_batch_size, rollouts in accumulation_rollouts:
                 active_response_count = sum(self._active_response_count(items) for _, _, items in rollouts)
                 failure_active_response_count = sum(
                     self._failure_active_response_count(items) for _, _, items in rollouts
@@ -890,14 +977,14 @@ class FEPOSingleGPUTrainer:
                             active_response_count=active_response_count,
                             failure_active_response_count=failure_active_response_count,
                             prompt_batch_index=prompt_index,
-                            train_prompt_batch_size=len(batch),
+                            train_prompt_batch_size=train_prompt_batch_size,
                         )
                     )
                 loss_wall_seconds += time.perf_counter() - loss_start
-                self._print_step_samples(self.global_step + 1, rollouts)
             self.global_step += 1
             self.train_cursor = cursor
             grad_metrics = self.optimizer_step()
+            self.wake_vllm_if_needed()
             solver_dir, failure_dir = self.save_reload_and_cleanup(self.global_step)
             metrics = self._summarize_step(step_records)
             metrics.update(grad_metrics)
@@ -1038,4 +1125,12 @@ class FEPOSingleGPUTrainer:
 
     def close(self) -> None:
         if self.vllm_process is not None and self.vllm_process.poll() is None:
-            self.vllm_process.terminate()
+            try:
+                os.killpg(self.vllm_process.pid, 15)
+            except ProcessLookupError:
+                return
+            try:
+                self.vllm_process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.vllm_process.pid, 9)
+                self.vllm_process.wait(timeout=20)
