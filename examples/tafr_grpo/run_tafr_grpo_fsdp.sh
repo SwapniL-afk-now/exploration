@@ -11,7 +11,22 @@ PYTHON_BIN=${PYTHON_BIN:-"${REPO_ROOT}/.venv/bin/python"}
 
 cd "$REPO_ROOT"
 
-PROJECT_NAME=${PROJECT_NAME:-tafr_grpo}
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+    _XTRACE_WAS_ON=0
+    case $- in
+        *x*) _XTRACE_WAS_ON=1; set +x ;;
+    esac
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.env"
+    set +a
+    if [[ ${_XTRACE_WAS_ON} -eq 1 ]]; then
+        set -x
+    fi
+    unset _XTRACE_WAS_ON
+fi
+
+PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_dapo_math}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_tafr_grpo_fsdp}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 NNODES=${NNODES:-1}
@@ -56,7 +71,7 @@ if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
 fi
 
 TAFR_VARIANT=${TAFR_VARIANT:-full}
-TAFR_BETA=${TAFR_BETA:-0.001}
+TAFR_BETA=${TAFR_BETA:-0.01}
 TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}
 TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}
 TAFR_REPLAY_NUM_SAMPLES=${TAFR_REPLAY_NUM_SAMPLES:-1}
@@ -76,7 +91,7 @@ LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 
 ACTOR_LR=${ACTOR_LR:-5e-7}
 ENTROPY_COEFF=${ENTROPY_COEFF:-0}
-PPO_LOSS_COEF=${PPO_LOSS_COEF:-0}
+PPO_LOSS_COEF=${PPO_LOSS_COEF:-1}
 CLIP_RATIO=${CLIP_RATIO:-0.2}
 
 ROLLOUT_TP=${ROLLOUT_TP:-1}
@@ -92,7 +107,7 @@ VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
 MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
-SAVE_FREQ=${SAVE_FREQ:--1}
+SAVE_FREQ=${SAVE_FREQ:--10}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 LOGGER=${LOGGER:-'["console","wandb"]'}

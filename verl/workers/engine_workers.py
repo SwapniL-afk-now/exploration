@@ -701,6 +701,42 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def tafr_init(self, tafr_config: dict):
+        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
+        if self.config.actor.strategy not in ("fsdp", "fsdp2"):
+            raise NotImplementedError(
+                "custom_tafr_grpo.enable=true is currently supported only for HF FSDP/FSDP2 actors."
+            )
+        return self.actor.engine.tafr_init(tafr_config)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="tafr_anchor_log_prob")
+    def tafr_compute_anchor_log_prob(self, data: TensorDict) -> TensorDict:
+        output = self.actor.engine.tafr_compute_anchor_log_prob(data)
+        return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="tafr_replay_generate")
+    def tafr_generate_replay(self, data: TensorDict) -> TensorDict:
+        output = self.actor.engine.tafr_generate_replay(data)
+        return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
+        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
+        return self.actor.engine.tafr_failure_sft_update(records, tafr_config)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def tafr_save_and_refresh(self, local_path: str, global_step: int, failure_model_changed: bool, tafr_config: dict):
+        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
+        return self.actor.engine.tafr_save_and_refresh(local_path, global_step, failure_model_changed, tafr_config)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def tafr_load(self, local_path: str):
+        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
+        return self.actor.engine.tafr_load(local_path)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.

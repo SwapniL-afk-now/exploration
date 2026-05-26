@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Optional
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -38,10 +38,10 @@ class TAFRGRPOConfig:
     failure_sft_batch_size: int = 8
     failure_sft_max_updates_per_interval: int = 1
     failure_data_max_size: Optional[int] = None
-    failure_data_sampling: Literal["recent", "uniform"] = "recent"
+    failure_data_sampling: str = "recent"
     anchor_checkpoint_dir: Optional[str] = None
     replay_checkpoint_dir: Optional[str] = None
-    variant: Literal["full", "anchor_only", "replay_only"] = "full"
+    variant: str = "full"
 
     @classmethod
     def from_config(cls, config: DictConfig | dict | None) -> "TAFRGRPOConfig":
