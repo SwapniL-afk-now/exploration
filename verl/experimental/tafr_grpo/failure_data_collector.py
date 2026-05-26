@@ -106,6 +106,13 @@ class FailureDataCollector:
             return examples[-batch_size:]
         return self._rng.sample(examples, batch_size)
 
+    def clear(self) -> None:
+        """Discard all buffered examples. Call after each SFT update."""
+        if self.sampling == "recent":
+            self._examples.clear()
+        else:
+            self._examples = []
+
     def to_records(self) -> list[dict[str, Any]]:
         return [asdict(example) for example in self._examples]
 

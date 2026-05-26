@@ -75,7 +75,10 @@ TAFR_VARIANT=${TAFR_VARIANT:-full}               # full | anchor_only | replay_o
 TAFR_BETA=${TAFR_BETA:-0.01}                     # KL coefficient for both anchor and replay terms
 TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}           # EMA decay for GRPO and failure EMA trackers
 TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}               # mix weight: theta_anchor = (1-eta)*ref + eta*ema
-TAFR_REPLAY_NUM_SAMPLES=${TAFR_REPLAY_NUM_SAMPLES:-1}  # replay responses per prompt (M)
+
+# Replay: M responses generated per prompt from frozen pi_replay for the replay KL estimate.
+# Higher M = better KL estimate but proportionally more GPU time.
+TAFR_REPLAY_NUM_SAMPLES=${TAFR_REPLAY_NUM_SAMPLES:-4}
 
 # Failure-SFT schedule
 TAFR_SFT_UPDATE_INTERVAL=${TAFR_SFT_UPDATE_INTERVAL:-5}       # run SFT every N GRPO steps
@@ -83,11 +86,16 @@ TAFR_CHECKPOINT_INTERVAL=${TAFR_CHECKPOINT_INTERVAL:-10}      # save + refresh E
 
 # Failure-SFT optimizer
 TAFR_SFT_LR=${TAFR_SFT_LR:-1.0e-6}                           # failure-SFT learning rate
-TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-8}                 # wrong-response examples per SFT update
-TAFR_SFT_MAX_UPDATES=${TAFR_SFT_MAX_UPDATES:-1}               # optimizer steps per SFT interval
+# Chunk size when iterating over the interval's buffered failures.
+# The buffer is cleared after every SFT update, so this controls
+# how many examples go into each optimizer step within the interval.
+TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-32}
+# Hard cap on optimizer steps per interval (9999 = effectively unlimited).
+TAFR_SFT_MAX_UPDATES=${TAFR_SFT_MAX_UPDATES:-9999}
 
-# Failure data collector
-TAFR_FAILURE_DATA_MAX_SIZE=${TAFR_FAILURE_DATA_MAX_SIZE:-null} # max wrong-response buffer size (null = unlimited)
+# Failure data collector — cleared automatically after each SFT update,
+# so this is just a safety cap in case of an unusually large interval.
+TAFR_FAILURE_DATA_MAX_SIZE=${TAFR_FAILURE_DATA_MAX_SIZE:-null} # null = unlimited
 TAFR_FAILURE_DATA_SAMPLING=${TAFR_FAILURE_DATA_SAMPLING:-recent} # recent | uniform
 
 TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}

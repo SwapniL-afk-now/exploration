@@ -795,7 +795,8 @@ class FSDPEngine(BaseEngine):
             return {"tafr_grpo/failure_sft_updates": 0.0}
         tokenizer = self._tafr_get_tokenizer()
         batch_size = int(tafr_config.get("failure_sft_batch_size", 1))
-        max_updates = int(tafr_config.get("failure_sft_max_updates_per_interval", 1))
+        # max_updates caps optimizer steps; defaults to processing all records.
+        max_updates = int(tafr_config.get("failure_sft_max_updates_per_interval", len(records)))
         updates = 0
         total_loss = 0.0
         device = next(self._tafr_failure.parameters()).device
@@ -1603,7 +1604,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
             return {"tafr_grpo/failure_sft_updates": 0.0}
         tokenizer = self._tafr_get_tokenizer()
         batch_size = int(tafr_config.get("failure_sft_batch_size", 1))
-        max_updates = int(tafr_config.get("failure_sft_max_updates_per_interval", 1))
+        # max_updates caps optimizer steps; defaults to processing all records.
+        max_updates = int(tafr_config.get("failure_sft_max_updates_per_interval", len(records)))
         updates = 0
         total_loss = 0.0
         device = next(self._tafr_failure.parameters()).device

@@ -1700,9 +1700,9 @@ class RayPPOTrainer:
             return {"tafr_grpo/did_sft_update_this_step": 0.0}
         if len(self.tafr_failure_collector) == 0:
             return {"tafr_grpo/did_sft_update_this_step": 0.0, "tafr_grpo/failure_sft_updates": 0.0}
-        records = self.tafr_failure_collector.sample(
-            min(len(self.tafr_failure_collector), self.tafr_config.failure_sft_batch_size * self.tafr_config.failure_sft_max_updates_per_interval)
-        )
+        # Use all buffered failures from this interval, then clear the buffer.
+        records = self.tafr_failure_collector.to_records()
+        self.tafr_failure_collector.clear()
         output = self.actor_rollout_wg.tafr_failure_sft_update(records, self._tafr_config_dict())
         metrics = output if isinstance(output, dict) else {}
         self.tafr_failure_model_updated_since_save = True

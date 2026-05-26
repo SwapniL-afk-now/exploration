@@ -100,7 +100,7 @@ def validate_tafr_config(config: DictConfig | dict) -> TAFRGRPOConfig:
     if custom.failure_sft_batch_size <= 0:
         raise ValueError("custom_tafr_grpo.failure_sft_batch_size must be positive.")
     if custom.failure_sft_max_updates_per_interval <= 0:
-        raise ValueError("custom_tafr_grpo.failure_sft_max_updates_per_interval must be positive.")
+        raise ValueError("custom_tafr_grpo.failure_sft_max_updates_per_interval must be positive (use 9999 for unlimited).")
     if custom.failure_data_max_size is not None and custom.failure_data_max_size <= 0:
         raise ValueError("custom_tafr_grpo.failure_data_max_size must be positive or null.")
     if custom.failure_data_sampling not in {"recent", "uniform"}:
