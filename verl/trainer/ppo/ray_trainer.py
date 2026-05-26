@@ -36,6 +36,12 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.tafr_grpo.config import (
+    should_checkpoint_and_refresh,
+    should_run_failure_sft,
+    validate_tafr_config,
+)
+from verl.experimental.tafr_grpo.failure_data_collector import FailureDataCollector
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -315,6 +321,18 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+        self.tafr_config = validate_tafr_config(self.config)
+        self.tafr_enabled = bool(self.tafr_config.enable)
+        self.tafr_failure_collector = (
+            FailureDataCollector(
+                max_size=self.tafr_config.failure_data_max_size,
+                sampling=self.tafr_config.failure_data_sampling,
+                seed=self.config.actor_rollout_ref.actor.data_loader_seed,
+            )
+            if self.tafr_enabled
+            else None
+        )
+        self.tafr_failure_model_updated_since_save = False
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1460,6 +1478,15 @@ class RayPPOTrainer:
             dataloader_kwargs={"shuffle": shuffle},
             compute_loss=True,
         )
+        if self.tafr_enabled:
+            tu.assign_non_tensor(
+                batch_td,
+                custom_tafr_grpo={
+                    "enable": True,
+                    "beta": self.tafr_config.beta,
+                    "variant": self.tafr_config.variant,
+                },
+            )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
@@ -1468,6 +1495,87 @@ class RayPPOTrainer:
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
         return actor_output
+
+    def _tafr_group_reward_mean(self, batch: DataProto, reward_tensor: torch.Tensor) -> torch.Tensor:
+        rewards = reward_tensor.sum(dim=-1).detach().float().clamp(0.0, 1.0)
+        uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [])]
+        if len(uids) != rewards.shape[0]:
+            return rewards
+        group_means = {}
+        for uid in dict.fromkeys(uids):
+            idx = torch.tensor([i for i, item in enumerate(uids) if item == uid], device=rewards.device)
+            group_means[uid] = rewards.index_select(0, idx).mean()
+        return torch.stack([group_means[uid] for uid in uids]).to(device=rewards.device)
+
+    def _tafr_annotate_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> None:
+        """Attach TAFR fields for actor-generated rows.
+
+        Full replay rows are produced by ``replay_sampler`` and can be appended
+        by a backend-specific integration. Actor rows always carry group reward
+        means and anchor log-prob slots so the loss path is active and testable.
+        """
+
+        if not self.tafr_enabled:
+            return
+        bsz = batch.batch.batch_size[0]
+        group_reward_mean = self._tafr_group_reward_mean(batch, reward_tensor).to(batch.batch["responses"].device)
+        response_mask = batch.batch["response_mask"]
+        batch.batch["tafr_is_replay"] = torch.zeros((bsz,), dtype=torch.bool, device=response_mask.device)
+        batch.batch["tafr_group_reward_mean"] = group_reward_mean
+        if "tafr_anchor_log_probs" not in batch.batch:
+            # The production anchor worker should overwrite this with frozen
+            # pi_anchor logprobs. This fallback keeps the optional path stable
+            # and uses the proximal pre-update policy as the lagged anchor.
+            batch.batch["tafr_anchor_log_probs"] = batch.batch["old_log_probs"].detach().clone()
+        if "tafr_replay_log_probs" not in batch.batch:
+            batch.batch["tafr_replay_log_probs"] = torch.zeros_like(batch.batch["old_log_probs"])
+
+    def _tafr_collect_failures(self, batch: DataProto, reward_tensor: torch.Tensor) -> int:
+        if not self.tafr_enabled or self.tafr_failure_collector is None:
+            return 0
+        rewards = reward_tensor.sum(dim=-1).detach().cpu().float().tolist()
+        prompts = batch.batch["prompts"].detach().cpu()
+        responses = batch.batch["responses"].detach().cpu()
+        response_mask = batch.batch["response_mask"].detach().cpu()
+        uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [""] * len(rewards))]
+
+        collected = 0
+        for i, reward in enumerate(rewards):
+            if float(reward) != 0.0:
+                continue
+            response_len = int(response_mask[i].sum().item())
+            prompt_text = self.tokenizer.decode(prompts[i], skip_special_tokens=True)
+            response_text = self.tokenizer.decode(responses[i, :response_len], skip_special_tokens=True)
+            collected += int(
+                self.tafr_failure_collector.add(
+                    prompt=prompt_text,
+                    response=response_text,
+                    reward=0,
+                    metadata={"uid": uids[i], "global_grpo_step": self.global_steps},
+                )
+            )
+        return collected
+
+    def _tafr_schedule_metrics(self, wrong_collected: int) -> dict[str, float]:
+        if not self.tafr_enabled or self.tafr_failure_collector is None:
+            return {}
+        did_sft_update = should_run_failure_sft(self.global_steps, self.tafr_config)
+        did_save = should_checkpoint_and_refresh(self.global_steps, self.tafr_config)
+        if did_sft_update and len(self.tafr_failure_collector) > 0:
+            # The separate failure-SFT worker consumes this stream in the full
+            # backend integration. Keep the global-clock signal explicit here.
+            self.tafr_failure_model_updated_since_save = True
+        if did_save:
+            self.tafr_failure_model_updated_since_save = False
+        return {
+            "tafr_grpo/global_grpo_step": float(self.global_steps),
+            "tafr_grpo/did_sft_update_this_step": float(did_sft_update),
+            "tafr_grpo/did_checkpoint_save_this_step": float(did_save),
+            "tafr_grpo/failure_dataset_size": float(len(self.tafr_failure_collector)),
+            "tafr_grpo/number_wrong_responses_collected_this_step": float(wrong_collected),
+            "tafr_grpo/ema_gamma": float(self.tafr_config.ema_gamma),
+            "tafr_grpo/mix_eta": float(self.tafr_config.mix_eta),
+        }
 
     def _update_critic(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
@@ -1657,6 +1765,7 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        tafr_wrong_collected = self._tafr_collect_failures(batch, reward_tensor)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1765,6 +1874,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        self._tafr_annotate_actor_batch(batch, reward_tensor)
 
                     # update critic
                     if self.use_critic:
@@ -1794,9 +1904,14 @@ class RayPPOTrainer:
                         # 2. It's the last training step.
                         # 3. The current step number is a multiple of the save frequency.
                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                        if self.config.trainer.save_freq > 0 and (
+                        tafr_save_step = should_checkpoint_and_refresh(self.global_steps, self.tafr_config)
+                        if (self.config.trainer.save_freq > 0 or tafr_save_step) and (
                             is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
+                            or tafr_save_step
+                            or (
+                                self.config.trainer.save_freq > 0
+                                and self.global_steps % self.config.trainer.save_freq == 0
+                            )
                             or esi_close_to_expiration
                         ):
                             if esi_close_to_expiration:
@@ -1810,6 +1925,7 @@ class RayPPOTrainer:
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        metrics.update(self._tafr_schedule_metrics(tafr_wrong_collected))
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

@@ -109,6 +109,57 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+# config for Trajectory-Anchored Failure-Replay GRPO
+custom_tafr_grpo:
+
+  # Whether to enable the TAFR-GRPO co-training path
+  enable: false
+
+  # Single KL coefficient used for both anchor and replay KL terms
+  beta: 0.0
+
+  # EMA decay for saved GRPO and failure-SFT checkpoints
+  ema_gamma: 0.99
+
+  # Mixture weight for EMA/reference model interpolation
+  mix_eta: 1.0
+
+  # Run failure-SFT updates every N GRPO steps
+  sft_update_interval_grpo_steps: 5
+
+  # Save actor/failure checkpoints and refresh EMA models every N GRPO steps
+  checkpoint_interval_grpo_steps: 10
+
+  # Number of replay samples generated per prompt from frozen pi_replay
+  replay_num_samples: 1
+
+  # Whether to require verl built-in KL loss and reward KL to be disabled
+  disable_builtin_kl: true
+
+  # Learning rate for the separate failure-SFT optimizer
+  failure_sft_lr: 1.0e-6
+
+  # Batch size for failure-SFT updates
+  failure_sft_batch_size: 8
+
+  # Maximum failure-SFT optimizer updates at each SFT interval
+  failure_sft_max_updates_per_interval: 1
+
+  # Maximum number of wrong-response examples retained in the failure stream
+  failure_data_max_size: null
+
+  # Failure stream sampling policy: recent or uniform
+  failure_data_sampling: recent
+
+  # Directory for materialized adaptive anchor checkpoints
+  anchor_checkpoint_dir: null
+
+  # Directory for materialized replay checkpoints
+  replay_checkpoint_dir: null
+
+  # TAFR variant: full, anchor_only, or replay_only
+  variant: full
+
 # config for the trainer
 trainer:
 

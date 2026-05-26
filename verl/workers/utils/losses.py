@@ -16,6 +16,7 @@
 import torch
 from tensordict import TensorDict
 
+from verl.experimental.tafr_grpo.tafr_loss import compute_tafr_grpo_auxiliary_loss
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -86,6 +87,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
 
     metrics = {}
 
+    tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default=None)
+    tafr_group_ids = _as_list(data.get("uid", None)) if tafr_config and tafr_config.get("enable", False) else []
+
     wasserstein_guidance = getattr(config, "wasserstein_guidance", {})
     wg_enabled = bool(wasserstein_guidance.get("enable", False))
     wg_group_ids = _as_list(data.get("uid", None)) if wg_enabled else []
@@ -100,9 +104,22 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         for field in ("responses", "rm_scores", "token_level_rewards"):
             if field in data:
                 fields.append(field)
+    tafr_enabled = bool(tafr_config and tafr_config.get("enable", False))
+    if tafr_enabled:
+        for field in (
+            "tafr_is_replay",
+            "tafr_group_reward_mean",
+            "tafr_anchor_log_probs",
+            "tafr_replay_log_probs",
+        ):
+            if field in data:
+                fields.append(field)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
+    policy_response_mask = response_mask
+    if tafr_enabled and "tafr_is_replay" in data:
+        policy_response_mask = response_mask & (~data["tafr_is_replay"].to(bool).unsqueeze(-1))
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
@@ -117,7 +134,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
-        response_mask=response_mask,
+        response_mask=policy_response_mask,
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
@@ -132,6 +149,30 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
     ppo_loss_coef = float(getattr(config, "ppo_loss_coef", 1.0))
     policy_loss = ppo_loss_coef * pg_loss
     metrics["actor/ppo_loss_coef"] = ppo_loss_coef
+
+    if tafr_enabled:
+        missing = [
+            field
+            for field in ("tafr_is_replay", "tafr_group_reward_mean")
+            if field not in data
+        ]
+        if missing:
+            raise ValueError(f"TAFR-GRPO batch is missing required fields: {missing}")
+        tafr_output = compute_tafr_grpo_auxiliary_loss(
+            log_prob=log_prob,
+            response_mask=response_mask,
+            is_replay=data["tafr_is_replay"],
+            group_reward_mean=data["tafr_group_reward_mean"],
+            beta=float(tafr_config.get("beta", 0.0)),
+            variant=str(tafr_config.get("variant", "full")),
+            anchor_log_prob=data.get("tafr_anchor_log_probs", None),
+            replay_log_prob=data.get("tafr_replay_log_probs", None),
+            group_ids=tafr_group_ids,
+        )
+        policy_loss += tafr_output.loss
+        tafr_metrics = Metric.from_dict(tafr_output.metrics, aggregation=AggregationType.MEAN)
+        metrics.update(tafr_metrics)
+        metrics["tafr_grpo/loss_grpo"] = Metric(value=pg_loss, aggregation=metric_aggregation)
 
     # add entropy loss
     if entropy is not None:
