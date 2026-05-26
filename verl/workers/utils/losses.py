@@ -101,7 +101,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
     if wg_enabled:
-        for field in ("responses", "rm_scores", "token_level_rewards"):
+        for field in ("rm_scores", "token_level_rewards"):
             if field in data:
                 fields.append(field)
     tafr_enabled = bool(tafr_config and tafr_config.get("enable", False))
@@ -184,7 +184,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         wg_stats = compute_wasserstein_guidance_loss(
             log_prob=log_prob,
             response_mask=response_mask,
-            responses=data.get("responses", None),
             rewards=rewards,
             group_ids=wg_group_ids,
             alpha_transport=float(wasserstein_guidance.get("alpha_transport", 0.2)),

@@ -48,19 +48,29 @@ def _sequence_log_probs(log_prob: torch.Tensor, response_mask: torch.Tensor) -> 
     return (weights.detach() * log_prob).sum(dim=-1)
 
 
-def _response_embeddings(responses: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
-    ids = responses.detach().to(dtype=torch.float32)
+def _response_embeddings(log_prob: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Embed each response as a probability-weighted sum of sinusoidal positional features.
+
+    Using log_prob (the model's own probability signal) rather than raw token IDs means the
+    cost matrix reflects what the model has actually learned, not an arbitrary token-ID hash.
+    """
     mask = response_mask.detach().to(dtype=torch.float32)
-    freqs = torch.arange(1, _EMBED_DIM + 1, device=responses.device, dtype=torch.float32)
-    phases = ids.unsqueeze(-1) * freqs.view(1, 1, -1) * 1.0e-4
-    features = torch.sin(phases) + torch.cos(phases * 0.5)
-    features = features * mask.unsqueeze(-1)
-    emb = features.sum(dim=1) / (mask.sum(dim=1, keepdim=True) + EPS)
+    probs = log_prob.detach().float().exp()  # [bsz, seq_len]
+    seq_len = log_prob.shape[-1]
+    freqs = torch.arange(1, _EMBED_DIM + 1, device=log_prob.device, dtype=torch.float32)
+    positions = torch.arange(seq_len, device=log_prob.device, dtype=torch.float32)
+    # [seq_len, _EMBED_DIM] sinusoidal positional features
+    phases = positions.unsqueeze(-1) * freqs.view(1, -1) * (2.0 * 3.141592653589793 / max(seq_len, 1))
+    features = torch.sin(phases) + torch.cos(phases)  # [seq_len, _EMBED_DIM]
+    # Weight positional features by token probabilities then mask
+    weights = probs * mask  # [bsz, seq_len]
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + EPS)
+    emb = (weights.unsqueeze(-1) * features.unsqueeze(0)).sum(dim=1)  # [bsz, _EMBED_DIM]
     return F.normalize(emb, p=2, dim=-1, eps=EPS).detach()
 
 
-def _cost_matrix(group_responses: torch.Tensor, group_mask: torch.Tensor) -> torch.Tensor:
-    emb = _response_embeddings(group_responses, group_mask)
+def _cost_matrix(group_log_prob: torch.Tensor, group_mask: torch.Tensor) -> torch.Tensor:
+    emb = _response_embeddings(group_log_prob, group_mask)
     cost = (1.0 - emb @ emb.transpose(0, 1)).clamp_(0.0, 1.0)
     cost.fill_diagonal_(0.0)
     return cost.detach()
@@ -84,13 +94,13 @@ def compute_wasserstein_guidance_loss(
     *,
     log_prob: torch.Tensor,
     response_mask: torch.Tensor,
-    responses: torch.Tensor | None,
     rewards: torch.Tensor | None,
     group_ids: list[Any],
     alpha_transport: float,
+    responses: torch.Tensor | None = None,  # kept for API compatibility, no longer used
 ) -> WassersteinGuidanceStats:
     zero = log_prob.sum() * 0.0
-    if responses is None or rewards is None or len(group_ids) != log_prob.shape[0]:
+    if rewards is None or len(group_ids) != log_prob.shape[0]:
         return WassersteinGuidanceStats(zero, 0, 0.0, 0.0)
 
     rewards = rewards.to(device=log_prob.device, dtype=log_prob.dtype).view(-1)
@@ -122,7 +132,7 @@ def compute_wasserstein_guidance_loss(
         q[correct] = p_sg[correct] + alpha_transport * p_wrong * p_sg[correct] / (p_correct + EPS)
         q = (q / (q.sum() + EPS)).detach()
 
-        cost = _cost_matrix(responses.index_select(0, idx), response_mask.index_select(0, idx))
+        cost = _cost_matrix(log_prob.index_select(0, idx), response_mask.index_select(0, idx))
         transport_cost = _sinkhorn_cost(p_theta, q, cost)
         moved_mass = alpha_transport * p_wrong
         group_losses.append(transport_cost / (moved_mass + EPS))
