@@ -740,54 +740,21 @@ class FSDPEngine(BaseEngine):
                 self._tafr_tokenizer.pad_token = self._tafr_tokenizer.eos_token
         return self._tafr_tokenizer
 
-    def tafr_generate_replay(self, data: TensorDict) -> TensorDict:
-        cfg = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(cfg)
+    def tafr_compute_replay_log_prob(self, data: TensorDict) -> TensorDict:
+        """Evaluate frozen pi_replay on the actor-generated (pi_old) rollout samples.
+
+        No generation happens here. Responses were already sampled by pi_old during
+        rollout. We just score them under pi_replay so the actor loss can compute:
+            - beta * (1 - r_bar_x) * D_KL(pi_replay || pi_theta)
+        using the same y_i samples used for GRPO and anchor KL.
+        """
+        self.tafr_init(tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {})
         padded = data.to_padded_tensor()
-        prompts = padded["prompts"].to(next(self.module.parameters()).device)
-        max_response_length = int(tu.get_non_tensor_data(data=data, key="max_response_length", default=prompts.shape[-1]))
-        num_samples = int(cfg.get("replay_num_samples", 1))
-        pad_token_id = int(tu.get_non_tensor_data(data=data, key="pad_token_id", default=0))
-        eos_token_id = int(tu.get_non_tensor_data(data=data, key="eos_token_id", default=pad_token_id))
-        temperature = float(tu.get_non_tensor_data(data=data, key="temperature", default=1.0))
-        top_p = float(tu.get_non_tensor_data(data=data, key="top_p", default=1.0))
-        prompt_attention = prompts.ne(pad_token_id).long()
-        replay = self._tafr_replay
-        replay.eval()
-        with torch.no_grad():
-            generated = replay.generate(
-                input_ids=prompts,
-                attention_mask=prompt_attention,
-                max_new_tokens=max_response_length,
-                do_sample=temperature > 0,
-                temperature=max(temperature, 1.0e-6),
-                top_p=top_p,
-                num_return_sequences=num_samples,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id,
-            )
-        prompt_len = prompts.shape[-1]
-        response = generated[:, prompt_len : prompt_len + max_response_length]
-        if response.shape[-1] < max_response_length:
-            response = torch.nn.functional.pad(response, (0, max_response_length - response.shape[-1]), value=pad_token_id)
-        prompts_rep = prompts.repeat_interleave(num_samples, dim=0)
-        input_ids = torch.cat([prompts_rep, response], dim=-1)
-        response_mask = response.ne(pad_token_id).long()
-        attention_mask = torch.cat([prompts_rep.ne(pad_token_id).long(), response_mask], dim=-1)
-        position_ids = torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0)
-        replay_lp = self._tafr_model_log_probs(replay, input_ids, attention_mask, response_mask)
-        return TensorDict(
-            {
-                "prompts": prompts_rep.detach(),
-                "responses": response.detach(),
-                "input_ids": input_ids.detach(),
-                "attention_mask": attention_mask.detach(),
-                "position_ids": position_ids.detach(),
-                "response_mask": response_mask.detach(),
-                "tafr_replay_log_probs": replay_lp.detach(),
-            },
-            batch_size=[input_ids.shape[0]],
-        )
+        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
+        attention_mask = padded["attention_mask"].to(input_ids.device)
+        response_mask = padded["response_mask"].to(input_ids.device)
+        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
+        return TensorDict({"tafr_replay_log_probs": replay_lp}, batch_size=[replay_lp.shape[0]])
 
     def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
         self.tafr_init(tafr_config)
@@ -1549,54 +1516,21 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 self._tafr_tokenizer.pad_token = self._tafr_tokenizer.eos_token
         return self._tafr_tokenizer
 
-    def tafr_generate_replay(self, data: TensorDict) -> TensorDict:
-        cfg = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(cfg)
+    def tafr_compute_replay_log_prob(self, data: TensorDict) -> TensorDict:
+        """Evaluate frozen pi_replay on the actor-generated (pi_old) rollout samples.
+
+        No generation happens here. Responses were already sampled by pi_old during
+        rollout. We just score them under pi_replay so the actor loss can compute:
+            - beta * (1 - r_bar_x) * D_KL(pi_replay || pi_theta)
+        using the same y_i samples used for GRPO and anchor KL.
+        """
+        self.tafr_init(tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {})
         padded = data.to_padded_tensor()
-        prompts = padded["prompts"].to(next(self.module.parameters()).device)
-        max_response_length = int(tu.get_non_tensor_data(data=data, key="max_response_length", default=prompts.shape[-1]))
-        num_samples = int(cfg.get("replay_num_samples", 1))
-        pad_token_id = int(tu.get_non_tensor_data(data=data, key="pad_token_id", default=0))
-        eos_token_id = int(tu.get_non_tensor_data(data=data, key="eos_token_id", default=pad_token_id))
-        temperature = float(tu.get_non_tensor_data(data=data, key="temperature", default=1.0))
-        top_p = float(tu.get_non_tensor_data(data=data, key="top_p", default=1.0))
-        prompt_attention = prompts.ne(pad_token_id).long()
-        replay = self._tafr_replay
-        replay.eval()
-        with torch.no_grad():
-            generated = replay.generate(
-                input_ids=prompts,
-                attention_mask=prompt_attention,
-                max_new_tokens=max_response_length,
-                do_sample=temperature > 0,
-                temperature=max(temperature, 1.0e-6),
-                top_p=top_p,
-                num_return_sequences=num_samples,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id,
-            )
-        prompt_len = prompts.shape[-1]
-        response = generated[:, prompt_len : prompt_len + max_response_length]
-        if response.shape[-1] < max_response_length:
-            response = torch.nn.functional.pad(response, (0, max_response_length - response.shape[-1]), value=pad_token_id)
-        prompts_rep = prompts.repeat_interleave(num_samples, dim=0)
-        input_ids = torch.cat([prompts_rep, response], dim=-1)
-        response_mask = response.ne(pad_token_id).long()
-        attention_mask = torch.cat([prompts_rep.ne(pad_token_id).long(), response_mask], dim=-1)
-        position_ids = torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0)
-        replay_lp = self._tafr_model_log_probs(replay, input_ids, attention_mask, response_mask)
-        return TensorDict(
-            {
-                "prompts": prompts_rep.detach(),
-                "responses": response.detach(),
-                "input_ids": input_ids.detach(),
-                "attention_mask": attention_mask.detach(),
-                "position_ids": position_ids.detach(),
-                "response_mask": response_mask.detach(),
-                "tafr_replay_log_probs": replay_lp.detach(),
-            },
-            batch_size=[input_ids.shape[0]],
-        )
+        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
+        attention_mask = padded["attention_mask"].to(input_ids.device)
+        response_mask = padded["response_mask"].to(input_ids.device)
+        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
+        return TensorDict({"tafr_replay_log_probs": replay_lp}, batch_size=[replay_lp.shape[0]])
 
     def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
         self.tafr_init(tafr_config)

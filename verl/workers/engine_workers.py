@@ -717,9 +717,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="purple", role="tafr_replay_generate")
-    def tafr_generate_replay(self, data: TensorDict) -> TensorDict:
-        output = self.actor.engine.tafr_generate_replay(data)
+    @DistProfiler.annotate(color="purple", role="tafr_replay_log_prob")
+    def tafr_compute_replay_log_prob(self, data: TensorDict) -> TensorDict:
+        output = self.actor.engine.tafr_compute_replay_log_prob(data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

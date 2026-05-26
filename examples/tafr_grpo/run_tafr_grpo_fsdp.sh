@@ -76,10 +76,6 @@ TAFR_BETA=${TAFR_BETA:-0.01}                     # KL coefficient for both ancho
 TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}           # EMA decay for GRPO and failure EMA trackers
 TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}               # mix weight: theta_anchor = (1-eta)*ref + eta*ema
 
-# Replay: M responses generated per prompt from frozen pi_replay for the replay KL estimate.
-# Higher M = better KL estimate but proportionally more GPU time.
-TAFR_REPLAY_NUM_SAMPLES=${TAFR_REPLAY_NUM_SAMPLES:-4}
-
 # Failure-SFT schedule
 TAFR_SFT_UPDATE_INTERVAL=${TAFR_SFT_UPDATE_INTERVAL:-5}       # run SFT every N GRPO steps
 TAFR_CHECKPOINT_INTERVAL=${TAFR_CHECKPOINT_INTERVAL:-10}      # save + refresh EMA every N GRPO steps
@@ -231,8 +227,6 @@ TAFR=(
     custom_tafr_grpo.beta="${TAFR_BETA}"
     custom_tafr_grpo.ema_gamma="${TAFR_EMA_GAMMA}"
     custom_tafr_grpo.mix_eta="${TAFR_MIX_ETA}"
-    # Replay
-    custom_tafr_grpo.replay_num_samples="${TAFR_REPLAY_NUM_SAMPLES}"
     # Disable verl built-in KL (TAFR manages its own)
     custom_tafr_grpo.disable_builtin_kl=true
     # Failure-SFT schedule

@@ -32,7 +32,6 @@ class TAFRGRPOConfig:
     mix_eta: float = 1.0
     sft_update_interval_grpo_steps: int = 5
     checkpoint_interval_grpo_steps: int = 10
-    replay_num_samples: int = 1
     disable_builtin_kl: bool = True
     failure_sft_lr: float = 1e-6
     failure_sft_batch_size: int = 8
@@ -95,8 +94,6 @@ def validate_tafr_config(config: DictConfig | dict) -> TAFRGRPOConfig:
         raise ValueError("custom_tafr_grpo.sft_update_interval_grpo_steps must be positive.")
     if custom.checkpoint_interval_grpo_steps <= 0:
         raise ValueError("custom_tafr_grpo.checkpoint_interval_grpo_steps must be positive.")
-    if custom.replay_num_samples <= 0:
-        raise ValueError("custom_tafr_grpo.replay_num_samples must be positive.")
     if custom.failure_sft_batch_size <= 0:
         raise ValueError("custom_tafr_grpo.failure_sft_batch_size must be positive.")
     if custom.failure_sft_max_updates_per_interval <= 0:

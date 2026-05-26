@@ -130,9 +130,6 @@ custom_tafr_grpo:
   # Save actor/failure checkpoints and refresh EMA models every N GRPO steps
   checkpoint_interval_grpo_steps: 10
 
-  # Number of replay samples generated per prompt from frozen pi_replay
-  replay_num_samples: 1
-
   # Whether to require verl built-in KL loss and reward KL to be disabled
   disable_builtin_kl: true
 

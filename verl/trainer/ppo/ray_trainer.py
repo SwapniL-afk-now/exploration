@@ -1517,7 +1517,6 @@ class RayPPOTrainer:
             "mix_eta": float(self.tafr_config.mix_eta),
             "sft_update_interval_grpo_steps": int(self.tafr_config.sft_update_interval_grpo_steps),
             "checkpoint_interval_grpo_steps": int(self.tafr_config.checkpoint_interval_grpo_steps),
-            "replay_num_samples": int(self.tafr_config.replay_num_samples),
             "failure_sft_lr": float(self.tafr_config.failure_sft_lr),
             "failure_sft_batch_size": int(self.tafr_config.failure_sft_batch_size),
             "failure_sft_max_updates_per_interval": int(self.tafr_config.failure_sft_max_updates_per_interval),
@@ -1538,10 +1537,7 @@ class RayPPOTrainer:
     def _tafr_annotate_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> None:
         if not self.tafr_enabled:
             return
-        bsz = batch.batch.batch_size[0]
         group_reward_mean = self._tafr_group_reward_mean(batch, reward_tensor).to(batch.batch["responses"].device)
-        response_mask = batch.batch["response_mask"]
-        batch.batch["tafr_is_replay"] = torch.zeros((bsz,), dtype=torch.bool, device=response_mask.device)
         batch.batch["tafr_group_reward_mean"] = group_reward_mean
         if "tafr_anchor_log_probs" not in batch.batch:
             batch.batch["tafr_anchor_log_probs"] = torch.zeros_like(batch.batch["old_log_probs"])
@@ -1559,113 +1555,22 @@ class RayPPOTrainer:
             raise RuntimeError("TAFR anchor worker did not return tafr_anchor_log_probs")
         batch.batch["tafr_anchor_log_probs"] = anchor_log_probs.to(batch.batch["old_log_probs"].device).float()
 
-    def _tafr_prompt_indices(self, batch: DataProto) -> list[int]:
-        uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [])]
-        seen = set()
-        indices = []
-        for idx, uid in enumerate(uids):
-            if uid in seen:
-                continue
-            seen.add(uid)
-            indices.append(idx)
-        return indices or list(range(batch.batch.batch_size[0]))
+    def _tafr_compute_replay_log_probs(self, batch: DataProto) -> None:
+        """Score the pi_old rollout samples under frozen pi_replay.
 
-    def _tafr_build_replay_batch(self, batch: DataProto) -> DataProto | None:
+        No generation — same responses already sampled by pi_old, just evaluated
+        under pi_replay so the actor loss can compute the replay KL repulsion term:
+            - beta * (1 - r_bar_x) * D_KL(pi_replay || pi_theta)
+        """
         if not self.tafr_enabled or self.tafr_config.variant == "anchor_only":
-            return None
-        prompt_indices = self._tafr_prompt_indices(batch)
-        prompt_td = batch.select_idxs(prompt_indices).to_tensordict()
-        rollout_cfg = self.config.actor_rollout_ref.rollout
-        tu.assign_non_tensor(
-            prompt_td,
-            custom_tafr_grpo=self._tafr_config_dict(),
-            max_response_length=int(self.config.data.max_response_length),
-            pad_token_id=int(self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0),
-            eos_token_id=int(self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0),
-            temperature=float(rollout_cfg.temperature),
-            top_p=float(rollout_cfg.top_p),
-        )
-        replay_output = self.actor_rollout_wg.tafr_generate_replay(prompt_td)
-        if replay_output is None:
-            return None
-        prompts = tu.get(replay_output, "prompts")
-        if prompts is None or prompts.shape[0] == 0:
-            return None
-        device = batch.batch["responses"].device
-        replay_tensors = {
-            "prompts": tu.get(replay_output, "prompts").to(device),
-            "responses": tu.get(replay_output, "responses").to(device),
-            "input_ids": tu.get(replay_output, "input_ids").to(device),
-            "attention_mask": tu.get(replay_output, "attention_mask").to(device),
-            "position_ids": tu.get(replay_output, "position_ids").to(device),
-            "response_mask": tu.get(replay_output, "response_mask").to(device),
-            "tafr_replay_log_probs": tu.get(replay_output, "tafr_replay_log_probs").to(device).float(),
-        }
-        n_replay = replay_tensors["responses"].shape[0]
-        repeat = max(1, n_replay // max(1, len(prompt_indices)))
-        group_rewards = batch.batch["tafr_group_reward_mean"].detach().index_select(
-            0, torch.tensor(prompt_indices, device=device)
-        ).repeat_interleave(repeat)[:n_replay]
-
-        tensor_data = {}
-        for key, value in batch.batch.items():
-            if key in replay_tensors:
-                tensor_data[key] = replay_tensors[key]
-                continue
-            selected = value.index_select(0, torch.tensor(prompt_indices, device=value.device)).repeat_interleave(
-                repeat, dim=0
-            )[:n_replay]
-            if key in {
-                "old_log_probs",
-                "advantages",
-                "token_level_rewards",
-                "token_level_scores",
-                "returns",
-                "values",
-                "ref_log_prob",
-                "rollout_log_probs",
-                "tafr_anchor_log_probs",
-            }:
-                selected = torch.zeros_like(selected)
-            tensor_data[key] = selected
-        tensor_data["tafr_is_replay"] = torch.ones((n_replay,), dtype=torch.bool, device=device)
-        tensor_data["tafr_group_reward_mean"] = group_rewards.to(device)
-        tensor_data["tafr_replay_log_probs"] = replay_tensors["tafr_replay_log_probs"]
-        if "old_log_probs" in tensor_data:
-            tensor_data["old_log_probs"] = torch.zeros_like(tensor_data["tafr_replay_log_probs"])
-        if "advantages" in tensor_data:
-            tensor_data["advantages"] = torch.zeros_like(tensor_data["tafr_replay_log_probs"])
-
-        non_tensor = {}
-        for key, value in batch.non_tensor_batch.items():
-            if len(value) == batch.batch.batch_size[0]:
-                non_tensor[key] = np.asarray(value)[prompt_indices].repeat(repeat, axis=0)[:n_replay]
-            else:
-                non_tensor[key] = value
-        replay_proto = DataProto.from_single_dict(tensor_data)
-        replay_proto.non_tensor_batch.update(non_tensor)
-        replay_proto.meta_info.update(batch.meta_info)
-        return replay_proto
-
-    def _tafr_append_replay_rows(self, batch: DataProto) -> DataProto:
-        replay_batch = self._tafr_build_replay_batch(batch)
-        if replay_batch is None:
-            return batch
-        # The actor mini-batch iterator requires total_rows % mini_batch_size == 0.
-        # mini_batch_size = ppo_mini_batch_size * rollout.n (row-level, not prompt-level).
-        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
-        mini_batch_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * rollout_n
-        actor_rows = batch.batch.batch_size[0]
-        replay_rows = replay_batch.batch.batch_size[0]
-        total = actor_rows + replay_rows
-        if mini_batch_size > 0 and total % mini_batch_size != 0:
-            # Truncate replay rows to the largest multiple of mini_batch_size that fits.
-            keep = ((total // mini_batch_size) * mini_batch_size) - actor_rows
-            if keep <= 0:
-                # Cannot fit even one mini-batch worth of replay rows; skip replay entirely.
-                return batch
-            replay_batch = replay_batch.select_idxs(list(range(keep)))
-        return DataProto.concat([batch, replay_batch])
+            return
+        batch_td = batch.to_tensordict()
+        tu.assign_non_tensor(batch_td, custom_tafr_grpo=self._tafr_config_dict())
+        output = self.actor_rollout_wg.tafr_compute_replay_log_prob(batch_td)
+        replay_log_probs = tu.get(output, "tafr_replay_log_probs")
+        if replay_log_probs is None:
+            raise RuntimeError("TAFR replay worker did not return tafr_replay_log_probs")
+        batch.batch["tafr_replay_log_probs"] = replay_log_probs.to(batch.batch["old_log_probs"].device).float()
 
     def _tafr_collect_failures(self, batch: DataProto, reward_tensor: torch.Tensor) -> int:
         if not self.tafr_enabled or self.tafr_failure_collector is None:
@@ -2020,7 +1925,7 @@ class RayPPOTrainer:
                         )
                         self._tafr_annotate_actor_batch(batch, reward_tensor)
                         self._tafr_compute_anchor_log_probs(batch)
-                        batch = self._tafr_append_replay_rows(batch)
+                        self._tafr_compute_replay_log_probs(batch)
 
                     # update critic
                     if self.use_critic:

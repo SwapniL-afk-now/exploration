@@ -56,7 +56,6 @@ def test_tafr_replay_loss_zero_for_all_correct_group():
     out = compute_tafr_grpo_auxiliary_loss(
         log_prob=log_prob,
         response_mask=torch.ones_like(log_prob, dtype=torch.bool),
-        is_replay=torch.tensor([True]),
         group_reward_mean=torch.tensor([1.0]),
         beta=0.7,
         variant="replay_only",
@@ -71,7 +70,6 @@ def test_tafr_replay_loss_full_for_all_wrong_group():
     out = compute_tafr_grpo_auxiliary_loss(
         log_prob=log_prob,
         response_mask=torch.ones_like(log_prob, dtype=torch.bool),
-        is_replay=torch.tensor([True]),
         group_reward_mean=torch.tensor([0.0]),
         beta=0.5,
         variant="replay_only",
