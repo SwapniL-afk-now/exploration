@@ -77,7 +77,7 @@ TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}           # EMA decay for GRPO and failur
 TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}               # mix weight: theta_anchor = (1-eta)*ref + eta*ema
 
 # Failure-SFT schedule
-TAFR_SFT_UPDATE_INTERVAL=${TAFR_SFT_UPDATE_INTERVAL:-5}       # run SFT every N GRPO steps
+TAFR_SFT_UPDATE_INTERVAL=${TAFR_SFT_UPDATE_INTERVAL:-2}       # run SFT every N GRPO steps
 TAFR_CHECKPOINT_INTERVAL=${TAFR_CHECKPOINT_INTERVAL:-10}      # save + refresh EMA every N GRPO steps
 
 # Failure-SFT optimizer
@@ -85,7 +85,7 @@ TAFR_SFT_LR=${TAFR_SFT_LR:-1.0e-6}                           # failure-SFT learn
 # Chunk size when iterating over the interval's buffered failures.
 # The buffer is cleared after every SFT update, so this controls
 # how many examples go into each optimizer step within the interval.
-TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-16}
+TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-4}
 # Hard cap on optimizer steps per interval (9999 = effectively unlimited).
 TAFR_SFT_MAX_UPDATES=${TAFR_SFT_MAX_UPDATES:-9999}
 

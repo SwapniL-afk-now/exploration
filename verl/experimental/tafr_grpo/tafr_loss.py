@@ -90,7 +90,10 @@ def compute_tafr_grpo_auxiliary_loss(
 
     if variant in {"full", "anchor_only"} and anchor_log_prob is not None:
         frozen_anchor = anchor_log_prob.to(device=log_prob.device, dtype=log_prob.dtype).detach()
-        anchor_seq_kl = response_length_normalized_mean(log_prob - frozen_anchor, response_mask)
+        # k3 estimator: (r-1) - log(r), lower variance than k1 log(r)
+        log_ratio_anchor = (log_prob - frozen_anchor).clamp(min=-20, max=20)
+        r_anchor = torch.exp(log_ratio_anchor)
+        anchor_seq_kl = response_length_normalized_mean(((r_anchor - 1) - log_ratio_anchor).clamp(min=-10, max=10), response_mask)
         anchor_loss = _group_mean(anchor_seq_kl, group_ids)
         anchor_kl_metric = float(anchor_seq_kl.detach().mean().cpu())
         actor_lp_metric = float(response_length_normalized_mean(log_prob.detach(), response_mask).mean().cpu())
@@ -98,7 +101,10 @@ def compute_tafr_grpo_auxiliary_loss(
 
     if variant in {"full", "replay_only"} and replay_log_prob is not None:
         frozen_replay = replay_log_prob.to(device=log_prob.device, dtype=log_prob.dtype).detach()
-        replay_seq_kl = response_length_normalized_mean(frozen_replay - log_prob, response_mask)
+        # k3 estimator for D_KL(pi_replay || pi_theta): log ratio is frozen_replay - log_prob
+        log_ratio_replay = (frozen_replay - log_prob).clamp(min=-20, max=20)
+        r_replay = torch.exp(log_ratio_replay)
+        replay_seq_kl = response_length_normalized_mean(((r_replay - 1) - log_ratio_replay).clamp(min=-10, max=10), response_mask)
         gated_replay_seq_kl = gate * replay_seq_kl
         replay_loss = _group_mean(gated_replay_seq_kl, group_ids)
         replay_kl_metric = float(replay_seq_kl.detach().mean().cpu())
