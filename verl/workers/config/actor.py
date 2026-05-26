@@ -19,6 +19,7 @@ from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig, RolloutCorrectionConfig
+from verl.trainer.ppo.exploration import ExplorationConfig
 from verl.utils.profiler.config import ProfilerConfig
 from verl.utils.qat import QATConfig
 
@@ -35,6 +36,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "WassersteinGuidanceConfig",
+    "ExplorationConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -133,6 +135,7 @@ class ActorConfig(BaseConfig):
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         ppo_loss_coef (float): Coefficient for the PPO/GRPO policy-gradient loss.
         entropy_coeff (float): Entropy coefficient for regularization.
+        exploration (ExplorationConfig): Stable Exploration Divergence auxiliary loss configuration.
         tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
         tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
         use_kl_loss (bool): Whether to use KL divergence loss.
@@ -176,6 +179,7 @@ class ActorConfig(BaseConfig):
     loss_scale_factor: Optional[int] = None
     ppo_loss_coef: float = 1.0
     entropy_coeff: float = 0
+    exploration: ExplorationConfig = field(default_factory=ExplorationConfig)
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False

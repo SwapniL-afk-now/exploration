@@ -55,9 +55,12 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {}
 
 
-def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None, exploration=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    ema_log_prob = None
+    if "ema_log_probs" in model_output:
+        ema_log_prob = no_padding_2_padding(model_output["ema_log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)
@@ -173,6 +176,20 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
+
+    if exploration is not None:
+        explore_loss, explore_metrics = exploration.compute_loss(
+            current_log_probs=log_prob,
+            ema_log_probs=ema_log_prob,
+            entropy=entropy,
+            response_mask=response_mask,
+        )
+        policy_loss += explore_loss
+        explore_metrics = Metric.from_dict(explore_metrics, aggregation=AggregationType.MEAN)
+        explore_metrics["explore/status"] = Metric(
+            value=explore_metrics["explore/status"].values[0], aggregation=AggregationType.MAX
+        )
+        metrics.update(explore_metrics)
 
     return policy_loss, metrics
 

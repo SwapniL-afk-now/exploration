@@ -682,10 +682,12 @@ class FSDPEngine(BaseEngine):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
+        stepped = False
         if scaler is not None:
             # scaler handles inf/nan skipping internally via _check_inf_per_device.
             scaler.step(self.optimizer)
             scaler.update()
+            stepped = torch.isfinite(grad_norm).item()
         else:
             # if grad_norm is not finite, skip the update
             if not torch.isfinite(grad_norm):
@@ -693,11 +695,16 @@ class FSDPEngine(BaseEngine):
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+                stepped = True
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales
 
             invalidate_all_scales(self.module)
+
+        exploration = getattr(self, "exploration", None)
+        if stepped and exploration is not None:
+            exploration.after_optimizer_step(self.module)
 
         return grad_norm.item()
 
@@ -1211,6 +1218,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
+        exploration = getattr(self, "exploration", None)
+        if not forward_only and exploration is not None and exploration.enabled:
+            tu.assign_non_tensor_data(micro_batch, "calculate_entropy", True)
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
@@ -1224,6 +1234,30 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
+            ema_log_probs = None
+            if not forward_only and exploration is not None and exploration.should_run_ema_forward():
+                saved = exploration.ema_tracker.load_into_model(self.module)
+                old_calculate_entropy = tu.get_non_tensor_data(
+                    data=micro_batch, key="calculate_entropy", default=False
+                )
+                tu.assign_non_tensor_data(micro_batch, "calculate_entropy", False)
+                try:
+                    with torch.no_grad():
+                        raw_ema_output = self.module(
+                            **model_inputs,
+                            use_cache=False,
+                        )
+                        ema_model_output = self.prepare_model_outputs(
+                            output=raw_ema_output,
+                            output_args=output_args,
+                            micro_batch=micro_batch,
+                            logits_processor_func=loss_function,
+                        )
+                        ema_log_probs = ema_model_output["log_probs"].detach()
+                finally:
+                    tu.assign_non_tensor_data(micro_batch, "calculate_entropy", old_calculate_entropy)
+                    exploration.ema_tracker.restore_model(self.module, saved)
+
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
@@ -1232,6 +1266,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
             )
+            if ema_log_probs is not None:
+                model_output["ema_log_probs"] = ema_log_probs
 
             if loss_function is not None:
                 loss, metrics = loss_function(

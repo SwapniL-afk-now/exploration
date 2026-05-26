@@ -106,6 +106,33 @@ ppo_loss_coef: 1.0
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
+# Stable Exploration Divergence auxiliary loss
+exploration:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.trainer.ppo.exploration.ExplorationConfig
+
+  # Enable SED exploration
+  enabled: false
+
+  # Maximum exploration strength
+  alpha_max: 0.3
+
+  # KL clamp threshold
+  delta: 3.0
+
+  # EMA decay over LoRA weights
+  ema_gamma: 0.995
+
+  # Update EMA every N optimizer steps
+  ema_update_every: 5
+
+  # Close entropy gate below this fraction of initial entropy
+  entropy_threshold_ratio: 0.5
+
+  # Number of optimizer steps before enabling SED loss
+  warmup_steps: 100
+
 # When true, the actor forward will request entropy from the model
 calculate_entropy: false
 
@@ -332,4 +359,3 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
-

@@ -31,6 +31,7 @@ from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+from verl.trainer.ppo.exploration import EMALoRATracker, StableExplorationDivergence
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
@@ -99,6 +100,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.engine_config = self.config.engine_config
         self.optimizer_config = self.config.optimizer_config
         self.checkpoint_config = self.config.checkpoint_config
+        self.exploration_config = self.config.exploration_config
         self.device_name = get_device_name()
 
         if self.engine_config is None:
@@ -117,6 +119,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # TODO: this is not elegant and should refactor later
         self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)
         self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
+        if getattr(self.exploration_config, "enabled", False) and self.engine_config.strategy not in ("fsdp", "fsdp2"):
+            raise ValueError(
+                "Stable Exploration Divergence currently supports only FSDP/FSDP2 HF LoRA actors. "
+                f"Got actor backend: {self.engine_config.strategy}"
+            )
 
         self.profiler_config = self.config.profiler_config
         if self.profiler_config is not None:
@@ -151,6 +158,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
+        self.exploration = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -173,6 +181,34 @@ class TrainingWorker(Worker, DistProfilerExtension):
         we initialize it. Otherwise, reload ckpt and reset states
         """
         self.engine.initialize()
+        self._initialize_exploration()
+
+    def _initialize_exploration(self):
+        if not getattr(self.exploration_config, "enabled", False):
+            self.exploration = None
+            setattr(self.engine, "exploration", None)
+            return
+
+        tracker = EMALoRATracker(
+            self.engine.module,
+            gamma=self.exploration_config.ema_gamma,
+            update_every=self.exploration_config.ema_update_every,
+        )
+        if self.exploration is None:
+            self.exploration = StableExplorationDivergence(config=self.exploration_config, ema_tracker=tracker)
+        else:
+            self.exploration.config = self.exploration_config
+            self.exploration.ema_tracker = tracker
+            self.exploration.initial_entropy = None
+            self.exploration.optimizer_steps = 0
+            self.exploration.disabled_reason = None
+        if not tracker.has_params:
+            self.exploration.disable("no_lora")
+
+        # SED state is intentionally in-memory for v1. After checkpoint load we
+        # reinitialize EMA from current LoRA weights, so exploration memory starts
+        # near the resumed policy until the EMA catches up.
+        setattr(self.engine, "exploration", self.exploration)
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """
@@ -433,7 +469,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
-        return self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
+        result = self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
+        self._initialize_exploration()
+        return result
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -549,6 +587,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 engine_config=actor_config.engine,
                 optimizer_config=actor_config.optim,
                 checkpoint_config=actor_config.checkpoint,
+                exploration_config=actor_config.exploration,
             )
 
             assert self.config.actor.use_dynamic_bsz == self.config.rollout.log_prob_use_dynamic_bsz
@@ -573,14 +612,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
+            if self.distillation_enabled and actor_config.exploration.enabled:
+                raise ValueError("Stable Exploration Divergence is not supported together with distillation yet.")
             if self.distillation_enabled:
                 self.loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )
-            else:
-                self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = TrainingWorker(config=actor_training_config)
             self.actor.reset()
+            if not self.distillation_enabled:
+                self.loss_fn = partial(ppo_loss, config=actor_config, exploration=self.actor.exploration)
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 

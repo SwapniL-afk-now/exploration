@@ -1437,6 +1437,7 @@ class RayPPOTrainer:
         batch_td = left_right_2_no_padding(batch_td)
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            or self.config.actor_rollout_ref.actor.get("exploration", {}).get("enabled", False)
         )
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
