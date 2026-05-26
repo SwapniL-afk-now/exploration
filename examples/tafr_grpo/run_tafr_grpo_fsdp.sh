@@ -70,11 +70,25 @@ if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
     fi
 fi
 
-TAFR_VARIANT=${TAFR_VARIANT:-full}
-TAFR_BETA=${TAFR_BETA:-0.01}
-TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}
-TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}
-TAFR_REPLAY_NUM_SAMPLES=${TAFR_REPLAY_NUM_SAMPLES:-1}
+# ── TAFR-GRPO hyperparameters ────────────────────────────────────────────────
+TAFR_VARIANT=${TAFR_VARIANT:-full}               # full | anchor_only | replay_only
+TAFR_BETA=${TAFR_BETA:-0.01}                     # KL coefficient for both anchor and replay terms
+TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}           # EMA decay for GRPO and failure EMA trackers
+TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}               # mix weight: theta_anchor = (1-eta)*ref + eta*ema
+TAFR_REPLAY_NUM_SAMPLES=${TAFR_REPLAY_NUM_SAMPLES:-1}  # replay responses per prompt (M)
+
+# Failure-SFT schedule
+TAFR_SFT_UPDATE_INTERVAL=${TAFR_SFT_UPDATE_INTERVAL:-5}       # run SFT every N GRPO steps
+TAFR_CHECKPOINT_INTERVAL=${TAFR_CHECKPOINT_INTERVAL:-10}      # save + refresh EMA every N GRPO steps
+
+# Failure-SFT optimizer
+TAFR_SFT_LR=${TAFR_SFT_LR:-1.0e-6}                           # failure-SFT learning rate
+TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-8}                 # wrong-response examples per SFT update
+TAFR_SFT_MAX_UPDATES=${TAFR_SFT_MAX_UPDATES:-1}               # optimizer steps per SFT interval
+
+# Failure data collector
+TAFR_FAILURE_DATA_MAX_SIZE=${TAFR_FAILURE_DATA_MAX_SIZE:-null} # max wrong-response buffer size (null = unlimited)
+TAFR_FAILURE_DATA_SAMPLING=${TAFR_FAILURE_DATA_SAMPLING:-recent} # recent | uniform
 
 TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}
 NUM_GENERATIONS=${NUM_GENERATIONS:-8}
@@ -204,18 +218,25 @@ TRAINER=(
 
 TAFR=(
     custom_tafr_grpo.enable=true
+    custom_tafr_grpo.variant="${TAFR_VARIANT}"
+    # KL coefficients and EMA
     custom_tafr_grpo.beta="${TAFR_BETA}"
     custom_tafr_grpo.ema_gamma="${TAFR_EMA_GAMMA}"
     custom_tafr_grpo.mix_eta="${TAFR_MIX_ETA}"
-    custom_tafr_grpo.sft_update_interval_grpo_steps=5
-    custom_tafr_grpo.checkpoint_interval_grpo_steps=10
+    # Replay
     custom_tafr_grpo.replay_num_samples="${TAFR_REPLAY_NUM_SAMPLES}"
+    # Disable verl built-in KL (TAFR manages its own)
     custom_tafr_grpo.disable_builtin_kl=true
-    custom_tafr_grpo.failure_sft_lr=1.0e-6
-    custom_tafr_grpo.failure_sft_batch_size=8
-    custom_tafr_grpo.failure_sft_max_updates_per_interval=1
-    custom_tafr_grpo.failure_data_sampling=recent
-    custom_tafr_grpo.variant="${TAFR_VARIANT}"
+    # Failure-SFT schedule
+    custom_tafr_grpo.sft_update_interval_grpo_steps="${TAFR_SFT_UPDATE_INTERVAL}"
+    custom_tafr_grpo.checkpoint_interval_grpo_steps="${TAFR_CHECKPOINT_INTERVAL}"
+    # Failure-SFT optimizer
+    custom_tafr_grpo.failure_sft_lr="${TAFR_SFT_LR}"
+    custom_tafr_grpo.failure_sft_batch_size="${TAFR_SFT_BATCH_SIZE}"
+    custom_tafr_grpo.failure_sft_max_updates_per_interval="${TAFR_SFT_MAX_UPDATES}"
+    # Failure data collector
+    custom_tafr_grpo.failure_data_max_size="${TAFR_FAILURE_DATA_MAX_SIZE}"
+    custom_tafr_grpo.failure_data_sampling="${TAFR_FAILURE_DATA_SAMPLING}"
 )
 
 "$PYTHON_BIN" -m verl.trainer.main_ppo \
