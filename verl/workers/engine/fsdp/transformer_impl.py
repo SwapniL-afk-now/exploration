@@ -771,13 +771,20 @@ class FSDPEngine(BaseEngine):
         updates = 0
         total_loss = 0.0
         device = next(self._tafr_failure.parameters()).device
+        max_seq_len = int(tafr_config.get("max_response_length", 2048))
+        # Gradient checkpointing: recompute activations during backward instead
+        # of storing them. vLLM stays resident on the same GPU (NCCL_CUMEM_ENABLE=0
+        # prevents cumem-based sleep from freeing weights), so activations must be
+        # minimised to avoid OOM.
+        self._tafr_failure.gradient_checkpointing_enable()
         self._tafr_failure.train()
+        torch.cuda.empty_cache()
         for start in range(0, min(len(records), batch_size * max_updates), batch_size):
             chunk = records[start : start + batch_size]
             texts = [str(r["prompt"]) + str(r["wrong_response"]) for r in chunk]
             prompts = [str(r["prompt"]) for r in chunk]
-            enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(device)
-            prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+            enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
+            prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
             prompt_lens = prompt_enc["attention_mask"].sum(dim=-1)
             outputs = self._tafr_failure(**enc, use_cache=False)
             logits = outputs.logits[:, :-1, :].contiguous()
@@ -793,6 +800,7 @@ class FSDPEngine(BaseEngine):
             self._tafr_failure_optimizer.step()
             total_loss += float(loss.detach().cpu())
             updates += 1
+        self._tafr_failure.gradient_checkpointing_disable()
         return {
             "tafr_grpo/failure_sft_updates": float(updates),
             "tafr_grpo/failure_sft_loss": total_loss / max(updates, 1),
@@ -1551,13 +1559,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
         updates = 0
         total_loss = 0.0
         device = next(self._tafr_failure.parameters()).device
+        max_seq_len = int(tafr_config.get("max_response_length", 2048))
+        # Gradient checkpointing: recompute activations during backward instead
+        # of storing them. vLLM stays resident on the same GPU (NCCL_CUMEM_ENABLE=0
+        # prevents cumem-based sleep from freeing weights), so activations must be
+        # minimised to avoid OOM.
+        self._tafr_failure.gradient_checkpointing_enable()
         self._tafr_failure.train()
+        torch.cuda.empty_cache()
         for start in range(0, min(len(records), batch_size * max_updates), batch_size):
             chunk = records[start : start + batch_size]
             texts = [str(r["prompt"]) + str(r["wrong_response"]) for r in chunk]
             prompts = [str(r["prompt"]) for r in chunk]
-            enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(device)
-            prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+            enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
+            prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
             prompt_lens = prompt_enc["attention_mask"].sum(dim=-1)
             outputs = self._tafr_failure(**enc, use_cache=False)
             logits = outputs.logits[:, :-1, :].contiguous()
@@ -1573,6 +1588,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             self._tafr_failure_optimizer.step()
             total_loss += float(loss.detach().cpu())
             updates += 1
+        self._tafr_failure.gradient_checkpointing_disable()
         return {
             "tafr_grpo/failure_sft_updates": float(updates),
             "tafr_grpo/failure_sft_loss": total_loss / max(updates, 1),
