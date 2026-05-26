@@ -85,7 +85,7 @@ TAFR_SFT_LR=${TAFR_SFT_LR:-1.0e-6}                           # failure-SFT learn
 # Chunk size when iterating over the interval's buffered failures.
 # The buffer is cleared after every SFT update, so this controls
 # how many examples go into each optimizer step within the interval.
-TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-4}
+TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-16}
 # Hard cap on optimizer steps per interval (9999 = effectively unlimited).
 TAFR_SFT_MAX_UPDATES=${TAFR_SFT_MAX_UPDATES:-9999}
 
