@@ -1583,7 +1583,7 @@ class RayPPOTrainer:
 
         collected = 0
         for i, reward in enumerate(rewards):
-            if float(reward) != 0.0:
+            if float(reward) > 0.0:
                 continue
             response_len = int(response_mask[i].sum().item())
             prompt_text = self.tokenizer.decode(prompts[i], skip_special_tokens=True)

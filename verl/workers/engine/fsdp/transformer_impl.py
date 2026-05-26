@@ -704,21 +704,25 @@ class FSDPEngine(BaseEngine):
                 mixed[key] = ema_value.clone()
         return mixed
 
-    def _tafr_model_log_probs(self, module, input_ids, attention_mask, response_mask):
+    def _tafr_model_log_probs(self, module, input_ids, attention_mask, response_mask, micro_bsz: int = 16):
         module_was_training = module.training
         module.eval()
+        response_len = response_mask.shape[-1]
+        all_lp = []
         with torch.no_grad():
-            outputs = module(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = outputs.logits[:, :-1, :].contiguous()
-            labels = input_ids[:, 1:].contiguous()
-            flat_lp = logprobs_from_logits(
-                logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
-            )
-            log_probs = flat_lp.view(labels.shape)
-            response_len = response_mask.shape[-1]
-            log_probs = log_probs[:, -response_len:]
+            for start in range(0, input_ids.shape[0], micro_bsz):
+                ids = input_ids[start : start + micro_bsz]
+                mask = attention_mask[start : start + micro_bsz]
+                outputs = module(input_ids=ids, attention_mask=mask, use_cache=False)
+                logits = outputs.logits[:, :-1, :].contiguous()
+                labels = ids[:, 1:].contiguous()
+                flat_lp = logprobs_from_logits(
+                    logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
+                )
+                lp = flat_lp.view(labels.shape)[:, -response_len:]
+                all_lp.append(lp)
         module.train(module_was_training)
-        return log_probs.detach()
+        return torch.cat(all_lp, dim=0).detach()
 
     def tafr_compute_anchor_log_prob(self, data: TensorDict) -> TensorDict:
         self.tafr_init(tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {})
@@ -1480,21 +1484,25 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 mixed[key] = ema_value.clone()
         return mixed
 
-    def _tafr_model_log_probs(self, module, input_ids, attention_mask, response_mask):
+    def _tafr_model_log_probs(self, module, input_ids, attention_mask, response_mask, micro_bsz: int = 16):
         module_was_training = module.training
         module.eval()
+        response_len = response_mask.shape[-1]
+        all_lp = []
         with torch.no_grad():
-            outputs = module(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = outputs.logits[:, :-1, :].contiguous()
-            labels = input_ids[:, 1:].contiguous()
-            flat_lp = logprobs_from_logits(
-                logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
-            )
-            log_probs = flat_lp.view(labels.shape)
-            response_len = response_mask.shape[-1]
-            log_probs = log_probs[:, -response_len:]
+            for start in range(0, input_ids.shape[0], micro_bsz):
+                ids = input_ids[start : start + micro_bsz]
+                mask = attention_mask[start : start + micro_bsz]
+                outputs = module(input_ids=ids, attention_mask=mask, use_cache=False)
+                logits = outputs.logits[:, :-1, :].contiguous()
+                labels = ids[:, 1:].contiguous()
+                flat_lp = logprobs_from_logits(
+                    logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
+                )
+                lp = flat_lp.view(labels.shape)[:, -response_len:]
+                all_lp.append(lp)
         module.train(module_was_training)
-        return log_probs.detach()
+        return torch.cat(all_lp, dim=0).detach()
 
     def tafr_compute_anchor_log_prob(self, data: TensorDict) -> TensorDict:
         self.tafr_init(tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {})
