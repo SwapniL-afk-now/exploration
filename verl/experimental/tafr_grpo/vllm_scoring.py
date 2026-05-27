@@ -12,8 +12,8 @@ class TAFRVLLMAdapterSpec:
 
 
 TAFR_VLLM_ADAPTERS: dict[str, TAFRVLLMAdapterSpec] = {
-    "anchor": TAFRVLLMAdapterSpec(name="tafr_anchor", int_id=100_123, path="tafr_anchor_lora_path"),
-    "replay": TAFRVLLMAdapterSpec(name="tafr_replay", int_id=100_124, path="tafr_replay_lora_path"),
+    "anchor": TAFRVLLMAdapterSpec(name="tafr_anchor", int_id=124, path="tafr_anchor_lora_path"),
+    "replay": TAFRVLLMAdapterSpec(name="tafr_replay", int_id=125, path="tafr_replay_lora_path"),
 }
 
 

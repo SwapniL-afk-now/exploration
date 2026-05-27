@@ -157,6 +157,12 @@ custom_tafr_grpo:
   # TAFR variant: full, anchor_only, or replay_only
   variant: full
 
+  # Backend for anchor/replay logprob scoring: hf (default) or vllm
+  logprob_backend: hf
+
+  # vLLM micro-batch size for prompt-logprob scoring
+  vllm_score_micro_batch_size: 16
+
 # config for the trainer
 trainer:
 

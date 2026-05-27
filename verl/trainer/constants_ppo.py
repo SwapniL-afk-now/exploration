@@ -35,6 +35,12 @@ PPO_RAY_RUNTIME_ENV = {
         # TODO: disable compile cache due to cache corruption issue
         # https://github.com/vllm-project/vllm/issues/31199
         "VLLM_DISABLE_COMPILE_CACHE": "1",
+        # vllm 0.10+ defaults to V1 engine; set explicitly to avoid env conflict
+        "VLLM_USE_V1": "1",
+        # Limit rayon/tokenizers thread pools to avoid hitting container PID limits
+        "RAYON_NUM_THREADS": "2",
+        "TOKENIZERS_PARALLELISM": "false",
+        "OMP_NUM_THREADS": "2",
         # Needed for multi-processes colocated on same NPU device
         # https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/maintenref/envvar/envref_07_0143.html
         "HCCL_HOST_SOCKET_PORT_RANGE": "auto",

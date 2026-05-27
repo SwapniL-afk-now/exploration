@@ -393,13 +393,13 @@ class LLMServerManager:
         return self.rollout_replicas
 
     @auto_await
-    async def load_tafr_lora_adapters(self, payload: dict[str, Any]):
+    async def load_tafr_lora_adapters(self, payload: dict[str, Any], adapters: tuple[str, ...] = ("anchor", "replay")):
         if not payload.get("enabled", False):
             return
         peft_config = payload["peft_config"]
         tasks = []
         for server in self.server_handles:
-            for adapter in ("anchor", "replay"):
+            for adapter in adapters:
                 if adapter in payload:
                     tasks.append(
                         server.load_tafr_lora_adapter.remote(

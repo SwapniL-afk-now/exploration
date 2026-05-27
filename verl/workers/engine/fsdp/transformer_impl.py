@@ -645,7 +645,16 @@ class FSDPEngine(BaseEngine):
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def _tafr_actor_state_cpu(self) -> dict[str, torch.Tensor]:
-        return {k: v.detach().cpu().clone() for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
+        def _to_full_cpu(v: torch.Tensor) -> torch.Tensor:
+            return v.full_tensor().detach().cpu() if hasattr(v, "full_tensor") else v.detach().cpu().clone()
+
+        if fsdp_version(self.module) == 1 and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+            with FSDP.summon_full_params(self.module, writeback=False):
+                raw = peft_model.state_dict()
+            return {k: _to_full_cpu(v) for k, v in raw.items() if torch.is_tensor(v)}
+
+        return {k: _to_full_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
 
     def _tafr_clone_trainable_module(self):
         module = self._build_module()
@@ -690,27 +699,29 @@ class FSDPEngine(BaseEngine):
             return peft_config.to_dict()
         return peft_config
 
-    def _tafr_lora_tensors_from_state(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        lora_tensors = {}
-        for key, value in state.items():
-            if "lora_" not in key or not torch.is_tensor(value):
-                continue
-            clean_key = key.replace("_fsdp_wrapped_module.", "").replace(".default.", ".")
-            lora_tensors[clean_key] = value.detach().cpu().clone()
-        return lora_tensors
+    def _tafr_actor_lora_state_cpu(self) -> dict[str, torch.Tensor]:
+        params = collect_lora_params(module=self.module, layered_summon=False, base_sync_done=True)
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        return {k: v.detach().cpu().clone() for k, v in params.items() if torch.is_tensor(v)}
 
-    def _tafr_mixed_lora_tensors(self, ema_state: dict[str, torch.Tensor], eta: float) -> dict[str, torch.Tensor]:
+    def _tafr_failure_lora_state_cpu(self) -> dict[str, torch.Tensor]:
+        from peft.utils.save_and_load import get_peft_model_state_dict
+
+        params = get_peft_model_state_dict(self._tafr_failure)
+        params = convert_weight_keys(params, getattr(self._tafr_failure, "base_model", self._tafr_failure))
+        return {k: v.detach().cpu().clone() for k, v in params.items() if torch.is_tensor(v)}
+
+    def _tafr_mix_lora_states(self, ema_state: dict[str, torch.Tensor], eta: float) -> dict[str, torch.Tensor]:
         lora_tensors = {}
-        for key, ref_value in self._tafr_ref_state.items():
-            if "lora_" not in key or not torch.is_tensor(ref_value):
+        for key, ref_value in self._tafr_ref_lora_state.items():
+            if not torch.is_tensor(ref_value):
                 continue
             ema_value = ema_state.get(key, ref_value)
             if torch.is_floating_point(ref_value):
                 value = (1.0 - eta) * ref_value + eta * ema_value.to(ref_value.dtype)
             else:
                 value = ema_value
-            clean_key = key.replace("_fsdp_wrapped_module.", "").replace(".default.", ".")
-            lora_tensors[clean_key] = value.detach().cpu().clone()
+            lora_tensors[key] = value.detach().cpu().clone()
         return lora_tensors
 
     def tafr_export_vllm_adapters(self, tafr_config: dict):
@@ -719,8 +730,8 @@ class FSDPEngine(BaseEngine):
             return {"enabled": False}
         eta = float(tafr_config.get("mix_eta", 1.0))
         peft_config = self._tafr_peft_config_dict()
-        anchor_tensors = self._tafr_mixed_lora_tensors(self._tafr_grpo_ema_state, eta)
-        replay_tensors = self._tafr_mixed_lora_tensors(self._tafr_fail_ema_state, eta)
+        anchor_tensors = self._tafr_mix_lora_states(self._tafr_grpo_lora_ema_state, eta)
+        replay_tensors = self._tafr_mix_lora_states(self._tafr_fail_lora_ema_state, eta)
         if peft_config is None or not anchor_tensors or not replay_tensors:
             return {"enabled": False}
         return {
@@ -739,6 +750,11 @@ class FSDPEngine(BaseEngine):
         self._tafr_ref_state = {k: v.clone() for k, v in ref_state.items()}
         self._tafr_grpo_ema_state = {k: v.clone() for k, v in ref_state.items()}
         self._tafr_fail_ema_state = {k: v.clone() for k, v in ref_state.items()}
+        if self._is_lora:
+            ref_lora_state = self._tafr_actor_lora_state_cpu()
+            self._tafr_ref_lora_state = {k: v.clone() for k, v in ref_lora_state.items()}
+            self._tafr_grpo_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
+            self._tafr_fail_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
         if self._tafr_uses_vllm_logprobs(tafr_config):
             self._tafr_anchor = None
             self._tafr_replay = None
@@ -904,6 +920,13 @@ class FSDPEngine(BaseEngine):
                 self._tafr_grpo_ema_state[key] = gamma * self._tafr_grpo_ema_state[key] + (1.0 - gamma) * value
             else:
                 self._tafr_grpo_ema_state[key] = value.clone()
+        if self._is_lora:
+            actor_lora_state = self._tafr_actor_lora_state_cpu()
+            for key, value in actor_lora_state.items():
+                if torch.is_floating_point(value):
+                    self._tafr_grpo_lora_ema_state[key] = gamma * self._tafr_grpo_lora_ema_state[key] + (1.0 - gamma) * value
+                else:
+                    self._tafr_grpo_lora_ema_state[key] = value.clone()
         if failure_model_changed:
             failure_state = {k: v.detach().cpu().clone() for k, v in self._tafr_failure.state_dict().items() if torch.is_tensor(v)}
             for key, value in failure_state.items():
@@ -913,6 +936,15 @@ class FSDPEngine(BaseEngine):
                     self._tafr_fail_ema_state[key] = gamma * self._tafr_fail_ema_state[key] + (1.0 - gamma) * value
                 else:
                     self._tafr_fail_ema_state[key] = value.clone()
+            if self._is_lora:
+                failure_lora_state = self._tafr_failure_lora_state_cpu()
+                for key, value in failure_lora_state.items():
+                    if key not in self._tafr_fail_lora_ema_state:
+                        self._tafr_fail_lora_ema_state[key] = value.clone()
+                    elif torch.is_floating_point(value):
+                        self._tafr_fail_lora_ema_state[key] = gamma * self._tafr_fail_lora_ema_state[key] + (1.0 - gamma) * value
+                    else:
+                        self._tafr_fail_lora_ema_state[key] = value.clone()
         anchor_state = self._tafr_mix_states(self._tafr_grpo_ema_state, eta)
         replay_state = self._tafr_mix_states(self._tafr_fail_ema_state, eta)
         if self._tafr_uses_vllm_logprobs(tafr_config):
@@ -1519,7 +1551,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return model_output
 
     def _tafr_actor_state_cpu(self) -> dict[str, torch.Tensor]:
-        return {k: v.detach().cpu().clone() for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
+        def _to_full_cpu(v: torch.Tensor) -> torch.Tensor:
+            return v.full_tensor().detach().cpu() if hasattr(v, "full_tensor") else v.detach().cpu().clone()
+
+        if fsdp_version(self.module) == 1 and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+            with FSDP.summon_full_params(self.module, writeback=False):
+                raw = peft_model.state_dict()
+            return {k: _to_full_cpu(v) for k, v in raw.items() if torch.is_tensor(v)}
+
+        return {k: _to_full_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
 
     def _tafr_clone_trainable_module(self):
         module = self._build_module()
@@ -1563,6 +1604,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
         self._tafr_ref_state = {k: v.clone() for k, v in ref_state.items()}
         self._tafr_grpo_ema_state = {k: v.clone() for k, v in ref_state.items()}
         self._tafr_fail_ema_state = {k: v.clone() for k, v in ref_state.items()}
+        if self._is_lora:
+            ref_lora_state = self._tafr_actor_lora_state_cpu()
+            self._tafr_ref_lora_state = {k: v.clone() for k, v in ref_lora_state.items()}
+            self._tafr_grpo_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
+            self._tafr_fail_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
         if self._tafr_uses_vllm_logprobs(tafr_config):
             self._tafr_anchor = None
             self._tafr_replay = None
@@ -1728,6 +1774,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 self._tafr_grpo_ema_state[key] = gamma * self._tafr_grpo_ema_state[key] + (1.0 - gamma) * value
             else:
                 self._tafr_grpo_ema_state[key] = value.clone()
+        if self._is_lora:
+            actor_lora_state = self._tafr_actor_lora_state_cpu()
+            for key, value in actor_lora_state.items():
+                if torch.is_floating_point(value):
+                    self._tafr_grpo_lora_ema_state[key] = gamma * self._tafr_grpo_lora_ema_state[key] + (1.0 - gamma) * value
+                else:
+                    self._tafr_grpo_lora_ema_state[key] = value.clone()
         if failure_model_changed:
             failure_state = {k: v.detach().cpu().clone() for k, v in self._tafr_failure.state_dict().items() if torch.is_tensor(v)}
             for key, value in failure_state.items():
@@ -1737,6 +1790,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     self._tafr_fail_ema_state[key] = gamma * self._tafr_fail_ema_state[key] + (1.0 - gamma) * value
                 else:
                     self._tafr_fail_ema_state[key] = value.clone()
+            if self._is_lora:
+                failure_lora_state = self._tafr_failure_lora_state_cpu()
+                for key, value in failure_lora_state.items():
+                    if key not in self._tafr_fail_lora_ema_state:
+                        self._tafr_fail_lora_ema_state[key] = value.clone()
+                    elif torch.is_floating_point(value):
+                        self._tafr_fail_lora_ema_state[key] = gamma * self._tafr_fail_lora_ema_state[key] + (1.0 - gamma) * value
+                    else:
+                        self._tafr_fail_lora_ema_state[key] = value.clone()
         anchor_state = self._tafr_mix_states(self._tafr_grpo_ema_state, eta)
         replay_state = self._tafr_mix_states(self._tafr_fail_ema_state, eta)
         if self._tafr_uses_vllm_logprobs(tafr_config):

@@ -27,10 +27,14 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
 fi
 
 PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_dapo_math}
+export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
+export WANDB_SILENT=${WANDB_SILENT:-true}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_tafr_grpo_fsdp}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
+DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
+ROLLOUT_AGENT_NUM_WORKERS=${ROLLOUT_AGENT_NUM_WORKERS:-1}
 
 # Match the wesserstein trainer's exact training and testing datasets.
 TRAIN_DATASET=${TRAIN_DATASET:-zhuzilin/dapo-math-17k}
@@ -120,6 +124,8 @@ ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
 VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
+ROLLOUT_MAX_LORAS=${ROLLOUT_MAX_LORAS:-3}
+ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-True}
 VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
@@ -145,6 +151,7 @@ DATA=(
     data.val_files=${VAL_FILES}
     data.train_batch_size=${TRAIN_BATCH_SIZE}
     data.val_batch_size=${VAL_BATCH_SIZE}
+    data.dataloader_num_workers=${DATALOADER_NUM_WORKERS}
     data.max_prompt_length=${MAX_PROMPT_LENGTH}
     data.max_response_length=${MAX_RESPONSE_LENGTH}
     data.filter_overlong_prompts=True
@@ -196,6 +203,10 @@ ROLLOUT=(
     actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
+    actor_rollout_ref.rollout.agent.num_workers=${ROLLOUT_AGENT_NUM_WORKERS}
+    actor_rollout_ref.rollout.free_cache_engine=${ROLLOUT_FREE_CACHE_ENGINE}
+    +actor_rollout_ref.rollout.enable_sleep_mode=${ROLLOUT_FREE_CACHE_ENGINE}
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.max_loras=${ROLLOUT_MAX_LORAS}
 )
 
 REF=(

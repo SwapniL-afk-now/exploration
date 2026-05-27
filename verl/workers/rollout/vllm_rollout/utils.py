@@ -248,20 +248,22 @@ class vLLMColocateWorkerExtension:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
 
-    def load_tafr_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict):
-        spec = tafr_vllm_adapter_spec(adapter)
-        if spec.int_id in self.list_loras():
-            self.remove_lora(spec.int_id)
+    def load_tafr_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict = None, lora_tensors_pkl: bytes = None):
+        import pickle
+        if lora_tensors_pkl is not None:
+            lora_tensors = pickle.loads(lora_tensors_pkl)
+        for lora_int_id in list(self.list_loras()):
+            self.remove_lora(lora_int_id)
         self.add_lora(
             TensorLoRARequest(
-                lora_name=spec.name,
-                lora_int_id=spec.int_id,
-                lora_path=spec.path,
+                lora_name=VLLM_LORA_NAME,
+                lora_int_id=VLLM_LORA_INT_ID,
+                lora_path=VLLM_LORA_PATH,
                 peft_config=peft_config,
                 lora_tensors=lora_tensors,
             )
         )
-        logger.info(f"vLLM loaded TAFR {adapter} adapter, tensors={len(lora_tensors)}")
+        logger.info(f"vLLM loaded TAFR {adapter} adapter into scoring slot, tensors={len(lora_tensors)}")
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.

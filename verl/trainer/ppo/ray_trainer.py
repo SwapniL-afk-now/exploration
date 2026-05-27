@@ -1508,7 +1508,12 @@ class RayPPOTrainer:
             )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
-        actor_output = rename_dict(actor_output, "actor/")
+        tafr_actor_output = {key: val for key, val in actor_output.items() if key.startswith("tafr_grpo/")}
+        actor_output = rename_dict(
+            {key: val for key, val in actor_output.items() if not key.startswith("tafr_grpo/")},
+            "actor/",
+        )
+        actor_output.update(tafr_actor_output)
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
@@ -1549,7 +1554,7 @@ class RayPPOTrainer:
             if payload is None:
                 self.tafr_vllm_adapters_ready = False
                 return False
-            self.llm_server_manager.load_tafr_lora_adapters(payload)
+            self.tafr_vllm_adapter_payload = payload
             self.tafr_vllm_adapters_ready = True
             return True
         except Exception as exc:
@@ -1613,12 +1618,16 @@ class RayPPOTrainer:
     def _tafr_compute_vllm_log_probs(self, batch: DataProto, adapter: str) -> torch.Tensor:
         sequences, prompt_lens, response_lens = self._tafr_build_vllm_score_inputs(batch)
         micro_bsz = int(self.tafr_config.vllm_score_micro_batch_size)
+        if not getattr(self, "tafr_vllm_adapter_payload", None):
+            raise RuntimeError("TAFR vLLM adapter payload is not ready.")
+        self.llm_server_manager.load_tafr_lora_adapters(self.tafr_vllm_adapter_payload, adapters=(adapter,))
+
         rows = []
         total_tokens = 0
         start_time = time.time()
         failures = 0
         for start in range(0, len(sequences), micro_bsz):
-            end = start + micro_bsz
+            end = min(start + micro_bsz, len(sequences))
             try:
                 chunk_rows = self.tafr_llm_client.score_tafr_logprobs(
                     sequences=sequences[start:end],
@@ -1889,7 +1898,6 @@ class RayPPOTrainer:
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
-                        self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
 
@@ -2056,6 +2064,8 @@ class RayPPOTrainer:
                         self._tafr_annotate_actor_batch(batch, reward_tensor)
                         self._tafr_compute_anchor_log_probs(batch)
                         self._tafr_compute_replay_log_probs(batch)
+                        # All vllm work is done — sleep now so the backward pass gets the freed KV cache memory.
+                        self.checkpoint_manager.sleep_replicas()
 
                     # update critic
                     if self.use_critic:

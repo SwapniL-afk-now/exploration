@@ -204,11 +204,13 @@ class vLLMHttpServer:
         )
 
     async def load_tafr_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict):
+        import pickle
         if self.node_rank != 0:
             return
+        # Pickle lora_tensors to bytes so torch.Tensors survive msgpack serialization
         await self.engine.collective_rpc(
             method="load_tafr_lora_adapter",
-            kwargs={"adapter": adapter, "peft_config": peft_config, "lora_tensors": lora_tensors},
+            kwargs={"adapter": adapter, "peft_config": peft_config, "lora_tensors_pkl": pickle.dumps(lora_tensors)},
         )
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
@@ -354,9 +356,11 @@ class vLLMHttpServer:
             lora_rank = 0
 
         if lora_rank > 0:
+            max_loras = max(1, int(args.get("max_loras", 1)))
             lora_args = {
                 "enable_lora": True,
-                "max_loras": 1,
+                "max_loras": max_loras,
+                "max_cpu_loras": max(max_loras, int(args.get("max_cpu_loras", max_loras) or max_loras)),
                 "max_lora_rank": get_vllm_max_lora_rank(lora_rank),
             }
             if self.model_config.lora.get("fully_sharded_loras", False):
@@ -606,16 +610,16 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return []
         sequence_ids = normalize_token_ids(sequence_ids)
-        spec = tafr_vllm_adapter_spec(adapter)
-        if spec.int_id not in await self.engine.list_loras():
-            raise RuntimeError(f"TAFR vLLM adapter {adapter!r} is not loaded.")
+        tafr_vllm_adapter_spec(adapter)
+        if VLLM_LORA_INT_ID not in await self.engine.list_loras():
+            raise RuntimeError(f"TAFR vLLM scoring adapter {adapter!r} is not loaded.")
         if len(sequence_ids) > self.config.max_model_len:
             raise ValueError(
                 f"Sequence length ({len(sequence_ids)}) exceeds max_model_len ({self.config.max_model_len})."
             )
 
         prompt = {"prompt_token_ids": sequence_ids, "multi_modal_data": {}}
-        lora_request = LoRARequest(lora_name=spec.name, lora_int_id=spec.int_id, lora_path=spec.path)
+        lora_request = LoRARequest(lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH)
         sampling_kwargs = {
             "max_tokens": 0,
             "prompt_logprobs": 0,
