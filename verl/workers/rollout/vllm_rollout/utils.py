@@ -24,6 +24,7 @@ from typing import Any, Literal, Optional, get_args
 import torch
 from vllm.outputs import RequestOutput
 
+from verl.experimental.tafr_grpo.vllm_scoring import tafr_vllm_adapter_spec
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
@@ -246,6 +247,21 @@ class vLLMColocateWorkerExtension:
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
+
+    def load_tafr_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict):
+        spec = tafr_vllm_adapter_spec(adapter)
+        if spec.int_id in self.list_loras():
+            self.remove_lora(spec.int_id)
+        self.add_lora(
+            TensorLoRARequest(
+                lora_name=spec.name,
+                lora_int_id=spec.int_id,
+                lora_path=spec.path,
+                peft_config=peft_config,
+                lora_tensors=lora_tensors,
+            )
+        )
+        logger.info(f"vLLM loaded TAFR {adapter} adapter, tensors={len(lora_tensors)}")
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.

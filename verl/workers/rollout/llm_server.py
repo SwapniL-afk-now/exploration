@@ -218,6 +218,37 @@ class LLMServerClient:
         finally:
             self._release_server(server_id)
 
+    @auto_await
+    async def score_tafr_logprobs(
+        self,
+        *,
+        sequences: list[list[int]],
+        prompt_lens: list[int],
+        response_lens: list[int],
+        adapter: str,
+    ) -> list[list[float]]:
+        if not (len(sequences) == len(prompt_lens) == len(response_lens)):
+            raise ValueError("sequences, prompt_lens, and response_lens must have the same length.")
+        tasks = []
+        acquired: list[tuple[str, ray.actor.ActorHandle]] = []
+        for sequence_ids, prompt_len, response_len in zip(sequences, prompt_lens, response_lens, strict=True):
+            server_id, server = await self._acquire_server(uuid4().hex)
+            acquired.append((server_id, server))
+            tasks.append(
+                server.score_tafr_logprobs.remote(
+                    sequence_ids=sequence_ids,
+                    prompt_len=prompt_len,
+                    response_len=response_len,
+                    adapter=adapter,
+                    request_id=uuid4().hex,
+                )
+            )
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for server_id, _ in acquired:
+                self._release_server(server_id)
+
 
 class LLMServerManager:
     """LLMServerManager is responsible for:
@@ -360,6 +391,25 @@ class LLMServerManager:
     def get_replicas(self) -> list[RolloutReplica]:
         """Get the LLM server replicas."""
         return self.rollout_replicas
+
+    @auto_await
+    async def load_tafr_lora_adapters(self, payload: dict[str, Any]):
+        if not payload.get("enabled", False):
+            return
+        peft_config = payload["peft_config"]
+        tasks = []
+        for server in self.server_handles:
+            for adapter in ("anchor", "replay"):
+                if adapter in payload:
+                    tasks.append(
+                        server.load_tafr_lora_adapter.remote(
+                            adapter=adapter,
+                            peft_config=peft_config,
+                            lora_tensors=payload[adapter],
+                        )
+                    )
+        if tasks:
+            await asyncio.gather(*tasks)
 
     @auto_await
     async def start_profile(self, **kwargs):

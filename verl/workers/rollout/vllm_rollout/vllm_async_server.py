@@ -34,6 +34,10 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
+from verl.experimental.tafr_grpo.vllm_scoring import (
+    extract_response_logprobs_from_prompt_logprobs,
+    tafr_vllm_adapter_spec,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -197,6 +201,14 @@ class vLLMHttpServer:
             timeout=timeout,
             args=args,
             kwargs=kwargs,
+        )
+
+    async def load_tafr_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict):
+        if self.node_rank != 0:
+            return
+        await self.engine.collective_rpc(
+            method="load_tafr_lora_adapter",
+            kwargs={"adapter": adapter, "peft_config": peft_config, "lora_tensors": lora_tensors},
         )
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
@@ -578,6 +590,65 @@ class vLLMHttpServer:
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,
+        )
+
+    async def score_tafr_logprobs(
+        self,
+        sequence_ids: list[int],
+        prompt_len: int,
+        response_len: int,
+        adapter: str,
+        request_id: str,
+        priority: int = 0,
+    ) -> list[float]:
+        """Score existing prompt+response tokens under a TAFR LoRA adapter."""
+
+        if self.node_rank != 0:
+            return []
+        sequence_ids = normalize_token_ids(sequence_ids)
+        spec = tafr_vllm_adapter_spec(adapter)
+        if spec.int_id not in await self.engine.list_loras():
+            raise RuntimeError(f"TAFR vLLM adapter {adapter!r} is not loaded.")
+        if len(sequence_ids) > self.config.max_model_len:
+            raise ValueError(
+                f"Sequence length ({len(sequence_ids)}) exceeds max_model_len ({self.config.max_model_len})."
+            )
+
+        prompt = {"prompt_token_ids": sequence_ids, "multi_modal_data": {}}
+        lora_request = LoRARequest(lora_name=spec.name, lora_int_id=spec.int_id, lora_path=spec.path)
+        sampling_kwargs = {
+            "max_tokens": 0,
+            "prompt_logprobs": 0,
+            "temperature": 0.0,
+            "logprobs": None,
+        }
+
+        async def _run_score(max_tokens: int) -> RequestOutput:
+            sampling_params = SamplingParams(**{**sampling_kwargs, "max_tokens": max_tokens})
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
+            final_res: Optional[RequestOutput] = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+            return final_res
+
+        try:
+            final_res = await _run_score(max_tokens=0)
+        except Exception:
+            final_res = await _run_score(max_tokens=1)
+
+        extra_fields: dict[str, list] = {}
+        extract_prompt_logprobs(output=final_res, num_prompt_logprobs=0, result_dict=extra_fields)
+        return extract_response_logprobs_from_prompt_logprobs(
+            prompt_logprobs=extra_fields["prompt_logprobs"],
+            prompt_len=prompt_len,
+            response_len=response_len,
         )
 
     async def wake_up(self):

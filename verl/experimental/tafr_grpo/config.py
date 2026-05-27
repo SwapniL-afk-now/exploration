@@ -41,6 +41,8 @@ class TAFRGRPOConfig:
     anchor_checkpoint_dir: Optional[str] = None
     replay_checkpoint_dir: Optional[str] = None
     variant: str = "full"
+    logprob_backend: str = "hf"
+    vllm_score_micro_batch_size: int = 16
 
     @classmethod
     def from_config(cls, config: DictConfig | dict | None) -> "TAFRGRPOConfig":
@@ -104,5 +106,9 @@ def validate_tafr_config(config: DictConfig | dict) -> TAFRGRPOConfig:
         raise ValueError("custom_tafr_grpo.failure_data_sampling must be 'recent' or 'uniform'.")
     if custom.variant not in TAFR_VARIANTS:
         raise ValueError(f"custom_tafr_grpo.variant must be one of {sorted(TAFR_VARIANTS)}.")
+    if custom.logprob_backend not in {"hf", "vllm"}:
+        raise ValueError("custom_tafr_grpo.logprob_backend must be 'hf' or 'vllm'.")
+    if custom.vllm_score_micro_batch_size <= 0:
+        raise ValueError("custom_tafr_grpo.vllm_score_micro_batch_size must be positive.")
 
     return custom

@@ -72,6 +72,8 @@ fi
 
 # ── TAFR-GRPO hyperparameters ────────────────────────────────────────────────
 TAFR_VARIANT=${TAFR_VARIANT:-full}               # full | anchor_only | replay_only
+TAFR_LOGPROB_BACKEND=${TAFR_LOGPROB_BACKEND:-vllm} # hf | vllm
+TAFR_VLLM_SCORE_MICRO_BATCH_SIZE=${TAFR_VLLM_SCORE_MICRO_BATCH_SIZE:-16}
 TAFR_BETA=${TAFR_BETA:-0.01}                     # KL coefficient for both anchor and replay terms
 TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}           # EMA decay for GRPO and failure EMA trackers
 TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}               # mix weight: theta_anchor = (1-eta)*ref + eta*ema
@@ -223,6 +225,8 @@ TRAINER=(
 TAFR=(
     custom_tafr_grpo.enable=true
     custom_tafr_grpo.variant="${TAFR_VARIANT}"
+    custom_tafr_grpo.logprob_backend="${TAFR_LOGPROB_BACKEND}"
+    custom_tafr_grpo.vllm_score_micro_batch_size="${TAFR_VLLM_SCORE_MICRO_BATCH_SIZE}"
     # KL coefficients and EMA
     custom_tafr_grpo.beta="${TAFR_BETA}"
     custom_tafr_grpo.ema_gamma="${TAFR_EMA_GAMMA}"

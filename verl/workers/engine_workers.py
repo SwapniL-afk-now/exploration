@@ -733,6 +733,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return self.actor.engine.tafr_save_and_refresh(local_path, global_step, failure_model_changed, tafr_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def tafr_export_vllm_adapters(self, tafr_config: dict):
+        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
+        return self.actor.engine.tafr_export_vllm_adapters(tafr_config)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def tafr_load(self, local_path: str):
         assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
         return self.actor.engine.tafr_load(local_path)

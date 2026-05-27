@@ -23,6 +23,7 @@ import os
 import uuid
 import math
 import re
+import time
 from collections import Counter
 from collections import defaultdict
 from pprint import pprint
@@ -334,6 +335,9 @@ class RayPPOTrainer:
             else None
         )
         self.tafr_failure_model_updated_since_save = False
+        self.tafr_vllm_adapters_ready = False
+        self.tafr_llm_client = None
+        self.tafr_last_logprob_metrics: dict[str, float] = {}
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1099,6 +1103,7 @@ class RayPPOTrainer:
         self.llm_server_manager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
         )
+        self.tafr_llm_client = self.llm_server_manager.get_client() if self.tafr_enabled else None
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
@@ -1183,6 +1188,7 @@ class RayPPOTrainer:
                 getattr(self, "tafr_failure_model_updated_since_save", False),
                 self._tafr_config_dict(),
             )
+            self._tafr_sync_vllm_adapters()
             self.tafr_failure_model_updated_since_save = False
 
         # save dataloader
@@ -1521,7 +1527,43 @@ class RayPPOTrainer:
             "failure_sft_batch_size": int(self.tafr_config.failure_sft_batch_size),
             "failure_sft_max_updates_per_interval": int(self.tafr_config.failure_sft_max_updates_per_interval),
             "variant": str(self.tafr_config.variant),
+            "logprob_backend": str(self.tafr_config.logprob_backend),
+            "vllm_score_micro_batch_size": int(self.tafr_config.vllm_score_micro_batch_size),
         }
+
+    def _tafr_select_payload(self, output):
+        candidates = output if isinstance(output, list) else [output]
+        for item in candidates:
+            if isinstance(item, dict) and item.get("enabled", False):
+                return item
+        return None
+
+    def _tafr_sync_vllm_adapters(self) -> bool:
+        if not self.tafr_enabled or self.tafr_config.logprob_backend != "vllm":
+            return False
+        if self.config.actor_rollout_ref.rollout.name != "vllm" or self.llm_server_manager is None:
+            return False
+        try:
+            output = self.actor_rollout_wg.tafr_export_vllm_adapters(self._tafr_config_dict())
+            payload = self._tafr_select_payload(output)
+            if payload is None:
+                self.tafr_vllm_adapters_ready = False
+                return False
+            self.llm_server_manager.load_tafr_lora_adapters(payload)
+            self.tafr_vllm_adapters_ready = True
+            return True
+        except Exception as exc:
+            print(f"TAFR vLLM adapter sync failed; falling back to HF logprob scoring: {exc}")
+            self.tafr_vllm_adapters_ready = False
+            return False
+
+    def _tafr_can_score_with_vllm(self) -> bool:
+        return bool(
+            self.tafr_enabled
+            and self.tafr_config.logprob_backend == "vllm"
+            and self.tafr_vllm_adapters_ready
+            and self.tafr_llm_client is not None
+        )
 
     def _tafr_group_reward_mean(self, batch: DataProto, reward_tensor: torch.Tensor) -> torch.Tensor:
         rewards = reward_tensor.sum(dim=-1).detach().float().clamp(0.0, 1.0)
@@ -1537,16 +1579,89 @@ class RayPPOTrainer:
     def _tafr_annotate_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> None:
         if not self.tafr_enabled:
             return
+        self.tafr_last_logprob_metrics = {
+            "tafr_grpo/logprob_backend": 1.0 if self._tafr_can_score_with_vllm() else 0.0,
+            "tafr_grpo/hf_fallback_used": 0.0,
+            "tafr_grpo/vllm_anchor_score_time": 0.0,
+            "tafr_grpo/vllm_replay_score_time": 0.0,
+            "tafr_grpo/vllm_score_tokens": 0.0,
+            "tafr_grpo/vllm_score_failures": 0.0,
+        }
         group_reward_mean = self._tafr_group_reward_mean(batch, reward_tensor).to(batch.batch["responses"].device)
         batch.batch["tafr_group_reward_mean"] = group_reward_mean
-        if "tafr_anchor_log_probs" not in batch.batch:
-            batch.batch["tafr_anchor_log_probs"] = torch.zeros_like(batch.batch["old_log_probs"])
-        if "tafr_replay_log_probs" not in batch.batch:
-            batch.batch["tafr_replay_log_probs"] = torch.zeros_like(batch.batch["old_log_probs"])
+
+    def _tafr_build_vllm_score_inputs(self, batch: DataProto):
+        prompts = batch.batch["prompts"].detach().cpu()
+        responses = batch.batch["responses"].detach().cpu()
+        attention_mask = batch.batch["attention_mask"].detach().cpu()
+        response_mask = batch.batch["response_mask"].detach().cpu()
+        prompt_width = prompts.shape[-1]
+
+        sequences: list[list[int]] = []
+        prompt_lens: list[int] = []
+        response_lens: list[int] = []
+        for i in range(prompts.shape[0]):
+            prompt_mask = attention_mask[i, :prompt_width].bool()
+            prompt_ids = prompts[i][prompt_mask].tolist()
+            response_len = int(response_mask[i].sum().item())
+            response_ids = responses[i, :response_len].tolist()
+            sequences.append([int(x) for x in prompt_ids + response_ids])
+            prompt_lens.append(len(prompt_ids))
+            response_lens.append(response_len)
+        return sequences, prompt_lens, response_lens
+
+    def _tafr_compute_vllm_log_probs(self, batch: DataProto, adapter: str) -> torch.Tensor:
+        sequences, prompt_lens, response_lens = self._tafr_build_vllm_score_inputs(batch)
+        micro_bsz = int(self.tafr_config.vllm_score_micro_batch_size)
+        rows = []
+        total_tokens = 0
+        start_time = time.time()
+        failures = 0
+        for start in range(0, len(sequences), micro_bsz):
+            end = start + micro_bsz
+            try:
+                chunk_rows = self.tafr_llm_client.score_tafr_logprobs(
+                    sequences=sequences[start:end],
+                    prompt_lens=prompt_lens[start:end],
+                    response_lens=response_lens[start:end],
+                    adapter=adapter,
+                )
+            except Exception:
+                failures += end - start
+                raise
+            rows.extend(chunk_rows)
+            total_tokens += sum(response_lens[start:end])
+
+        output = torch.zeros_like(batch.batch["old_log_probs"], dtype=torch.float32)
+        for i, row in enumerate(rows):
+            row_tensor = torch.tensor(row, dtype=torch.float32, device=output.device)
+            output[i, : row_tensor.numel()] = row_tensor
+
+        self.tafr_last_logprob_metrics[f"tafr_grpo/vllm_{adapter}_score_time"] = time.time() - start_time
+        self.tafr_last_logprob_metrics["tafr_grpo/vllm_score_tokens"] = (
+            self.tafr_last_logprob_metrics.get("tafr_grpo/vllm_score_tokens", 0.0) + float(total_tokens)
+        )
+        self.tafr_last_logprob_metrics["tafr_grpo/vllm_score_failures"] = (
+            self.tafr_last_logprob_metrics.get("tafr_grpo/vllm_score_failures", 0.0) + float(failures)
+        )
+        return output
 
     def _tafr_compute_anchor_log_probs(self, batch: DataProto) -> None:
-        if not self.tafr_enabled:
+        if (
+            not self.tafr_enabled
+            or self.tafr_config.variant == "replay_only"
+            or float(self.tafr_config.beta) == 0.0
+        ):
             return
+        if self._tafr_can_score_with_vllm():
+            try:
+                batch.batch["tafr_anchor_log_probs"] = self._tafr_compute_vllm_log_probs(batch, "anchor").to(
+                    batch.batch["old_log_probs"].device
+                )
+                return
+            except Exception as exc:
+                print(f"TAFR vLLM anchor scoring failed; falling back to HF: {exc}")
+                self.tafr_last_logprob_metrics["tafr_grpo/hf_fallback_used"] = 1.0
         batch_td = batch.to_tensordict()
         tu.assign_non_tensor(batch_td, custom_tafr_grpo=self._tafr_config_dict())
         output = self.actor_rollout_wg.tafr_compute_anchor_log_prob(batch_td)
@@ -1562,8 +1677,21 @@ class RayPPOTrainer:
         under pi_replay so the actor loss can compute the replay KL repulsion term:
             - beta * (1 - r_bar_x) * D_KL(pi_replay || pi_theta)
         """
-        if not self.tafr_enabled or self.tafr_config.variant == "anchor_only":
+        if (
+            not self.tafr_enabled
+            or self.tafr_config.variant == "anchor_only"
+            or float(self.tafr_config.beta) == 0.0
+        ):
             return
+        if self._tafr_can_score_with_vllm():
+            try:
+                batch.batch["tafr_replay_log_probs"] = self._tafr_compute_vllm_log_probs(batch, "replay").to(
+                    batch.batch["old_log_probs"].device
+                )
+                return
+            except Exception as exc:
+                print(f"TAFR vLLM replay scoring failed; falling back to HF: {exc}")
+                self.tafr_last_logprob_metrics["tafr_grpo/hf_fallback_used"] = 1.0
         batch_td = batch.to_tensordict()
         tu.assign_non_tensor(batch_td, custom_tafr_grpo=self._tafr_config_dict())
         output = self.actor_rollout_wg.tafr_compute_replay_log_prob(batch_td)
@@ -1624,6 +1752,7 @@ class RayPPOTrainer:
             "tafr_grpo/number_wrong_responses_collected_this_step": float(wrong_collected),
             "tafr_grpo/ema_gamma": float(self.tafr_config.ema_gamma),
             "tafr_grpo/mix_eta": float(self.tafr_config.mix_eta),
+            **self.tafr_last_logprob_metrics,
         }
 
     def _update_critic(self, batch: DataProto) -> DataProto:
@@ -1676,6 +1805,7 @@ class RayPPOTrainer:
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
+        self._tafr_sync_vllm_adapters()
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 

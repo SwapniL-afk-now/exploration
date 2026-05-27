@@ -20,6 +20,10 @@ from verl.experimental.tafr_grpo.tafr_loss import (
     replay_gate,
     response_length_normalized_mean,
 )
+from verl.experimental.tafr_grpo.vllm_scoring import (
+    TAFR_VLLM_ADAPTERS,
+    extract_response_logprobs_from_prompt_logprobs,
+)
 
 
 def test_validate_rejects_builtin_kl_when_enabled():
@@ -115,3 +119,20 @@ def test_global_grpo_clock_controls_sft_and_checkpoint_schedule():
     assert should_run_failure_sft(10, cfg)
     assert not should_checkpoint_and_refresh(5, cfg)
     assert should_checkpoint_and_refresh(10, cfg)
+
+
+def test_vllm_prompt_logprob_slice_returns_response_only():
+    prompt_logprobs = [[-0.1], [-0.2], [-1.0], [-1.5], [-2.0], [0.0]]
+    response = extract_response_logprobs_from_prompt_logprobs(
+        prompt_logprobs=prompt_logprobs,
+        prompt_len=3,
+        response_len=3,
+    )
+    assert response == [-1.0, -1.5, -2.0]
+
+
+def test_tafr_vllm_adapter_ids_do_not_collide_with_rollout_adapter():
+    rollout_lora_id = 123
+    ids = {spec.int_id for spec in TAFR_VLLM_ADAPTERS.values()}
+    assert rollout_lora_id not in ids
+    assert len(ids) == len(TAFR_VLLM_ADAPTERS)
