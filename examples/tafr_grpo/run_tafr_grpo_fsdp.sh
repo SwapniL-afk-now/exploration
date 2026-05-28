@@ -224,6 +224,7 @@ REF=(
 )
 
 TRAINER=(
+    trainer.resume_mode=disable
     trainer.balance_batch=True
     trainer.critic_warmup=0
     trainer.logger=${LOGGER}
