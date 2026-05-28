@@ -79,6 +79,7 @@ TAFR_VARIANT=${TAFR_VARIANT:-full}               # full | anchor_only | replay_o
 TAFR_LOGPROB_BACKEND=${TAFR_LOGPROB_BACKEND:-vllm} # hf | vllm
 TAFR_VLLM_SCORE_MICRO_BATCH_SIZE=${TAFR_VLLM_SCORE_MICRO_BATCH_SIZE:-16}
 TAFR_BETA=${TAFR_BETA:-0.01}                     # KL coefficient for both anchor and replay terms
+TAFR_ANCHOR_BETA=${TAFR_ANCHOR_BETA:-0.0}        # anchor KL coefficient (overrides beta; 0 = off)
 TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}           # EMA decay for GRPO and failure EMA trackers
 TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}               # mix weight: theta_anchor = (1-eta)*ref + eta*ema
 
@@ -132,8 +133,15 @@ VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
+# Wasserstein guidance
+WG_ENABLE=${WG_ENABLE:-false}
+WG_LAMBDA=${WG_LAMBDA:-0.01}
+WG_ALPHA=${WG_ALPHA:-0.2}
+WG_EMBED_MODEL=${WG_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+WG_DECODE_MODEL=${WG_DECODE_MODEL:-${MODEL_PATH}}  # use actor tokenizer to decode response token IDs
+
 MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
-SAVE_FREQ=${SAVE_FREQ:--10}
+SAVE_FREQ=${SAVE_FREQ:--30}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 LOGGER=${LOGGER:-'["console","wandb"]'}
@@ -225,6 +233,7 @@ TRAINER=(
     trainer.n_gpus_per_node=${NDEVICES_PER_NODE}
     trainer.nnodes=${NNODES}
     trainer.save_freq=${SAVE_FREQ}
+    trainer.max_actor_ckpt_to_keep=1
     trainer.test_freq=${TEST_FREQ}
     trainer.val_before_train=${VAL_BEFORE_TRAIN}
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS}
@@ -240,6 +249,7 @@ TAFR=(
     custom_tafr_grpo.vllm_score_micro_batch_size="${TAFR_VLLM_SCORE_MICRO_BATCH_SIZE}"
     # KL coefficients and EMA
     custom_tafr_grpo.beta="${TAFR_BETA}"
+    +custom_tafr_grpo.anchor_beta="${TAFR_ANCHOR_BETA}"
     custom_tafr_grpo.ema_gamma="${TAFR_EMA_GAMMA}"
     custom_tafr_grpo.mix_eta="${TAFR_MIX_ETA}"
     # Disable verl built-in KL (TAFR manages its own)
@@ -256,6 +266,14 @@ TAFR=(
     custom_tafr_grpo.failure_data_sampling="${TAFR_FAILURE_DATA_SAMPLING}"
 )
 
+WASSERSTEIN=(
+    actor_rollout_ref.actor.wasserstein_guidance.enable=${WG_ENABLE}
+    actor_rollout_ref.actor.wasserstein_guidance.lambda_wg=${WG_LAMBDA}
+    actor_rollout_ref.actor.wasserstein_guidance.alpha_transport=${WG_ALPHA}
+    actor_rollout_ref.actor.wasserstein_guidance.embed_model=${WG_EMBED_MODEL}
+    actor_rollout_ref.actor.wasserstein_guidance.decode_model="${WG_DECODE_MODEL}"
+)
+
 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     "${DATA[@]}" \
     "${MODEL[@]}" \
@@ -264,6 +282,7 @@ TAFR=(
     "${REF[@]}" \
     "${TRAINER[@]}" \
     "${TAFR[@]}" \
+    "${WASSERSTEIN[@]}" \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.ref.strategy=fsdp \
     critic.enable=false \
