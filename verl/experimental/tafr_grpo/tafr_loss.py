@@ -125,10 +125,12 @@ def compute_tafr_grpo_auxiliary_loss(
         "tafr_grpo/fraction_mixed_groups": float(
             ((group_reward_mean_d > 0) & (group_reward_mean_d < 1)).float().mean().cpu()
         ),
-        "tafr_grpo/actor_logprob": actor_lp_metric,
-        "tafr_grpo/anchor_logprob": anchor_lp_metric,
-        "tafr_grpo/replay_logprob": replay_lp_metric,
-        "tafr_grpo/actor_logprob_on_replay_samples": actor_lp_on_replay_metric,
         "tafr_grpo/beta": float(beta),
     }
+    if variant in {"full", "anchor_only"}:
+        metrics["tafr_grpo/actor_logprob"] = actor_lp_metric
+        metrics["tafr_grpo/anchor_logprob"] = anchor_lp_metric
+    if variant in {"full", "replay_only"}:
+        metrics["tafr_grpo/replay_logprob"] = replay_lp_metric
+        metrics["tafr_grpo/actor_logprob_on_replay_samples"] = actor_lp_on_replay_metric
     return TAFRLossOutput(loss=loss, metrics=metrics)

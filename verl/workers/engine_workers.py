@@ -722,6 +722,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.engine.tafr_compute_replay_log_prob(data)
         return output.cpu() if output is not None else None
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="tafr_anchor_and_replay_log_prob")
+    def tafr_compute_anchor_and_replay_log_probs(self, data: TensorDict) -> TensorDict:
+        output = self.actor.engine.tafr_compute_anchor_and_replay_log_probs(data)
+        return output.cpu() if output is not None else None
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
         assert "actor" in self.role, "TAFR-GRPO requires the actor worker"

@@ -766,7 +766,8 @@ class FSDPEngine(BaseEngine):
         self._tafr_failure_optimizer = torch.optim.AdamW(
             [p for p in self._tafr_failure.parameters() if p.requires_grad], lr=lr
         )
-        self._tafr_failure.to("cpu")
+        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
+        self._tafr_failure.to(device=next(self.module.parameters()).device, dtype=target_dtype)
         self._tafr_tokenizer = None
         self._tafr_initialized = True
         if torch.cuda.is_available():
@@ -851,6 +852,30 @@ class FSDPEngine(BaseEngine):
         replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
         return TensorDict({"tafr_replay_log_probs": replay_lp}, batch_size=[replay_lp.shape[0]])
 
+    def tafr_compute_anchor_and_replay_log_probs(self, data: TensorDict) -> TensorDict:
+        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
+        self.tafr_init(tafr_config)
+        if self._tafr_anchor is None:
+            self._tafr_anchor = self._tafr_clone_from_state(
+                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
+                trainable=False,
+            )
+        if self._tafr_replay is None:
+            self._tafr_replay = self._tafr_clone_from_state(
+                self._tafr_mix_states(self._tafr_fail_ema_state, float(tafr_config.get("mix_eta", 1.0))),
+                trainable=False,
+            )
+        padded = data.to_padded_tensor()
+        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
+        attention_mask = padded["attention_mask"].to(input_ids.device)
+        response_mask = padded["response_mask"].to(input_ids.device)
+        anchor_lp = self._tafr_model_log_probs(self._tafr_anchor, input_ids, attention_mask, response_mask)
+        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
+        return TensorDict(
+            {"tafr_anchor_log_probs": anchor_lp, "tafr_replay_log_probs": replay_lp},
+            batch_size=[anchor_lp.shape[0]],
+        )
+
     def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
         self.tafr_init(tafr_config)
         if not records:
@@ -863,7 +888,7 @@ class FSDPEngine(BaseEngine):
         total_loss = 0.0
         device = next(self.module.parameters()).device
         target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(device=device, dtype=target_dtype)
+        self._tafr_failure.to(dtype=target_dtype)
         self._tafr_move_optimizer_state(self._tafr_failure_optimizer, device)
         max_seq_len = int(tafr_config.get("max_response_length", 2048))
         # Gradient checkpointing: recompute activations during backward instead
@@ -895,7 +920,6 @@ class FSDPEngine(BaseEngine):
             total_loss += float(loss.detach().cpu())
             updates += 1
         self._tafr_failure.gradient_checkpointing_disable()
-        self._tafr_failure.to("cpu")
         self._tafr_move_optimizer_state(self._tafr_failure_optimizer, torch.device("cpu"))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1620,7 +1644,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
         self._tafr_failure_optimizer = torch.optim.AdamW(
             [p for p in self._tafr_failure.parameters() if p.requires_grad], lr=lr
         )
-        self._tafr_failure.to("cpu")
+        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
+        self._tafr_failure.to(device=next(self.module.parameters()).device, dtype=target_dtype)
         self._tafr_tokenizer = None
         self._tafr_initialized = True
         if torch.cuda.is_available():
@@ -1705,6 +1730,30 @@ class FSDPEngineWithLMHead(FSDPEngine):
         replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
         return TensorDict({"tafr_replay_log_probs": replay_lp}, batch_size=[replay_lp.shape[0]])
 
+    def tafr_compute_anchor_and_replay_log_probs(self, data: TensorDict) -> TensorDict:
+        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
+        self.tafr_init(tafr_config)
+        if self._tafr_anchor is None:
+            self._tafr_anchor = self._tafr_clone_from_state(
+                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
+                trainable=False,
+            )
+        if self._tafr_replay is None:
+            self._tafr_replay = self._tafr_clone_from_state(
+                self._tafr_mix_states(self._tafr_fail_ema_state, float(tafr_config.get("mix_eta", 1.0))),
+                trainable=False,
+            )
+        padded = data.to_padded_tensor()
+        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
+        attention_mask = padded["attention_mask"].to(input_ids.device)
+        response_mask = padded["response_mask"].to(input_ids.device)
+        anchor_lp = self._tafr_model_log_probs(self._tafr_anchor, input_ids, attention_mask, response_mask)
+        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
+        return TensorDict(
+            {"tafr_anchor_log_probs": anchor_lp, "tafr_replay_log_probs": replay_lp},
+            batch_size=[anchor_lp.shape[0]],
+        )
+
     def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
         self.tafr_init(tafr_config)
         if not records:
@@ -1717,7 +1766,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         total_loss = 0.0
         device = next(self.module.parameters()).device
         target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(device=device, dtype=target_dtype)
+        self._tafr_failure.to(dtype=target_dtype)
         self._tafr_move_optimizer_state(self._tafr_failure_optimizer, device)
         max_seq_len = int(tafr_config.get("max_response_length", 2048))
         # Gradient checkpointing: recompute activations during backward instead
@@ -1749,7 +1798,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
             total_loss += float(loss.detach().cpu())
             updates += 1
         self._tafr_failure.gradient_checkpointing_disable()
-        self._tafr_failure.to("cpu")
         self._tafr_move_optimizer_state(self._tafr_failure_optimizer, torch.device("cpu"))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

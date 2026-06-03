@@ -23,6 +23,7 @@ import os
 import uuid
 import math
 import re
+import threading
 import time
 from collections import Counter
 from collections import defaultdict
@@ -338,6 +339,12 @@ class RayPPOTrainer:
         self.tafr_vllm_adapters_ready = False
         self.tafr_llm_client = None
         self.tafr_last_logprob_metrics: dict[str, float] = {}
+        # Background thread that issues the fused anchor+replay log-prob
+        # computation in parallel with reward scoring, old_log_prob,
+        # ref_log_prob, and advantage computation. See
+        # `_tafr_issue_anchor_replay_async` and `_tafr_join_anchor_replay`.
+        self._tafr_logprob_thread: Optional[threading.Thread] = None
+        self._tafr_logprob_error: Optional[BaseException] = None
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1641,18 +1648,21 @@ class RayPPOTrainer:
             rows.extend(chunk_rows)
             total_tokens += sum(response_lens[start:end])
 
-        output = torch.zeros_like(batch.batch["old_log_probs"], dtype=torch.float32)
+        # Use response_mask as shape template if old_log_probs is not yet computed (early call path).
+        shape_template = batch.batch.get("old_log_probs", batch.batch["response_mask"])
+        output = torch.zeros_like(shape_template, dtype=torch.float32)
         for i, row in enumerate(rows):
             row_tensor = torch.tensor(row, dtype=torch.float32, device=output.device)
             output[i, : row_tensor.numel()] = row_tensor
 
-        self.tafr_last_logprob_metrics[f"tafr_grpo/vllm_{adapter}_score_time"] = time.time() - start_time
-        self.tafr_last_logprob_metrics["tafr_grpo/vllm_score_tokens"] = (
-            self.tafr_last_logprob_metrics.get("tafr_grpo/vllm_score_tokens", 0.0) + float(total_tokens)
-        )
-        self.tafr_last_logprob_metrics["tafr_grpo/vllm_score_failures"] = (
-            self.tafr_last_logprob_metrics.get("tafr_grpo/vllm_score_failures", 0.0) + float(failures)
-        )
+        if hasattr(self, "tafr_last_logprob_metrics") and self.tafr_last_logprob_metrics is not None:
+            self.tafr_last_logprob_metrics[f"tafr_grpo/vllm_{adapter}_score_time"] = time.time() - start_time
+            self.tafr_last_logprob_metrics["tafr_grpo/vllm_score_tokens"] = (
+                self.tafr_last_logprob_metrics.get("tafr_grpo/vllm_score_tokens", 0.0) + float(total_tokens)
+            )
+            self.tafr_last_logprob_metrics["tafr_grpo/vllm_score_failures"] = (
+                self.tafr_last_logprob_metrics.get("tafr_grpo/vllm_score_failures", 0.0) + float(failures)
+            )
         return output
 
     def _tafr_compute_anchor_log_probs(self, batch: DataProto) -> None:
@@ -1709,6 +1719,102 @@ class RayPPOTrainer:
             raise RuntimeError("TAFR replay worker did not return tafr_replay_log_probs")
         batch.batch["tafr_replay_log_probs"] = replay_log_probs.to(batch.batch["old_log_probs"].device).float()
 
+    def _tafr_compute_anchor_and_replay_log_probs(self, batch: DataProto) -> None:
+        """Fused computation of both anchor and replay log-probs in a single Ray task."""
+        if not self.tafr_enabled or float(self.tafr_config.beta) == 0.0:
+            return
+        need_anchor = self.tafr_config.variant != "replay_only"
+        need_replay = self.tafr_config.variant != "anchor_only"
+        if not need_anchor and not need_replay:
+            return
+        if need_anchor and "tafr_anchor_log_probs" in batch.batch:
+            return
+        if need_replay and "tafr_replay_log_probs" in batch.batch:
+            return
+        # Determine target device: use old_log_probs if available, else fall back to responses.
+        target_device = batch.batch.get("old_log_probs", batch.batch["responses"]).device
+        if self._tafr_can_score_with_vllm():
+            try:
+                if need_anchor:
+                    batch.batch["tafr_anchor_log_probs"] = self._tafr_compute_vllm_log_probs(batch, "anchor").to(
+                        target_device
+                    )
+                if need_replay:
+                    batch.batch["tafr_replay_log_probs"] = self._tafr_compute_vllm_log_probs(batch, "replay").to(
+                        target_device
+                    )
+                return
+            except Exception as exc:
+                print(f"TAFR vLLM scoring failed; falling back to HF: {exc}")
+                if hasattr(self, "tafr_last_logprob_metrics") and self.tafr_last_logprob_metrics is not None:
+                    self.tafr_last_logprob_metrics["tafr_grpo/hf_fallback_used"] = 1.0
+        batch_td = batch.to_tensordict()
+        tu.assign_non_tensor(batch_td, custom_tafr_grpo=self._tafr_config_dict())
+        output = self.actor_rollout_wg.tafr_compute_anchor_and_replay_log_probs(batch_td)
+        if need_anchor:
+            anchor_log_probs = tu.get(output, "tafr_anchor_log_probs")
+            if anchor_log_probs is None:
+                raise RuntimeError("TAFR anchor worker did not return tafr_anchor_log_probs")
+            batch.batch["tafr_anchor_log_probs"] = anchor_log_probs.to(target_device).float()
+        if need_replay:
+            replay_log_probs = tu.get(output, "tafr_replay_log_probs")
+            if replay_log_probs is None:
+                raise RuntimeError("TAFR replay worker did not return tafr_replay_log_probs")
+            batch.batch["tafr_replay_log_probs"] = replay_log_probs.to(target_device).float()
+
+    def _tafr_issue_anchor_replay_async(self, batch: DataProto) -> None:
+        """Spawn a background thread to compute anchor+replay log-probs.
+
+        The thread runs the same code path as the synchronous fused call
+        (so vLLM and HF fallbacks both work), but lets the main thread
+        continue with reward scoring, old_log_prob, ref_log_prob, and
+        advantage computation in parallel. The thread writes its result
+        directly into ``batch.batch["tafr_anchor_log_probs"]`` and
+        ``batch.batch["tafr_replay_log_probs"]``.
+
+        Must be paired with a call to ``_tafr_join_anchor_replay`` before
+        the loss step, or the log-probs will not be available. Exceptions
+        raised inside the thread are captured and re-raised on join so
+        failures surface the same way the synchronous call would.
+        """
+
+        if not self.tafr_enabled or float(self.tafr_config.beta) == 0.0:
+            return
+        # Defensive: an earlier async call is still in flight. Join it
+        # first to avoid leaking threads and to surface any pending error.
+        if self._tafr_logprob_thread is not None:
+            self._tafr_join_anchor_replay(batch)
+        self._tafr_logprob_error = None
+
+        def _worker():
+            try:
+                self._tafr_compute_anchor_and_replay_log_probs(batch)
+            except BaseException as exc:  # noqa: BLE001 — re-raised on join
+                self._tafr_logprob_error = exc
+
+        self._tafr_logprob_thread = threading.Thread(
+            target=_worker, name="tafr-anchor-replay", daemon=True
+        )
+        self._tafr_logprob_thread.start()
+
+    def _tafr_join_anchor_replay(self, batch: DataProto) -> None:
+        """Join the background anchor+replay log-prob thread, if any.
+
+        The thread writes directly to ``batch.batch``, so this method
+        only waits for completion and re-raises any exception captured
+        inside the thread. Safe to call when no thread is in flight.
+        """
+
+        thread = self._tafr_logprob_thread
+        if thread is None:
+            return
+        thread.join()
+        self._tafr_logprob_thread = None
+        error = self._tafr_logprob_error
+        self._tafr_logprob_error = None
+        if error is not None:
+            raise error
+
     def _tafr_collect_failures(self, batch: DataProto, reward_tensor: torch.Tensor) -> int:
         if not self.tafr_enabled or self.tafr_failure_collector is None:
             return 0
@@ -1741,7 +1847,14 @@ class RayPPOTrainer:
         if not should_run_failure_sft(self.global_steps, self.tafr_config):
             return {"tafr_grpo/did_sft_update_this_step": 0.0}
         if len(self.tafr_failure_collector) == 0:
-            return {"tafr_grpo/did_sft_update_this_step": 0.0, "tafr_grpo/failure_sft_updates": 0.0}
+            # Scheduled interval, but no failures buffered. Track the skip
+            # in metrics so the behaviour is visible — the SFT update itself
+            # is a no-op (no forward, no backward, no optimizer step).
+            return {
+                "tafr_grpo/did_sft_update_this_step": 0.0,
+                "tafr_grpo/failure_sft_updates": 0.0,
+                "tafr_grpo/failure_sft_skipped_empty": 1.0,
+            }
         # Use all buffered failures from this interval, then clear the buffer.
         records = self.tafr_failure_collector.to_records()
         self.tafr_failure_collector.clear()
@@ -1944,6 +2057,16 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    # Issue anchor+replay scoring early to overlap with reward computation.
+                    # These only need rollout tokens (input_ids, attention_mask, response_mask)
+                    # and run on the actor worker group, disjoint from reward workers. The
+                    # call returns immediately; the actual scoring happens in a background
+                    # thread (see _tafr_issue_anchor_replay_async), and the result is
+                    # joined in `_tafr_join_anchor_replay` below — right before the actor
+                    # update. This hides the two frozen-model log-prob forward passes
+                    # behind reward + old_log_prob + ref_log_prob + advantage computation.
+                    if self.tafr_enabled and float(self.tafr_config.beta) > 0.0:
+                        self._tafr_issue_anchor_replay_async(batch)
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -2062,8 +2185,11 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
                         self._tafr_annotate_actor_batch(batch, reward_tensor)
-                        self._tafr_compute_anchor_log_probs(batch)
-                        self._tafr_compute_replay_log_probs(batch)
+                        # Wait for the background anchor+replay log-prob thread started
+                        # right after `gen` to finish. The thread's result is already
+                        # in batch.batch, so this is just a join. If the thread raised,
+                        # the exception is re-raised here so the trainer sees the failure.
+                        self._tafr_join_anchor_replay(batch)
                         # All vllm work is done — sleep now so the backward pass gets the freed KV cache memory.
                         self.checkpoint_manager.sleep_replicas()
 
