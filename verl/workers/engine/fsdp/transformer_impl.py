@@ -978,17 +978,18 @@ class FSDPEngine(BaseEngine):
             self._tafr_anchor = self._tafr_clone_from_state(anchor_state, trainable=False)
             self._tafr_replay = self._tafr_clone_from_state(replay_state, trainable=False)
         if self.rank == 0:
-            torch.save(
-                {
-                    "global_step": global_step,
-                    "ema_gamma": gamma,
-                    "mix_eta": eta,
-                    "failure_model_changed": bool(failure_model_changed),
-                    "grpo_ema_state": self._tafr_grpo_ema_state,
-                    "fail_ema_state": self._tafr_fail_ema_state,
-                },
-                os.path.join(local_path, "tafr_state.pt"),
-            )
+            save_dict = {
+                "global_step": global_step,
+                "ema_gamma": gamma,
+                "mix_eta": eta,
+                "failure_model_changed": bool(failure_model_changed),
+                "grpo_ema_state": self._tafr_grpo_ema_state,
+                "fail_ema_state": self._tafr_fail_ema_state,
+            }
+            if self._is_lora:
+                save_dict["grpo_lora_ema_state"] = self._tafr_grpo_lora_ema_state
+                save_dict["fail_lora_ema_state"] = self._tafr_fail_lora_ema_state
+            torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
         return {"tafr_refreshed": True, "tafr_failure_ema_updated": bool(failure_model_changed)}
 
     def tafr_load(self, local_path: str):
@@ -999,6 +1000,9 @@ class FSDPEngine(BaseEngine):
             state = torch.load(state_path, map_location="cpu")
             self._tafr_grpo_ema_state = state.get("grpo_ema_state", self._tafr_grpo_ema_state)
             self._tafr_fail_ema_state = state.get("fail_ema_state", self._tafr_fail_ema_state)
+            if self._is_lora:
+                self._tafr_grpo_lora_ema_state = state.get("grpo_lora_ema_state", self._tafr_grpo_lora_ema_state)
+                self._tafr_fail_lora_ema_state = state.get("fail_lora_ema_state", self._tafr_fail_lora_ema_state)
         if os.path.exists(failure_path):
             loaded = torch.load(failure_path, map_location="cpu")
             self._tafr_failure.load_state_dict(loaded, strict=False)
@@ -1856,17 +1860,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
             self._tafr_anchor = self._tafr_clone_from_state(anchor_state, trainable=False)
             self._tafr_replay = self._tafr_clone_from_state(replay_state, trainable=False)
         if self.rank == 0:
-            torch.save(
-                {
-                    "global_step": global_step,
-                    "ema_gamma": gamma,
-                    "mix_eta": eta,
-                    "failure_model_changed": bool(failure_model_changed),
-                    "grpo_ema_state": self._tafr_grpo_ema_state,
-                    "fail_ema_state": self._tafr_fail_ema_state,
-                },
-                os.path.join(local_path, "tafr_state.pt"),
-            )
+            save_dict = {
+                "global_step": global_step,
+                "ema_gamma": gamma,
+                "mix_eta": eta,
+                "failure_model_changed": bool(failure_model_changed),
+                "grpo_ema_state": self._tafr_grpo_ema_state,
+                "fail_ema_state": self._tafr_fail_ema_state,
+            }
+            if self._is_lora:
+                save_dict["grpo_lora_ema_state"] = self._tafr_grpo_lora_ema_state
+                save_dict["fail_lora_ema_state"] = self._tafr_fail_lora_ema_state
+            torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
         return {"tafr_refreshed": True, "tafr_failure_ema_updated": bool(failure_model_changed)}
 
     def tafr_load(self, local_path: str):
@@ -1877,6 +1882,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
             state = torch.load(state_path, map_location="cpu")
             self._tafr_grpo_ema_state = state.get("grpo_ema_state", self._tafr_grpo_ema_state)
             self._tafr_fail_ema_state = state.get("fail_ema_state", self._tafr_fail_ema_state)
+            if self._is_lora:
+                self._tafr_grpo_lora_ema_state = state.get("grpo_lora_ema_state", self._tafr_grpo_lora_ema_state)
+                self._tafr_fail_lora_ema_state = state.get("fail_lora_ema_state", self._tafr_fail_lora_ema_state)
         if os.path.exists(failure_path):
             loaded = torch.load(failure_path, map_location="cpu")
             self._tafr_failure.load_state_dict(loaded, strict=False)

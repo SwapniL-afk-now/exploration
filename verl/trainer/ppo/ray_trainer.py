@@ -1277,6 +1277,11 @@ class RayPPOTrainer:
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
+        # load TAFR state (EMA, failure model, failure SFT optimizer)
+        tafr_local_path = os.path.join(global_step_folder, "tafr")
+        if self.tafr_enabled and os.path.isdir(tafr_local_path):
+            print(f"Loading TAFR state from {tafr_local_path}")
+            self.actor_rollout_wg.tafr_load(tafr_local_path)
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
