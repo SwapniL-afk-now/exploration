@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import shutil
 import uuid
 import math
 import re
@@ -1215,6 +1216,24 @@ class RayPPOTrainer:
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+
+        # Clean up old global_step directories to reclaim disk space.
+        # The actor checkpoint manager only tracks actor/ subdirs, but
+        # tafr/ and data.pt in parent dirs accumulate. Remove old
+        # global_step dirs entirely if max_actor_ckpt_to_keep is set.
+        if max_actor_ckpt_to_keep and isinstance(max_actor_ckpt_to_keep, int) and max_actor_ckpt_to_keep >= 1:
+            ckpt_base = self.config.trainer.default_local_dir
+            if not os.path.isabs(ckpt_base):
+                ckpt_base = os.path.join(os.getcwd(), ckpt_base)
+            if os.path.isdir(ckpt_base):
+                for d in os.listdir(ckpt_base):
+                    if not d.startswith("global_step_"):
+                        continue
+                    step = int(d.split("global_step_")[-1])
+                    if step < self.global_steps:
+                        old_path = os.path.join(ckpt_base, d)
+                        print(f"Cleaning up old checkpoint dir: {old_path}")
+                        shutil.rmtree(old_path, ignore_errors=True)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
