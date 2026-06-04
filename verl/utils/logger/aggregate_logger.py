@@ -62,7 +62,7 @@ def concat_dict_to_str(dict: dict, step):
         "val/amc23/pass_at_1",
         "val/amc23/pass_at_8",
         "val/amc23/avg_at_k",
-        "val/amc23/maj_at_8",
+        "val/amc23/avg_at_8",
         "perf/time_per_step",
         "perf/step_seconds",
         "perf/responses_per_second",
@@ -75,7 +75,7 @@ def concat_dict_to_str(dict: dict, step):
             output.append(f"{k}:{float(dict[k]):.4g}")
             seen.add(k)
 
-    val_suffixes = {"pass_at_1", "pass_at_8", "avg_at_k", "maj_at_8"}
+    val_suffixes = {"pass_at_1", "pass_at_8", "avg_at_k", "avg_at_8"}
     for k in sorted(dict):
         parts = k.split("/")
         if len(parts) == 3 and parts[0] == "val" and parts[2] in val_suffixes and k not in seen:

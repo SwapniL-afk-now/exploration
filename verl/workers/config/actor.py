@@ -109,6 +109,8 @@ class WassersteinGuidanceConfig(BaseConfig):
     enable: bool = False
     lambda_wg: float = 0.01
     alpha_transport: float = 0.2
+    embed_model: str = "BAAI/bge-small-en-v1.5"
+    decode_model: str = ""
 
 
 @dataclass

@@ -497,7 +497,7 @@ class RayPPOTrainer:
             "val/amc23/pass_at_1",
             "val/amc23/pass_at_8",
             "val/amc23/avg_at_k",
-            "val/amc23/maj_at_8",
+            "val/amc23/avg_at_8",
             "perf/time_per_step",
             "timing_s/step",
         ]
@@ -800,7 +800,7 @@ class RayPPOTrainer:
             all_correct = 0.0
             mixed = 0.0
             pass_counts = {cutoff: 0.0 for cutoff in cutoffs}
-            maj_counts = {cutoff: 0.0 for cutoff in cutoffs}
+            avg_counts = {cutoff: 0.0 for cutoff in cutoffs}
             for group in source_groups:
                 vals = group["acc"]
                 preds = group["pred"]
@@ -825,12 +825,8 @@ class RayPPOTrainer:
                     subset_vals = vals[:cutoff]
                     subset_preds = preds[:cutoff]
                     pass_counts[cutoff] += float(any(value > 0.0 for value in subset_vals)) if subset_vals else 0.0
-                    if subset_vals and subset_preds:
-                        pred_counts = Counter(subset_preds)
-                        majority_answer = sorted(pred_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
-                        maj_counts[cutoff] += float(
-                            any(pred == majority_answer and value > 0.0 for pred, value in zip(subset_preds, subset_vals, strict=False))
-                        )
+                    if subset_vals:
+                        avg_counts[cutoff] += float(sum(1.0 for v in subset_vals if v > 0.0) / len(subset_vals))
 
             def mean(values):
                 return float(sum(values) / len(values)) if values else 0.0
@@ -842,14 +838,14 @@ class RayPPOTrainer:
                 return float((sum((value - avg) ** 2 for value in values) / len(values)) ** 0.5)
 
             base = f"{prefix}/{source}"
-            metrics[f"{base}/avg_at_k"] = float(correct_total / generation_total) if generation_total else 0.0
+            metrics[f"{base}/sample_accuracy"] = float(correct_total / generation_total) if generation_total else 0.0
             metrics[f"{base}/total_prompts"] = int(prompt_total)
             metrics[f"{base}/total_generations"] = int(generation_total)
             for cutoff in cutoffs:
                 metrics[f"{base}/pass_at_{cutoff}"] = float(pass_counts[cutoff] / prompt_total) if prompt_total else 0.0
-                metrics[f"{base}/maj_at_{cutoff}"] = float(maj_counts[cutoff] / prompt_total) if prompt_total else 0.0
+                metrics[f"{base}/avg_at_{cutoff}"] = float(avg_counts[cutoff] / prompt_total) if prompt_total else 0.0
             metrics[f"{base}/pass_at_k"] = metrics[f"{base}/pass_at_{max(cutoffs)}"]
-            metrics[f"{base}/maj_at_k"] = metrics[f"{base}/maj_at_{max(cutoffs)}"]
+            metrics[f"{base}/avg_at_k"] = metrics[f"{base}/avg_at_{max(cutoffs)}"]
             metrics[f"{base}/unique_response_ratio_at_k"] = mean(unique_response_rates)
             metrics[f"{base}/unique_answer_ratio_at_k"] = mean(unique_answer_rates)
             metrics[f"{base}/answer_entropy_at_k"] = mean(answer_entropies)

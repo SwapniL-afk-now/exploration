@@ -25,6 +25,10 @@ _major, _ = get_device_capability()
 # Disable both on Blackwell (SM 10.x); non-Blackwell GPUs don't have MNNVL.
 _gb200_nccl_env = {"NCCL_NVLS_ENABLE": "0", "NCCL_MNNVL_ENABLE": "0"} if (_major or 0) >= 10 else {}
 
+_venv_site_packages = "/venv/main/lib/python3.12/site-packages"
+_verl_repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_extra_pythonpath = f"{_venv_site_packages}:{_verl_repo}"
+
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
@@ -46,6 +50,8 @@ PPO_RAY_RUNTIME_ENV = {
         "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
         "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
         "HSA_NO_SCRATCH_RECLAIM": "1",
+        # Ensure Ray workers can find venv-installed packages
+        "PYTHONPATH": _extra_pythonpath,
         **_gb200_nccl_env,
     },
 }
@@ -67,4 +73,8 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    # Ray workers don't inherit the driver's os.environ; pass these explicitly
+    for key in ("WANDB_API_KEY", "HF_TOKEN"):
+        if os.environ.get(key) is not None:
+            runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

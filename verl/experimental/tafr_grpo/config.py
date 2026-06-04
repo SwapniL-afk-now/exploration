@@ -28,6 +28,7 @@ class TAFRGRPOConfig:
 
     enable: bool = False
     beta: float = 0.0
+    anchor_beta: float = 0.0
     ema_gamma: float = 0.99
     mix_eta: float = 1.0
     sft_update_interval_grpo_steps: int = 5

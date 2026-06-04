@@ -90,6 +90,12 @@ wasserstein_guidance:
   # Transport coefficient for Wasserstein guidance
   alpha_transport: 0.2
 
+  # Embedding model for Wasserstein guidance
+  embed_model: BAAI/bge-small-en-v1.5
+
+  # Decode model for Wasserstein guidance
+  decode_model: ""
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

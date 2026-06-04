@@ -118,6 +118,9 @@ custom_tafr_grpo:
   # Single KL coefficient used for both anchor and replay KL terms
   beta: 0.0
 
+  # Anchor KL coefficient (overrides beta when > 0; 0 = use beta)
+  anchor_beta: 0.0
+
   # EMA decay for saved GRPO and failure-SFT checkpoints
   ema_gamma: 0.99
 

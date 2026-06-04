@@ -78,17 +78,17 @@ fi
 TAFR_VARIANT=${TAFR_VARIANT:-full}               # full | anchor_only | replay_only
 TAFR_LOGPROB_BACKEND=${TAFR_LOGPROB_BACKEND:-vllm} # hf | vllm
 TAFR_VLLM_SCORE_MICRO_BATCH_SIZE=${TAFR_VLLM_SCORE_MICRO_BATCH_SIZE:-16}
-TAFR_BETA=${TAFR_BETA:-0.01}                     # KL coefficient for both anchor and replay terms
+TAFR_BETA=${TAFR_BETA:-0.1}                      # KL coefficient for both anchor and replay terms
 TAFR_ANCHOR_BETA=${TAFR_ANCHOR_BETA:-0.0}        # anchor KL coefficient (overrides beta; 0 = off)
-TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.99}           # EMA decay for GRPO and failure EMA trackers
-TAFR_MIX_ETA=${TAFR_MIX_ETA:-1.0}               # mix weight: theta_anchor = (1-eta)*ref + eta*ema
+TAFR_EMA_GAMMA=${TAFR_EMA_GAMMA:-0.9}            # EMA decay for GRPO and failure EMA trackers
+TAFR_MIX_ETA=${TAFR_MIX_ETA:-0.5}               # mix weight: theta_anchor = (1-eta)*ref + eta*ema
 
 # Failure-SFT schedule
 TAFR_SFT_UPDATE_INTERVAL=${TAFR_SFT_UPDATE_INTERVAL:-2}       # run SFT every N GRPO steps
 TAFR_CHECKPOINT_INTERVAL=${TAFR_CHECKPOINT_INTERVAL:-10}      # save + refresh EMA every N GRPO steps
 
 # Failure-SFT optimizer
-TAFR_SFT_LR=${TAFR_SFT_LR:-1.0e-6}                           # failure-SFT learning rate
+TAFR_SFT_LR=${TAFR_SFT_LR:-5.0e-7}                           # failure-SFT learning rate
 # Chunk size when iterating over the interval's buffered failures.
 # The buffer is cleared after every SFT update, so this controls
 # how many examples go into each optimizer step within the interval.
@@ -250,7 +250,7 @@ TAFR=(
     custom_tafr_grpo.vllm_score_micro_batch_size="${TAFR_VLLM_SCORE_MICRO_BATCH_SIZE}"
     # KL coefficients and EMA
     custom_tafr_grpo.beta="${TAFR_BETA}"
-    +custom_tafr_grpo.anchor_beta="${TAFR_ANCHOR_BETA}"
+    custom_tafr_grpo.anchor_beta="${TAFR_ANCHOR_BETA}"
     custom_tafr_grpo.ema_gamma="${TAFR_EMA_GAMMA}"
     custom_tafr_grpo.mix_eta="${TAFR_MIX_ETA}"
     # Disable verl built-in KL (TAFR manages its own)
