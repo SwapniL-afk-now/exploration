@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 WORKSPACE_ROOT=$(cd -- "${REPO_ROOT}/.." && pwd)
-PYTHON_BIN=${PYTHON_BIN:-"${REPO_ROOT}/.venv/bin/python"}
+PYTHON_BIN=${PYTHON_BIN:-"/venv/main/bin/python3"}
 
 cd "$REPO_ROOT"
 
@@ -28,29 +28,29 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
     unset _XTRACE_WAS_ON
 fi
 
-PROJECT_NAME=${PROJECT_NAME:-verl_sharpening_grpo_dapo_math}
+PROJECT_NAME=${PROJECT_NAME:-verl_sharpening_grpo_ttt_aime24}
 export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
 export WANDB_SILENT=${WANDB_SILENT:-true}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_sharpening_grpo_fsdp}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_sharpening_grpo_ttt_aime24}
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-Math-1.5B-Instruct}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
 ROLLOUT_AGENT_NUM_WORKERS=${ROLLOUT_AGENT_NUM_WORKERS:-1}
 
-# Match the wesserstein trainer's exact training and testing datasets.
-TRAIN_DATASET=${TRAIN_DATASET:-zhuzilin/dapo-math-17k}
-TRAIN_DATASET_CONFIG=${TRAIN_DATASET_CONFIG:-default}
-TRAIN_SPLIT=${TRAIN_SPLIT:-train}
-TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:--1}
-TRAIN_FILE=${TRAIN_FILE:-"${WORKSPACE_ROOT}/failure-escape-runs/data/dapo_math_17k_train_full.parquet"}
-PREPARE_TRAIN_DATA=${PREPARE_TRAIN_DATA:-true}
-
 EVAL_DATA_DIR=${EVAL_DATA_DIR:-"${WORKSPACE_ROOT}/failure-escape-runs/data/wesserstein_eval"}
+
+# Test-time training: train and eval on the same benchmark (AIME24).
+TRAIN_DATASET=${TRAIN_DATASET:-math-ai/aime24}
+TRAIN_DATASET_CONFIG=${TRAIN_DATASET_CONFIG:-default}
+TRAIN_SPLIT=${TRAIN_SPLIT:-test}
+TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:--1}
+TRAIN_FILE=${TRAIN_FILE:-"${EVAL_DATA_DIR}/aime24.parquet"}
+PREPARE_TRAIN_DATA=${PREPARE_TRAIN_DATA:-false}
 PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-true}
 if [[ -z "${VAL_FILES:-}" ]]; then
-    # Same eval set as examples/wesserstein_trainer/run_qwen25_1_5b_fsdp.sh.
-    VAL_FILES="[${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet]"
+    # Test-time training: eval on the same benchmark.
+    VAL_FILES="[${EVAL_DATA_DIR}/aime24.parquet]"
 fi
 
 if [[ "${PREPARE_TRAIN_DATA}" == "true" && ! -f "${TRAIN_FILE}" ]]; then
@@ -63,37 +63,24 @@ if [[ "${PREPARE_TRAIN_DATA}" == "true" && ! -f "${TRAIN_FILE}" ]]; then
         --output "${TRAIN_FILE}"
 fi
 
-if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
-    mkdir -p "${EVAL_DATA_DIR}"
-    if [[ ! -f "${EVAL_DATA_DIR}/amc23.parquet" ]]; then
-        "$PYTHON_BIN" -m verl.experimental.fepo.data --dataset math-ai/amc23 --split test --output "${EVAL_DATA_DIR}/amc23.parquet"
-    fi
-    if [[ ! -f "${EVAL_DATA_DIR}/aime24.parquet" ]]; then
-        "$PYTHON_BIN" -m verl.experimental.fepo.data --dataset math-ai/aime24 --split test --output "${EVAL_DATA_DIR}/aime24.parquet"
-    fi
-    if [[ ! -f "${EVAL_DATA_DIR}/aime25.parquet" ]]; then
-        "$PYTHON_BIN" -m verl.experimental.fepo.data --dataset math-ai/aime25 --split test --output "${EVAL_DATA_DIR}/aime25.parquet"
-    fi
-fi
-
 # ── Sequence Sharpening hyperparameters ──────────────────────────────────────
 # When SHARPEN_ENABLE is false the entire custom_sharpening_grpo namespace
 # is still passed in (with enable=false) so the trainer's validation hook
 # runs but the loss falls back to the verl vanilla PPO loss.
 SHARPEN_ENABLE=${SHARPEN_ENABLE:-true}
-SHARPEN_USE_GRPO_REWARD=${SHARPEN_USE_GRPO_REWARD:-true}
+SHARPEN_USE_GRPO_REWARD=${SHARPEN_USE_GRPO_REWARD:-false}
 SHARPEN_GAMMA=${SHARPEN_GAMMA:-0.1}
 SHARPEN_ALPHA=${SHARPEN_ALPHA:-1.0}
 SHARPEN_BETA=${SHARPEN_BETA:-0.1}
 SHARPEN_CLIP_RATIO=${SHARPEN_CLIP_RATIO:-0.2}
 
-TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}
-NUM_GENERATIONS=${NUM_GENERATIONS:-8}
+TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-8}
+NUM_GENERATIONS=${NUM_GENERATIONS:-64}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
 DRGRPO_USE_LORA=${DRGRPO_USE_LORA:-true}
 LORA_RANK=${LORA_RANK:-128}
@@ -111,17 +98,17 @@ ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
 VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
-ROLLOUT_MAX_LORAS=${ROLLOUT_MAX_LORAS:-2}
+ROLLOUT_MAX_LORAS=${ROLLOUT_MAX_LORAS:-3}
 ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-True}
-# 16 val rollouts per prompt => the verl auto-metric block emits
-# val/<dataset>/pass_at_{1,4,8,16} and val/<dataset>/avg_at_{1,4,8,16}.
+# 32 val rollouts per prompt => the verl auto-metric block emits
+# val/<dataset>/pass_at_{1,4,8,16,32} and val/<dataset>/avg_at_{1,4,8,16,32}.
 VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
-VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
-MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
+MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-320}
 SAVE_FREQ=${SAVE_FREQ:--30}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
@@ -208,7 +195,7 @@ REF=(
 )
 
 TRAINER=(
-    trainer.resume_mode=disable
+    trainer.resume_mode=auto
     trainer.balance_batch=True
     trainer.critic_warmup=0
     trainer.logger=${LOGGER}

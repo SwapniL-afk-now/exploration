@@ -76,7 +76,13 @@ def need_reference_policy(
     config: DictConfig,
 ) -> bool:
     """Given the config, do we need ref policy."""
-    return config.algorithm.get("use_kl_in_reward", False) or config.actor_rollout_ref.actor.use_kl_loss
+    sharpening = config.get("custom_sharpening_grpo", {})
+    sharpening_active = bool(sharpening and sharpening.get("enable", False))
+    return (
+        config.algorithm.get("use_kl_in_reward", False)
+        or config.actor_rollout_ref.actor.use_kl_loss
+        or sharpening_active
+    )
 
 
 def need_teacher_policy(

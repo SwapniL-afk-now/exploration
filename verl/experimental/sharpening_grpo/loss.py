@@ -87,11 +87,8 @@ def compute_sharpening_grpo_loss(
             f"Got {tuple(old_log_prob.shape)}, {tuple(log_prob.shape)}, {tuple(ref_log_prob.shape)}."
         )
 
-    B, T = log_prob.shape
-    if B % int(group_size) != 0:
-        raise ValueError(
-            f"Batch size B={B} must be divisible by group_size G={group_size} for GRSA."
-        )
+    B_full, T = log_prob.shape
+    G = int(group_size)
 
     # ---------------------------------------------------------------- GRPO term
     # PPO-clipped surrogate on the rollout advantage. Identical to the verl
@@ -120,14 +117,32 @@ def compute_sharpening_grpo_loss(
 
     # ---------------------------------------------------------- GRSA normalize
     # Reshape (B, T) -> (P, G, T) and normalize across the G axis to get a
-    # per-prompt, per-timestep z-score. Flatten back and re-mask so that
-    # padding tokens are zeroed out.
-    P = B // int(group_size)
-    G = int(group_size)
-    w_r = w_t.view(P, G, T)
-    mu_group = w_r.mean(dim=1, keepdim=True)
-    sigma_group = w_r.std(dim=1, keepdim=True)
-    w_bar = ((w_r - mu_group) / (sigma_group + 1e-8)).view(B, T) * response_mask.to(dtype=w_t.dtype)
+    # per-prompt, per-timestep z-score.  When B is not divisible by G (dynamic
+    # batching), the trailing sequences use the raw entropy-rate weight.
+    B = B_full
+    P_complete = B // G
+    B_grsa = P_complete * G
+
+    if B_grsa > 0:
+        w_grsa = w_t[:B_grsa].view(P_complete, G, T)
+        mu_group = w_grsa.mean(dim=1, keepdim=True)
+        sigma_group = w_grsa.std(dim=1, keepdim=True)
+        w_bar_grsa = ((w_grsa - mu_group) / (sigma_group + 1e-8)).view(B_grsa, T)
+    else:
+        # Fewer sequences than group_size — no complete groups for GRSA.
+        # Use the raw entropy-rate weight (no z-scoring).
+        w_bar_grsa = torch.empty(0, T, dtype=w_t.dtype, device=w_t.device)
+        mu_group = torch.empty(0, 1, dtype=w_t.dtype, device=w_t.device)
+        sigma_group = torch.empty(0, 1, dtype=w_t.dtype, device=w_t.device)
+
+    # Remainder sequences that don't form a complete group get raw w_t.
+    if B > B_grsa:
+        w_bar_remainder = w_t[B_grsa:]
+    else:
+        w_bar_remainder = torch.empty(0, T, dtype=w_t.dtype, device=w_t.device)
+
+    # Concatenate GRSA-normalized and raw remainder weights.
+    w_bar = torch.cat([w_bar_grsa, w_bar_remainder], dim=0) * response_mask.to(dtype=w_t.dtype)
 
     # ------------------------------------------------ Sequence sharpening term
     # Same PPO-style clip as the GRPO term, but multiplied by the
@@ -151,18 +166,20 @@ def compute_sharpening_grpo_loss(
     kl_term = _masked_token_mean(kl_k3, response_mask)
 
     # ----------------------------------------------------------------- Metrics
+    mu_scalar = float(mu_group.detach().mean().cpu()) if mu_group.numel() > 0 else 0.0
+    sigma_scalar = float(sigma_group.detach().mean().cpu()) if sigma_group.numel() > 0 else 0.0
     metrics: dict[str, float] = {
         "sharpen/grpo_term": float(grpo_term.detach().cpu()),
         "sharpen/seq_term": float(seq_term.detach().cpu()),
         "sharpen/kl_term": float(kl_term.detach().cpu()),
-        "sharpen/mu_group_mean": float(mu_group.detach().mean().cpu()),
-        "sharpen/sigma_group_mean": float(sigma_group.detach().mean().cpu()),
-        "sharpen/mu_group_abs_mean": float(mu_group.detach().abs().mean().cpu()),
+        "sharpen/mu_group_mean": mu_scalar,
+        "sharpen/sigma_group_mean": sigma_scalar,
+        "sharpen/mu_group_abs_mean": float(mu_group.detach().abs().mean().cpu()) if mu_group.numel() > 0 else 0.0,
         "sharpen/w_bar_abs_mean": float(w_bar.detach().abs().mean().cpu()),
         "sharpen/entropy_rate_mean": float(w_t.detach().mean().cpu()),
         "sharpen/use_grpo_reward": float(bool(use_grpo_reward)),
         "sharpen/group_size": float(G),
-        "sharpen/num_prompts": float(P),
+        "sharpen/num_prompts": float(P_complete),
     }
 
     return SharpeningLossOutput(grpo_term=grpo_term, seq_term=seq_term, kl_term=kl_term, metrics=metrics)
