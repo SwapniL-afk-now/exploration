@@ -166,6 +166,31 @@ custom_tafr_grpo:
   # vLLM micro-batch size for prompt-logprob scoring
   vllm_score_micro_batch_size: 16
 
+# config for Sequence Sharpening GRPO
+custom_sharpening_grpo:
+
+  # Whether to enable the Sequence Sharpening actor loss
+  enable: false
+
+  # Toggle the standard GRPO reward advantage loss. When false, the GRPO
+  # contribution to the total actor loss is exactly 0 (verifier-free ablation).
+  use_grpo_reward: true
+
+  # Weight on the entropy-rate / GRSA sequence sharpening term
+  gamma: 0.1
+
+  # Auxiliary scale on the sequence sharpening term; combined as gamma*alpha
+  alpha: 1.0
+
+  # Coefficient for the K3 KL penalty (exp(r) - 1 - r) toward the reference
+  beta: 0.1
+
+  # Group size G for GRSA -- must equal actor_rollout_ref.rollout.n
+  group_size: 8
+
+  # PPO clip epsilon for the sequence sharpening surrogate
+  clip_ratio: 0.2
+
 # config for the trainer
 trainer:
 

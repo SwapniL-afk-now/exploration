@@ -39,6 +39,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.sharpening_grpo.config import validate_sharpening_config
 from verl.experimental.tafr_grpo.config import (
     should_checkpoint_and_refresh,
     should_run_failure_sft,
@@ -325,6 +326,8 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+        self.sharpening_config = validate_sharpening_config(self.config)
+        self.sharpening_enabled = bool(self.sharpening_config.enable)
         self.tafr_config = validate_tafr_config(self.config)
         self.tafr_enabled = bool(self.tafr_config.enable)
         self.tafr_failure_collector = (
@@ -1533,19 +1536,38 @@ class RayPPOTrainer:
                     "variant": self.tafr_config.variant,
                 },
             )
+        if self.sharpening_enabled:
+            tu.assign_non_tensor(
+                batch_td,
+                custom_sharpening_grpo=self._sharpening_config_dict(),
+            )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
         tafr_actor_output = {key: val for key, val in actor_output.items() if key.startswith("tafr_grpo/")}
+        sharpen_actor_output = {key: val for key, val in actor_output.items() if key.startswith("sharpen/")}
         actor_output = rename_dict(
-            {key: val for key, val in actor_output.items() if not key.startswith("tafr_grpo/")},
+            {key: val for key, val in actor_output.items()
+             if not key.startswith("tafr_grpo/") and not key.startswith("sharpen/")},
             "actor/",
         )
         actor_output.update(tafr_actor_output)
+        actor_output.update(sharpen_actor_output)
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
         return actor_output
+
+    def _sharpening_config_dict(self) -> dict[str, Any]:
+        return {
+            "enable": bool(self.sharpening_config.enable),
+            "use_grpo_reward": bool(self.sharpening_config.use_grpo_reward),
+            "gamma": float(self.sharpening_config.gamma),
+            "alpha": float(self.sharpening_config.alpha),
+            "beta": float(self.sharpening_config.beta),
+            "group_size": int(self.sharpening_config.group_size),
+            "clip_ratio": float(self.sharpening_config.clip_ratio),
+        }
 
     def _tafr_config_dict(self) -> dict[str, Any]:
         return {

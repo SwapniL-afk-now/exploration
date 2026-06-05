@@ -174,6 +174,11 @@ def validate_config(
 
         validate_tafr_config(config)
 
+    if config.get("custom_sharpening_grpo", {}).get("enable", False):
+        from verl.experimental.sharpening_grpo.config import validate_sharpening_config
+
+        validate_sharpening_config(config)
+
     # critic
     if use_critic:
         critic_config = omega_conf_to_dataclass(config.critic)

@@ -94,6 +94,40 @@ All run scripts follow the same shape:
    - `actor.ulysses_sequence_parallel_size` → use
      `actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size`.
 
+## Sequence Sharpening GRPO
+
+`examples/sequence_sharpening/run_sharpening_grpo_fsdp.sh` runs the
+Sequence Sharpening GRPO algorithm on top of `verl.trainer.main_ppo`. The
+algorithm is a verifier-free extension of standard GRPO that adds a
+sequence-level loss built from two upgrades:
+
+* **Entropy-Rate (Geometric) Sharpening** — a reverse-cumulative suffix
+  log-likelihood weight `w_t` that removes the implicit length bias of a
+  sequence-level likelihood surrogate.
+* **Group-Relative Sequence Advantage (GRSA)** — the entropy-rate weight
+  is z-scored within each prompt's rollouts, giving per-prompt
+  variance-reduced advantages.
+
+The total actor loss is
+
+```
+L = use_grpo_reward * L_grpo
+  + gamma * alpha * L_seq
+  + beta * L_kl_k3
+```
+
+`use_grpo_reward=false` zeroes out the standard GRPO contribution for
+verifier-free ablations. The K3 KL penalty is `exp(r) - 1 - r` with
+`r = pi_theta / pi_ref`; the sharpening config requires
+`actor_rollout_ref.actor.use_kl_loss=false` to avoid double-counting.
+
+All algorithm knobs are exposed as env vars (`SHARPEN_GAMMA`,
+`SHARPEN_ALPHA`, `SHARPEN_BETA`, `SHARPEN_USE_GRPO_REWARD`,
+`SHARPEN_CLIP_RATIO`, `SHARPEN_ENABLE`). The launch script sets
+`actor_rollout_ref.rollout.val_kwargs.n=16` so the trainer's auto-metric
+block emits `val/<dataset>/pass_at_{1,4,8,16}` and
+`val/<dataset>/avg_at_{1,4,8,16}` for every validation set.
+
 ## Directory layout
 
 ### Algorithm trainers
@@ -106,6 +140,7 @@ under `recipe/` instead.
 |------------------------------------|--------------------------------|-----------------------------------------------------|
 | `ppo_trainer/`                     | PPO (actor + critic)           | `adv_estimator=gae`                                 |
 | `grpo_trainer/`                    | GRPO                           | `adv_estimator=grpo`                                |
+| `sequence_sharpening/`             | Sequence Sharpening GRPO       | `adv_estimator=grpo`, `custom_sharpening_grpo.*`    |
 | `drgrpo_trainer/`                  | Dr.GRPO                        | `adv_estimator=grpo`, `norm_adv_by_std_in_grpo=False` |
 | `fepo_trainer/`                    | FEPO / failure-escape          | `verl.experimental.fepo.main_fepo`                 |
 | `rloo_trainer/`                    | RLOO                           | `adv_estimator=rloo`                                |

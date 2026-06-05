@@ -16,6 +16,7 @@
 import torch
 from tensordict import TensorDict
 
+from verl.experimental.sharpening_grpo.loss import compute_sharpening_grpo_loss
 from verl.experimental.tafr_grpo.tafr_loss import compute_tafr_grpo_auxiliary_loss
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
@@ -90,6 +91,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
     tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default=None)
     tafr_group_ids = _as_list(data.get("uid", None)) if tafr_config and tafr_config.get("enable", False) else []
 
+    sharpening_config = tu.get_non_tensor_data(data=data, key="custom_sharpening_grpo", default=None)
+    sharpening_enabled = bool(sharpening_config and sharpening_config.get("enable", False))
+
     wasserstein_guidance = getattr(config, "wasserstein_guidance", {})
     wg_enabled = bool(wasserstein_guidance.get("enable", False))
     wg_group_ids = _as_list(data.get("uid", None)) if wg_enabled else []
@@ -113,6 +117,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         ):
             if field in data:
                 fields.append(field)
+    if sharpening_enabled:
+        # The Sequence Sharpening loss needs ref_log_prob on top of the
+        # standard fields. Make sure it is included in the padded payload.
+        if "ref_log_prob" in data and "ref_log_prob" not in fields:
+            fields.append("ref_log_prob")
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
@@ -146,6 +155,47 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
     ppo_loss_coef = float(getattr(config, "ppo_loss_coef", 1.0))
     policy_loss = ppo_loss_coef * pg_loss
     metrics["actor/ppo_loss_coef"] = ppo_loss_coef
+
+    if sharpening_enabled:
+        if "ref_log_prob" not in data:
+            raise ValueError(
+                "Sequence Sharpening requires 'ref_log_prob' in the actor batch. "
+                "Ensure a reference policy is configured (use_reference_policy=true)."
+            )
+        sharpening_use_grpo_reward = bool(sharpening_config.get("use_grpo_reward", True))
+        sharpening_group_size = int(sharpening_config.get("group_size", 8))
+        sharpening_clip_ratio = float(sharpening_config.get("clip_ratio", config.clip_ratio))
+        sharpening_gamma = float(sharpening_config.get("gamma", 0.1))
+        sharpening_alpha = float(sharpening_config.get("alpha", 1.0))
+        sharpening_beta = float(sharpening_config.get("beta", 0.1))
+
+        sharpen_output = compute_sharpening_grpo_loss(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=policy_response_mask,
+            ref_log_prob=data["ref_log_prob"],
+            group_size=sharpening_group_size,
+            clip_ratio=sharpening_clip_ratio,
+            use_grpo_reward=sharpening_use_grpo_reward,
+        )
+
+        # Replace the GRPO contribution with the toggleable sharpening term.
+        # When use_grpo_reward=False, the GRPO contribution is exactly 0 but the
+        # term is still computed and reported in metrics for diagnostics.
+        grpo_scale = ppo_loss_coef if sharpening_use_grpo_reward else 0.0
+        policy_loss = grpo_scale * sharpen_output.grpo_term \
+            + sharpening_gamma * sharpening_alpha * sharpen_output.seq_term \
+            + sharpening_beta * sharpen_output.kl_term
+
+        sharpen_metrics = Metric.from_dict(sharpen_output.metrics, aggregation=AggregationType.MEAN)
+        metrics.update(sharpen_metrics)
+        metrics["sharpen/grpo_term"] = Metric(value=sharpen_output.grpo_term, aggregation=metric_aggregation)
+        metrics["sharpen/seq_term"] = Metric(value=sharpen_output.seq_term, aggregation=metric_aggregation)
+        metrics["sharpen/kl_term"] = Metric(value=sharpen_output.kl_term, aggregation=metric_aggregation)
+        metrics["sharpen/gamma"] = Metric(value=sharpening_gamma, aggregation=AggregationType.MAX)
+        metrics["sharpen/alpha"] = Metric(value=sharpening_alpha, aggregation=AggregationType.MAX)
+        metrics["sharpen/beta"] = Metric(value=sharpening_beta, aggregation=AggregationType.MAX)
 
     if tafr_enabled:
         if "tafr_group_reward_mean" not in data:
