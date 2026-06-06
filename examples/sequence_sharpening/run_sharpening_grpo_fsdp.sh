@@ -109,7 +109,7 @@ VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
 MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-320}
-SAVE_FREQ=${SAVE_FREQ:--30}
+SAVE_FREQ=${SAVE_FREQ:-10}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 LOGGER=${LOGGER:-'["console","wandb"]'}
@@ -205,7 +205,7 @@ TRAINER=(
     trainer.n_gpus_per_node=${NDEVICES_PER_NODE}
     trainer.nnodes=${NNODES}
     trainer.save_freq=${SAVE_FREQ}
-    trainer.max_actor_ckpt_to_keep=1
+    trainer.max_actor_ckpt_to_keep=2
     trainer.test_freq=${TEST_FREQ}
     trainer.val_before_train=${VAL_BEFORE_TRAIN}
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS}
