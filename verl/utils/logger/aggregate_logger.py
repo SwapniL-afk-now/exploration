@@ -67,6 +67,19 @@ def concat_dict_to_str(dict: dict, step):
         "perf/step_seconds",
         "perf/responses_per_second",
         "timing_s/step",
+        # JEPA-GRPO
+        "grpo_pg_loss",
+        "grpo_clip_fraction",
+        "grad_norm",
+        "jepa/lejepa_loss",
+        "jepa/align_loss",
+        "jepa/sigreg_loss",
+        "jepa/n_valid_pairs",
+        "jepa/frac_questions_with_both_correct",
+        "cot/pass_at_1",
+        "cot/avg_reward",
+        "code/pass_at_1",
+        "code/avg_reward",
     ]
     output = [f"step:{step}"]
     seen = set()

@@ -1477,7 +1477,7 @@ class RayPPOTrainer:
         routed_experts = tu.get(output, "routed_experts")
         sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
 
-        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+        old_log_prob_mfu = tu.get(output, "metrics").get("mfu", 0.0)
         # step 4. No padding to padding
         entropy = no_padding_2_padding(entropy, batch_td)
         log_probs = no_padding_2_padding(log_probs, batch_td)

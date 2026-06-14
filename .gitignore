@@ -7,6 +7,7 @@
 **/*.tar.gz
 **/playground
 **/wandb
+jepa-grpo-cache/
 
 /pyrightconfig.json
 

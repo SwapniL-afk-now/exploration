@@ -1,0 +1,15 @@
+defaults:
+  - jepa_grpo_trainer
+  - _self_
+
+model_id: Qwen/Qwen2.5-7B-Instruct
+experiment_name: qwen25_7b_jepa_grpo
+learning_rate: 1.0e-6
+vllm_gpu_memory_utilization: 0.35
+vllm_max_num_seqs: 16
+train_prompt_batch_size: 2
+gradient_accumulation_steps: 4
+embed_micro_batch_size: 8
+loss_micro_batch_size: 4
+eval_batch_size: 16
+eval_generations: 16

@@ -1,0 +1,62 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Config dataclass for the Ray-based JEPA-GRPO trainer."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from omegaconf import DictConfig, OmegaConf
+
+
+@dataclass
+class JEPARayConfig:
+    """JEPA hyperparameters for the Ray-based distributed trainer.
+
+    Loss:  L_total = L_DrGRPO(CoT) + alpha * L_LeJEPA(enc_q_cot, enc_a_code)
+    The LeJEPA loss aligns CoT prompt embeddings with correct Code view
+    embeddings on the unit sphere (align_loss) while regularising the joint
+    distribution toward N(0, I_d) via SIGReg (Epps-Pulley test).
+    """
+
+    enable: bool = True
+    alpha: float = 0.1
+    ema_decay: float = 0.99
+    embed_micro_batch_size: int = 16
+    # Minimum number of valid (cot_correct AND code_correct) pairs to skip step
+    min_valid_pairs: int = 2
+    # LeJEPA / SIGReg hyper-params (shared with core_algos.py defaults)
+    sigreg_lambda: float = 0.1
+    n_projections: int = 1024
+    t_min: float = -5.0
+    t_max: float = 5.0
+    epps_pulley_s: float = 1.0
+    # Code view system prompt override; if empty uses default math CoT prompt
+    code_system_prompt: str = (
+        "You are a Python programming expert. "
+        "Solve the following math problem by writing a complete, executable Python program "
+        "that prints the answer. Do not include any natural language explanation outside comments."
+    )
+
+    @classmethod
+    def from_config(cls, config: DictConfig | dict | None) -> "JEPARayConfig":
+        if not config:
+            return cls()
+        merged = OmegaConf.merge(OmegaConf.structured(cls), OmegaConf.create(config))
+        return OmegaConf.to_object(merged)
+
+
+def jepa_enabled(config: DictConfig | dict | None) -> bool:
+    jepa_cfg = config.get("jepa", {}) if config is not None else {}
+    return bool(jepa_cfg and jepa_cfg.get("enable", False))

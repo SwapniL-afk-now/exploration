@@ -31,6 +31,8 @@ from typing import Any, Optional
 getcontext().prec = 50
 
 BOXED_PATTERN = r"\boxed{"
+PYTHON_CODE_FENCE_PATTERN = re.compile(r"```(?:python|py)\b.*?```", flags=re.IGNORECASE | re.DOTALL)
+MARKDOWN_FENCE_PATTERN = re.compile(r"```(?:[^\n`]*)\n?(.*?)```", flags=re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,9 @@ def strip_latex_wrappers(text: str) -> str:
     s = str(text).strip()
     if s.startswith("$") and s.endswith("$") and len(s) >= 2:
         s = s[1:-1].strip()
+    for left, right in [("\\(", "\\)"), ("\\[", "\\]")]:
+        if s.startswith(left) and s.endswith(right) and len(s) >= len(left) + len(right):
+            s = s[len(left) : -len(right)].strip()
     s = s.replace("\\left", "").replace("\\right", "")
     s = s.replace("\\,", "").replace("\\!", "").replace("\\;", "")
     s = s.replace("−", "-")
@@ -184,24 +189,127 @@ def extract_after_hash_answer(text: str) -> Optional[str]:
     return match.group(1).strip() if match else None
 
 
-def extract_final_number_or_text(text: str) -> Optional[str]:
-    s = str(text).strip()
+def _without_python_code_blocks(text: str) -> str:
+    """Drop executable snippets but keep unlabeled output fences as text."""
+
+    s = PYTHON_CODE_FENCE_PATTERN.sub("\n", str(text))
+
+    def replace_fence(match: re.Match[str]) -> str:
+        content = match.group(1).strip()
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        first = lines[0].lower() if lines else ""
+        looks_like_code = (
+            first in {"python", "py"}
+            or any(re.search(r"(?<![=!<>])=(?!=)|\bprint\s*\(|\breturn\b|\bfor\b|\bwhile\b", line) for line in lines)
+        )
+        if looks_like_code:
+            return "\n"
+        return f"\n{content}\n"
+
+    return MARKDOWN_FENCE_PATTERN.sub(replace_fence, s)
+
+
+def _extract_terminal_value(fragment: str, *, allow_text: bool = False) -> Optional[str]:
+    s = strip_latex_wrappers(fragment)
     if not s:
         return None
 
-    answer_match = re.findall(
-        r"(?i)(?:answer|final answer|therefore|so)\s*(?:is|=|:)?\s*([^\n]+)",
-        s,
-    )
-    if answer_match:
-        return answer_match[-1].strip()
+    boxed = extract_last_boxed(s)
+    if boxed is not None:
+        return boxed
+    if "\\boxed{" in s:
+        return None
+    if allow_text and s.rstrip().endswith(":"):
+        return None
+
+    should_be = re.search(r"(?i)\bshould be\s+(.+?)\s*,?\s+not\s+.+$", s)
+    if should_be:
+        s = should_be.group(1).strip()
+
+    evaluates_to = re.search(r"(?i)\bevaluates to\s+(.+)$", s)
+    if allow_text and evaluates_to and not _is_standalone_answer_fragment(evaluates_to.group(1)):
+        return None
+
+    # Prefer the right side of the last displayed equation or assignment.
+    if "=" in s:
+        rhs = s.rsplit("=", 1)[-1].strip()
+        if re.search(r"\d", rhs):
+            s = rhs
 
     number_matches = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?(?:/[-+]?\d[\d,]*(?:\.\d+)?)?%?", s)
     if number_matches:
         return number_matches[-1]
 
-    lines = [line.strip() for line in s.splitlines() if line.strip()]
-    return lines[-1] if lines else None
+    if not allow_text:
+        return None
+
+    text_match = re.search(
+        r"(?i)(?:final answer|answer|final result|result|output|printed output|evaluates to)\s*(?:is|=|:)?\s*(.+)$",
+        s,
+    )
+    candidate = text_match.group(1).strip() if text_match else s.strip()
+    candidate = re.sub(r"(?i)^(?:therefore|thus|so|hence)[,\s:]+", "", candidate).strip()
+    candidate = candidate.strip("`")
+    if not re.search(r"\d", candidate):
+        if len(candidate) > 40 or len(candidate.split()) > 4:
+            return None
+        if not (re.fullmatch(r"[A-Za-z]", candidate) or re.search(r"[\\=+*/^{}]", candidate)):
+            return None
+    if candidate and candidate not in {":", ".", ",", ";", "?", ")"} and not candidate.endswith(":"):
+        return candidate
+    return None
+
+
+def _is_standalone_answer_fragment(fragment: str) -> bool:
+    s = strip_latex_wrappers(fragment)
+    if not s or s in {"\\[", "\\]", "$", "$$"}:
+        return False
+    if extract_last_boxed(s) is not None:
+        return True
+    if "\\boxed{" in s:
+        return False
+    if re.fullmatch(r"[-+]?\d[\d,]*(?:\.\d+)?(?:/[-+]?\d[\d,]*(?:\.\d+)?)?%?\.?", s):
+        return True
+    if "=" not in s:
+        return False
+
+    without_latex_commands = re.sub(r"\\[A-Za-z]+", "", s)
+    return re.search(r"\d", s) is not None and re.search(r"[A-Za-z]", without_latex_commands) is None
+
+
+def extract_final_number_or_text(text: str) -> Optional[str]:
+    s = _without_python_code_blocks(str(text)).strip()
+    if not s:
+        return None
+
+    lines = [line.strip() for line in s.splitlines() if line.strip() and not line.strip().startswith("```")]
+    explicit_line_pattern = re.compile(
+        r"(?i)\b(?:final answer|answer|final result|result|therefore|thus|hence|output|printed|prints?|evaluates to)\b"
+    )
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
+        if explicit_line_pattern.search(line):
+            candidate = _extract_terminal_value(line, allow_text=True)
+            if candidate is not None:
+                return candidate
+            for lookahead_end in range(idx + 2, min(idx + 5, len(lines) + 1)):
+                fragment = "\n".join(lines[idx + 1 : lookahead_end])
+                if not _is_standalone_answer_fragment(fragment):
+                    continue
+                candidate = _extract_terminal_value(fragment)
+                if candidate is not None:
+                    return candidate
+
+    # Handle a final display equation/value after prose such as
+    # "So the final result is:\n\\[ 17^2 + 23^2 = 818 \\]".
+    for line in reversed(lines):
+        if not _is_standalone_answer_fragment(line):
+            continue
+        candidate = _extract_terminal_value(line)
+        if candidate is not None:
+            return candidate
+
+    return None
 
 
 def extract_model_answer(text: str) -> Optional[str]:
@@ -249,7 +357,7 @@ def normalize_ground_truth_answer(answer: Any, dataset_kind: str | None = None) 
             if stripped.startswith("$") or "\\" in stripped or "=" in stripped:
                 candidate = stripped
             else:
-                candidate = extract_final_number_or_text(raw_answer)
+                candidate = extract_final_number_or_text(raw_answer) or stripped
     return normalize_answer_text(candidate)
 
 
