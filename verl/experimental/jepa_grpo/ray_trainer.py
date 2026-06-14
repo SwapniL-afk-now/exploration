@@ -33,6 +33,7 @@ import torch
 from verl import DataProto
 from verl.experimental.fepo.math_parser import compute_math_reward
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
+from verl.trainer.ppo.metric_utils import compute_data_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.utils.metric import reduce_metrics
 
@@ -399,10 +400,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 # ── Step 6: Weight sync to rollout (wakes vLLM) ─────────
                 self.checkpoint_manager.update_weights(self.global_steps)
 
-                # ── CoT accuracy metrics ─────────────────────────────────
+                # ── CoT-based train metrics (rich grouped stats) ─────────
                 cot_rew_scalar = reward_tensor.sum(dim=-1)
                 metrics["cot/pass_at_1"] = float((cot_rew_scalar > 0).float().mean())
                 metrics["cot/avg_reward"] = float(cot_rew_scalar.mean())
+                metrics.update(compute_data_metrics(batch=batch, use_critic=False))
+                metrics.update(self._compute_train_comparison_metrics(batch))
                 metrics["train/global_step"] = self.global_steps
 
                 # ── Validation ───────────────────────────────────────────
