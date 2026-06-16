@@ -16,7 +16,8 @@
 Extends ActorRolloutRefWorker with:
   - EMA target encoder for the Code view (stored as plain param dict, not PEFT adapter)
   - Hook-based embedding extraction on the final norm (avoids output_hidden_states=True overhead)
-  - jepa_update() RPC: runs a JEPA-only forward+backward+optimizer step
+  - jepa_update() RPC: runs a JEPA-only forward+backward+optimizer step, using either
+    the LeJEPA loss (default) or the LLM-JEPA paper's prediction loss (jepa.loss_type)
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
-from verl.experimental.jepa_grpo.core_algos import lejepa_loss
+from verl.experimental.jepa_grpo.core_algos import lejepa_loss, llm_jepa_loss
 
 
 class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
@@ -206,6 +207,31 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         last_idx   = torch.tensor(last_indices, device=device) # (B,)
         return packed_ids, packed_pos, last_idx
 
+    @staticmethod
+    def _pad_concat_batch(
+        ids_a: torch.Tensor, mask_a: torch.Tensor,
+        ids_b: torch.Tensor, mask_b: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Concatenate two (N, L) batches along the batch dim into one (N_a+N_b, L').
+
+        Used to merge the CoT and Code views into a single batch for the
+        LLM-JEPA joint live forward (see jepa_update). The shorter of the two
+        L dimensions is zero-padded to match; this is safe because
+        `_extract_embeddings` only ever reads real tokens via `attention_mask`
+        (extra zero-padded columns with mask=0 are simply ignored).
+        """
+        La, Lb = ids_a.shape[1], ids_b.shape[1]
+        L = max(La, Lb)
+        if La < L:
+            pad = (0, L - La)
+            ids_a = torch.nn.functional.pad(ids_a, pad)
+            mask_a = torch.nn.functional.pad(mask_a, pad)
+        if Lb < L:
+            pad = (0, L - Lb)
+            ids_b = torch.nn.functional.pad(ids_b, pad)
+            mask_b = torch.nn.functional.pad(mask_b, pad)
+        return torch.cat([ids_a, ids_b], dim=0), torch.cat([mask_a, mask_b], dim=0)
+
     def _extract_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -213,6 +239,8 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         seq_lengths: torch.Tensor,
         use_ema: bool,
         requires_grad: bool,
+        predictor_k: "int | list[int]" = 0,
+        predictor_token_id: int | None = None,
     ) -> torch.Tensor:
         """Run the policy model on the full batch and return last-token embeddings.
 
@@ -234,6 +262,19 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             seq_lengths: (N,) actual sequence lengths (= attention_mask.sum per row)
             use_ema: if True, temporarily swap in EMA weights
             requires_grad: if False, wrap forward in torch.no_grad()
+            predictor_k: number of LLM-JEPA tied-weight predictor tokens
+                (arXiv:2509.14252 §3.1) to append after each row's real tokens.
+                Either a single int broadcast to every row, or a per-row
+                list/sequence of ints (used to mix predictor and non-predictor
+                rows in one joint forward — e.g. CoT rows get k>0, Code rows
+                get k=0). k=0 is a no-op — Pred(x) = x, identical to prior
+                behavior. When k>0 for a row, ``predictor_token_id`` copies
+                are appended and that row's returned embedding is read from
+                the LAST predictor token instead of the last real token,
+                reusing the model's own weights (no new parameters) as the
+                "tied-weight predictor".
+            predictor_token_id: token id to repeat for the predictor tokens.
+                Required (and otherwise ignored) when any row has predictor_k > 0.
 
         Returns:
             (N, d) unit-normalised embeddings (float32)
@@ -241,17 +282,29 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         device = next(self.actor.engine.module.parameters()).device
         N = input_ids.shape[0]
         rlens = [int(seq_lengths[b].item()) for b in range(N)]
-        max_rlen = max(rlens) if rlens else 1
+        if isinstance(predictor_k, int):
+            predictor_ks = [predictor_k] * N
+        else:
+            predictor_ks = [int(k) for k in predictor_k]
+            assert len(predictor_ks) == N, "predictor_k list must match batch size"
+        base_max_rlen = max(rlens) if rlens else 1
+        max_rlen = base_max_rlen + (max(predictor_ks) if predictor_ks else 0)
 
         # Build (N, max_rlen) batch: real tokens contiguous at start, zeros for padding.
         # Works for both left-padded and right-padded inputs via the attention_mask.
+        # Where predictor_ks[b] > 0, predictor_token_id copies follow that row's
+        # real tokens (still causally attending to them) before trailing padding.
         packed_ids = torch.zeros(N, max_rlen, dtype=input_ids.dtype, device=device)
         packed_attn = torch.zeros(N, max_rlen, dtype=torch.long, device=device)
         for b, rlen in enumerate(rlens):
+            pk = predictor_ks[b]
             if rlen > 0:
                 real_toks = input_ids[b][attention_mask[b].bool()].to(device)  # (rlen,)
                 packed_ids[b, :rlen] = real_toks
                 packed_attn[b, :rlen] = 1
+                if pk > 0:
+                    packed_ids[b, rlen:rlen + pk] = predictor_token_id
+                    packed_attn[b, rlen:rlen + pk] = 1
 
         # Monotonically increasing position_ids for ALL positions (including padding).
         # _is_packed_sequence() returns False for monotonic positions → regular
@@ -295,7 +348,11 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             if rlen == 0:
                 all_embs.append(torch.zeros(last_h.shape[-1], device=device))
             else:
-                emb = torch.nn.functional.normalize(last_h[b, rlen - 1, :], dim=-1)
+                # With predictor_ks[b]=0 this is rlen-1 (last real token),
+                # matching prior behavior exactly. With predictor_ks[b]>0, this
+                # reads that row's last predictor token = Pred(Enc(Text)).
+                last_idx = rlen + predictor_ks[b] - 1
+                emb = torch.nn.functional.normalize(last_h[b, last_idx, :], dim=-1)
                 all_embs.append(emb)
 
         return torch.stack(all_embs, dim=0), logits_anchor  # (N, d), scalar
@@ -304,6 +361,16 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def jepa_update(self, data: TensorDict) -> TensorDict:
         """Run a JEPA-only forward+backward+optimizer step.
+
+        Two mutually-exclusive objectives, selected by ``self.jepa_cfg.loss_type``:
+          - "lejepa" (default): squared-Euclidean align between a live CoT
+            encoder and an EMA target Code encoder, + SIGReg (unchanged).
+          - "llm-jepa-loss": the LLM-JEPA paper's (arXiv:2509.14252) literal
+            symmetric architecture — ONE live encoder for both CoT and Code
+            (no EMA/target network, no stop-gradient), cosine-distance
+            prediction loss between Pred(Enc(CoT)) and Enc(Code), combined
+            with SIGReg for anti-collapse since no NTP term is added here
+            (see core_algos.llm_jepa_loss).
 
         Args:
             data: TensorDict with keys:
@@ -320,6 +387,11 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
+        if self.jepa_cfg.loss_type == "llm-jepa-loss" and self.jepa_cfg.predictor_k > 0:
+            assert self.jepa_cfg.predictor_token_id >= 0, (
+                "predictor_k > 0 requires a resolved predictor_token_id; "
+                "JEPARayPPOTrainer.init_workers() should have set this before jepa_init()"
+            )
 
         n_pairs = data["cot_input_ids"].shape[0]
         if n_pairs < self.jepa_cfg.min_valid_pairs:
@@ -330,41 +402,84 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             )
 
         engine = self.actor.engine
+        cfg = self.jepa_cfg
+        use_llm_jepa = cfg.loss_type == "llm-jepa-loss"
 
         with engine.train_mode():
             engine.optimizer_zero_grad()
 
-            # -- Pass 1: CoT prompt → enc_q_cot  (live weights, grad=True) --
-            enc_q_cot, logits_anchor = self._extract_embeddings(
-                data["cot_input_ids"],
-                data["cot_attn_mask"],
-                data["cot_lengths"],
-                use_ema=False,
-                requires_grad=True,
-            )
+            if use_llm_jepa:
+                # -- LLM-JEPA (arXiv:2509.14252), literal symmetric architecture:
+                # ONE live encoder for both views, no EMA/target network, no
+                # stop-gradient — gradient flows through both Enc(Text)=
+                # Pred(...) and Enc(Code). CoT and Code rows are packed into a
+                # SINGLE joint batch and run through ONE forward call so FSDP1
+                # still sees exactly one forward per backward; only the CoT
+                # rows get `predictor_k` tied-weight predictor tokens appended
+                # (k=0 -> Pred(x) = x, per the paper §3.1).
+                n_cot = data["cot_input_ids"].shape[0]
+                n_code = data["code_input_ids"].shape[0]
+                joint_ids, joint_mask = self._pad_concat_batch(
+                    data["cot_input_ids"], data["cot_attn_mask"],
+                    data["code_input_ids"], data["code_attn_mask"],
+                )
+                joint_lengths = torch.cat([data["cot_lengths"], data["code_lengths"]], dim=0)
+                joint_predictor_k = [cfg.predictor_k] * n_cot + [0] * n_code
 
-            # -- Pass 2: Code prompt+response → enc_a_code  (EMA, grad=False) --
-            enc_a_code, _ = self._extract_embeddings(
-                data["code_input_ids"],
-                data["code_attn_mask"],
-                data["code_lengths"],
-                use_ema=True,
-                requires_grad=False,
-            )
+                joint_emb, logits_anchor = self._extract_embeddings(
+                    joint_ids,
+                    joint_mask,
+                    joint_lengths,
+                    use_ema=False,
+                    requires_grad=True,
+                    predictor_k=joint_predictor_k,
+                    predictor_token_id=cfg.predictor_token_id,
+                )
+                enc_q_cot = joint_emb[:n_cot]
+                enc_a_code = joint_emb[n_cot:]
 
-            # -- LeJEPA loss --
-            all_pool = torch.cat([enc_q_cot, enc_a_code.detach()], dim=0)
-            cfg = self.jepa_cfg
-            loss, jepa_metrics = lejepa_loss(
-                enc_q_cot=enc_q_cot,
-                enc_a_code=enc_a_code.detach(),
-                all_embeddings=all_pool,
-                lambda_=cfg.sigreg_lambda,
-                M=cfg.n_projections,
-                t_min=cfg.t_min,
-                t_max=cfg.t_max,
-                s=cfg.epps_pulley_s,
-            )
+                # No .detach() on either view — both contribute gradient,
+                # matching the paper's no-stop-gradient design.
+                all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
+                loss, jepa_metrics = llm_jepa_loss(
+                    pred_text=enc_q_cot,
+                    enc_code=enc_a_code,
+                    all_embeddings=all_pool,
+                    lambda_=cfg.sigreg_lambda,
+                    M=cfg.n_projections,
+                    t_min=cfg.t_min,
+                    t_max=cfg.t_max,
+                    s=cfg.epps_pulley_s,
+                )
+            else:
+                # -- LeJEPA (default, unchanged): live CoT encoder + EMA Code
+                # target encoder, two separate forwards (Code pass is
+                # no_grad so it never enters the autograd/FSDP1 hook graph).
+                enc_q_cot, logits_anchor = self._extract_embeddings(
+                    data["cot_input_ids"],
+                    data["cot_attn_mask"],
+                    data["cot_lengths"],
+                    use_ema=False,
+                    requires_grad=True,
+                )
+                enc_a_code, _ = self._extract_embeddings(
+                    data["code_input_ids"],
+                    data["code_attn_mask"],
+                    data["code_lengths"],
+                    use_ema=True,
+                    requires_grad=False,
+                )
+                all_pool = torch.cat([enc_q_cot, enc_a_code.detach()], dim=0)
+                loss, jepa_metrics = lejepa_loss(
+                    enc_q_cot=enc_q_cot,
+                    enc_a_code=enc_a_code.detach(),
+                    all_embeddings=all_pool,
+                    lambda_=cfg.sigreg_lambda,
+                    M=cfg.n_projections,
+                    t_min=cfg.t_min,
+                    t_max=cfg.t_max,
+                    s=cfg.epps_pulley_s,
+                )
 
             # logits_anchor (= 0 * logits_scalar) ties backward to the root FSDP
             # module's actual output so its post-backward hook fires correctly.
@@ -376,7 +491,10 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         self._sync_ema()
 
         out = {
-            "jepa/lejepa_loss": torch.tensor(loss.detach().item()),
+            # Generic key valid for either loss_type; mode-specific totals
+            # ("jepa/lejepa_loss" / "jepa/llm_jepa_loss") are also present via
+            # jepa_metrics below.
+            "jepa/total_loss": torch.tensor(loss.detach().item()),
             "jepa/n_valid_pairs": torch.tensor(float(n_pairs)),
             "jepa/skipped": torch.tensor(0.0),
             "jepa/grad_norm": torch.tensor(float(grad_norm) if grad_norm is not None else 0.0),

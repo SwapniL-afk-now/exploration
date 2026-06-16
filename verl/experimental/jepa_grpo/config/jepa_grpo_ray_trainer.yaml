@@ -17,6 +17,8 @@ jepa:
   t_max: 5.0
   epps_pulley_s: 1.0
   code_system_prompt: "You are a Python programming expert. Solve the following math problem by writing a complete, executable Python program that prints the answer."
+  loss_type: lejepa  # lejepa | llm-jepa-loss
+  predictor_k: 0
 
 # ── Algorithm (GRPO, no KL) ─────────────────────────────────────────────────
 algorithm:

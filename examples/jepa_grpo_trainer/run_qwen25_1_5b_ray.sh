@@ -79,7 +79,7 @@ ROLLOUT_N=${ROLLOUT_N:-8}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
-PPO_MAX_TOKEN_LEN=${PPO_MAX_TOKEN_LEN:-16384}
+PPO_MAX_TOKEN_LEN=${PPO_MAX_TOKEN_LEN:-32768}
 MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
 
 # Actor optimiser
@@ -97,15 +97,32 @@ ALPHA=${ALPHA:-0.1}
 EMA_DECAY=${EMA_DECAY:-0.99}
 EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-8}
 MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
+# JEPA objective: "lejepa" (squared-Euclidean align + SIGReg) or
+# "llm-jepa-loss" (default; LLM-JEPA paper arXiv:2509.14252 cosine prediction loss + SIGReg).
+JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-llm-jepa-loss}
+# Number of LLM-JEPA tied-weight predictor tokens (paper §3.1). Only used when
+# JEPA_LOSS_TYPE=llm-jepa-loss; k=0 is the identity predictor, Pred(x) = x.
+LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
 
 SAVE_FREQ=${SAVE_FREQ:-20}
 TEST_FREQ=${TEST_FREQ:-10}
+
+# Validation rollout
+VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
+VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
+VAL_TOP_P=${VAL_TOP_P:-0.95}
+
+# KL penalty
+KL_COEF=${KL_COEF:-0.001}
 ########################### end user-adjustable ###########################
 
 DATA=(
     data.train_files="$TRAIN_FILE"
     data.val_files="${VAL_FILES}"
     data.train_batch_size=${TRAIN_BATCH_SIZE}
+    data.val_batch_size=${VAL_BATCH_SIZE}
     data.max_prompt_length=${MAX_PROMPT_LENGTH}
     data.max_response_length=${MAX_RESPONSE_LENGTH}
     data.filter_overlong_prompts=True
@@ -135,6 +152,10 @@ ROLLOUT=(
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}
     actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}
+    actor_rollout_ref.rollout.val_kwargs.n=${VAL_ROLLOUT_N}
+    actor_rollout_ref.rollout.val_kwargs.do_sample=${VAL_DO_SAMPLE}
+    actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}
+    actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}
 )
 
 JEPA=(
@@ -142,6 +163,8 @@ JEPA=(
     jepa.ema_decay=${EMA_DECAY}
     jepa.embed_micro_batch_size=${EMBED_MICRO_BATCH_SIZE}
     jepa.min_valid_pairs=${MIN_VALID_PAIRS}
+    jepa.loss_type=${JEPA_LOSS_TYPE}
+    jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
 )
 
 TRAINER=(
@@ -160,6 +183,9 @@ ALGORITHM=(
     algorithm.adv_estimator=grpo
     algorithm.norm_adv_by_std_in_grpo=False
     algorithm.use_kl_in_reward=False
+    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl
+    actor_rollout_ref.actor.kl_loss_coef=${KL_COEF}
 )
 
 python3 -m verl.experimental.jepa_grpo.main_ray \

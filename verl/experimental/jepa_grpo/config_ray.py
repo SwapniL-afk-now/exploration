@@ -48,6 +48,16 @@ class JEPARayConfig:
         "Solve the following math problem by writing a complete, executable Python program "
         "that prints the answer. Do not include any natural language explanation outside comments."
     )
+    # Which JEPA objective to use. "lejepa" (default) is the existing squared-Euclidean
+    # align + SIGReg loss; "llm-jepa-loss" switches to the LLM-JEPA paper's cosine-distance
+    # prediction loss (arXiv:2509.14252) + SIGReg. Mutually exclusive — exactly one is used.
+    loss_type: str = "lejepa"
+    # Number of tied-weight predictor tokens (paper §3.1). k=0 -> Pred(x) = x (identity),
+    # matching current behavior. Only used when loss_type == "llm-jepa-loss".
+    predictor_k: int = 0
+    # Token id used for the appended predictor tokens. Resolved programmatically by
+    # ray_trainer.py (which holds the tokenizer) before jepa_init; -1 means unset/unused.
+    predictor_token_id: int = -1
 
     @classmethod
     def from_config(cls, config: DictConfig | dict | None) -> "JEPARayConfig":

@@ -17,10 +17,12 @@ All pure differentiable math lives here:
   - Dr.GRPO policy loss (group-centered, no std normalization)
   - Epps-Pulley CF test statistic (vectorized)
   - SIGReg (Sketched Isotropic Gaussian Regularization, LeJEPA)
-  - LeJEPA loss (alignment + SIGReg)
+  - LeJEPA loss (squared-Euclidean alignment + SIGReg)
+  - LLM-JEPA loss (cosine-distance prediction alignment + SIGReg)
 
 References:
   - Balestriero et al. 2025 "LeJEPA" arXiv:2511.08544
+  - Huang, LeCun, Balestriero 2025 "LLM-JEPA" arXiv:2509.14252
   - Equation doc: JEPA-GRPO-Equation.md
 """
 
@@ -198,5 +200,58 @@ def lejepa_loss(
         "jepa/lejepa_loss": float(loss.detach().cpu()),
         "jepa/lambda": float(lambda_),
         "jepa/n_pairs": int(enc_q_cot.shape[0]),
+        "jepa/pool_size": int(all_embeddings.shape[0]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# LLM-JEPA loss: cosine-distance prediction alignment + SIGReg
+# ---------------------------------------------------------------------------
+
+def llm_jepa_loss(
+    pred_text: torch.Tensor,        # (B_joint, d) L2-normalized Pred(Enc(Text)) embeddings
+    enc_code: torch.Tensor,         # (B_joint, d) L2-normalized Enc(Code) embeddings
+    all_embeddings: torch.Tensor,   # (N_pool, d)  L2-normalized pool for SIGReg
+    lambda_: float = 0.05,          # SIGReg vs align mixing
+    M: int = 1024,
+    n_freq: int = 17,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    s: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """LLM-JEPA prediction loss (Huang, LeCun, Balestriero — arXiv:2509.14252, eq. 2),
+    combined with SIGReg for anti-collapse.
+
+    L = (1-λ)·d(Pred(Enc(Text)), Enc(Code)) + λ·L_SIGReg
+
+    d is cosine distance (1 - cosine similarity), per the paper's main result
+    (§3.1 "The metric" — confirmed best vs. ℓ2-norm/MSE in the ablation, Table 3).
+    Both inputs are already L2-normalized so cosine similarity reduces to a dot
+    product. ``pred_text`` is Pred(Enc(Text)): with k=0 tied-weight predictor
+    tokens this is just Enc(Text) (Pred(x) = x per the paper); with k>0 it is the
+    embedding of the last appended predictor token (see worker._extract_embeddings).
+
+    The paper relies on a joint cross-entropy/NTP term to prevent embedding
+    collapse. Since that term is intentionally not added here (the existing GRPO
+    objective already covers generative capability), SIGReg (LeJEPA,
+    arXiv:2511.08544) is reused as the anti-collapse regularizer, exactly as in
+    `lejepa_loss`.
+    """
+    # L_align: 1 - cosine_similarity(pred_text, enc_code), averaged over pairs
+    cos_sim = (pred_text * enc_code).sum(dim=-1)        # (B_joint,)
+    align = (1.0 - cos_sim).mean()
+
+    # L_SIGReg: on the full pool (both views, all correct)
+    sig = sigreg_loss(all_embeddings, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
+
+    loss = (1.0 - lambda_) * align + lambda_ * sig
+
+    return loss, {
+        "jepa/llm_jepa_align_loss": float(align.detach().cpu()),
+        "jepa/llm_jepa_cos_sim_mean": float(cos_sim.detach().mean().cpu()),
+        "jepa/llm_jepa_sigreg_loss": float(sig.detach().cpu()),
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
+        "jepa/llm_jepa_lambda": float(lambda_),
+        "jepa/n_pairs": int(pred_text.shape[0]),
         "jepa/pool_size": int(all_embeddings.shape[0]),
     }

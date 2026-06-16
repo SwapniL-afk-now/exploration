@@ -63,8 +63,35 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         super().init_workers()
         if self.jepa_cfg.enable:
             import dataclasses
+
+            if self.jepa_cfg.loss_type == "llm-jepa-loss" and self.jepa_cfg.predictor_k > 0:
+                self.jepa_cfg.predictor_token_id = self._resolve_predictor_token_id()
+
             cfg_dict = dataclasses.asdict(self.jepa_cfg)
             self.actor_rollout_wg.jepa_init(cfg_dict)
+
+    def _resolve_predictor_token_id(self) -> int:
+        """Pick a token id to use for the LLM-JEPA tied-weight predictor (paper §3.1).
+
+        The paper introduces a literal new [PRED] token. We avoid resizing the
+        embedding matrix (which would also have to be threaded through LoRA)
+        by instead reusing an existing, otherwise-unused token:
+          1. Prefer an unused reserved/special token already in the tokenizer's
+             vocab (e.g. Qwen-style `<|extra_0|>`...) that isn't part of the
+             active chat template — the model has trained (if rarely-used)
+             embeddings for these and no architecture change is needed.
+          2. Fall back to pad_token_id (or eos_token_id if no pad token) — a
+             deliberate simplification, documented here rather than the paper's
+             literal new-token approach.
+        """
+        tok = self.tokenizer
+        for candidate in getattr(tok, "additional_special_tokens", []) or []:
+            cid = tok.convert_tokens_to_ids(candidate)
+            if cid is not None and cid != tok.unk_token_id:
+                return int(cid)
+        if tok.pad_token_id is not None:
+            return int(tok.pad_token_id)
+        return int(tok.eos_token_id)
 
     # ------------------------------------------- code-view tokenisation -----
     def _tokenize_code_prompts(self, batch: DataProto) -> DataProto:
