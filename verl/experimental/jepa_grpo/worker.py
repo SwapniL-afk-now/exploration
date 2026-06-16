@@ -343,21 +343,21 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 requires_grad=True,
             )
 
-            # -- Pass 2: Code prompt+response → enc_a_code  (EMA, grad=True) --
-            enc_a_code, logits_anchor2 = self._extract_embeddings(
+            # -- Pass 2: Code prompt+response → enc_a_code  (EMA, grad=False) --
+            enc_a_code, _ = self._extract_embeddings(
                 data["code_input_ids"],
                 data["code_attn_mask"],
                 data["code_lengths"],
                 use_ema=True,
-                requires_grad=True,
+                requires_grad=False,
             )
 
             # -- LeJEPA loss --
-            all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
+            all_pool = torch.cat([enc_q_cot, enc_a_code.detach()], dim=0)
             cfg = self.jepa_cfg
             loss, jepa_metrics = lejepa_loss(
                 enc_q_cot=enc_q_cot,
-                enc_a_code=enc_a_code,
+                enc_a_code=enc_a_code.detach(),
                 all_embeddings=all_pool,
                 lambda_=cfg.sigreg_lambda,
                 M=cfg.n_projections,
@@ -366,8 +366,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 s=cfg.epps_pulley_s,
             )
 
-            # Both logits anchors tie backward through each forward's root FSDP output.
-            scaled_loss = cfg.alpha * loss + logits_anchor + logits_anchor2
+            # logits_anchor (= 0 * logits_scalar) ties backward to the root FSDP
+            # module's actual output so its post-backward hook fires correctly.
+            scaled_loss = cfg.alpha * loss + logits_anchor
             scaled_loss.backward()
             grad_norm = engine.optimizer_step()
 
