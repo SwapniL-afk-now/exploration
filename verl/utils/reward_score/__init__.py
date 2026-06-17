@@ -64,6 +64,8 @@ def default_compute_score(
         "amc23",
         "math500",
         "olympiadbench",
+        "deepscaler-preview-dataset",
+        "minervamath",
     ] or data_source.startswith("aime"):
         from verl.experimental.fepo.math_parser import compute_math_reward
 
@@ -101,6 +103,19 @@ def default_compute_score(
 
             # Assuming prime_code doesn't need the URL
             res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+    elif data_source == "livecodebench":
+        # The stdin/stdout-test subset only (see verl/experimental/fepo/data.py
+        # convert_livecodebench_to_verl). Uses a standalone executor rather than
+        # prime_code, since that module's `pyext` dependency is incompatible with
+        # Python 3.12 in this environment.
+        from . import stdio_code
+
+        res = stdio_code.compute_score(solution_str, ground_truth, extra_info=extra_info, continuous=True)
+    elif data_source in ["humanevalplus", "mbppplus"]:
+        # Assert-based (not stdin/stdout) code execution; see codegen_plus module docstring.
+        from . import codegen_plus
+
+        res = codegen_plus.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source in ["hiyouga/geometry3k"]:
         from . import geo3k
 

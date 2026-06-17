@@ -10,6 +10,8 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
+import numpy as np
+
 from verl.experimental.fepo.math_parser import normalize_ground_truth_answer
 
 SYSTEM_PROMPT = (
@@ -131,6 +133,15 @@ def adapt_row_to_verl(row: Mapping[str, Any], dataset_id: str, split: str, index
         prompt = raw_prompt
     else:
         prompt = make_messages(problem)
+
+    ground_truth_raw = raw_answer
+    if isinstance(ground_truth_raw, np.ndarray):
+        ground_truth_raw = ground_truth_raw.tolist()
+    if isinstance(ground_truth_raw, (list, tuple)):
+        ground_truth_raw = ground_truth_raw[0] if len(ground_truth_raw) > 0 else ""
+    if not isinstance(ground_truth_raw, str):
+        ground_truth_raw = str(ground_truth_raw)
+
     return {
         "data_source": short,
         "prompt": prompt,
@@ -141,7 +152,7 @@ def adapt_row_to_verl(row: Mapping[str, Any], dataset_id: str, split: str, index
             "index": int(index),
             "source_dataset": dataset_id,
             "problem": problem,
-            "ground_truth_raw": raw_answer,
+            "ground_truth_raw": ground_truth_raw,
         },
     }
 

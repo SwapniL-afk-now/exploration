@@ -1140,6 +1140,38 @@ class RayPPOTrainer:
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
+    def _maybe_save_best_checkpoint(self, val_metrics: dict):
+        """Save a separate `best/` checkpoint snapshot whenever the average pass@1
+        accuracy across `trainer.best_ckpt_sources` improves. This mirrors the
+        DeepScaleR/Dr.GRPO convention of selecting checkpoints by mean accuracy over a
+        held-out core math benchmark set, independent of the `latest` checkpoint kept
+        via `max_actor_ckpt_to_keep`.
+        """
+        best_ckpt_sources = self.config.trainer.get("best_ckpt_sources", None)
+        if not best_ckpt_sources:
+            return
+
+        accs = []
+        for source in best_ckpt_sources:
+            prefix = f"val-core/{source}/acc/mean@"
+            matches = [v for k, v in val_metrics.items() if k.startswith(prefix)]
+            if matches:
+                accs.append(matches[0])
+        if not accs:
+            return
+
+        avg_acc = sum(accs) / len(accs)
+        if avg_acc > getattr(self, "best_val_acc", float("-inf")):
+            self.best_val_acc = avg_acc
+            print(
+                f"New best checkpoint at step {self.global_steps}: "
+                f"avg acc over {best_ckpt_sources} = {avg_acc:.4f}"
+            )
+            best_local_path = os.path.join(self.config.trainer.default_local_dir, "best", "actor")
+            self.actor_rollout_wg.save_checkpoint(best_local_path, None, self.global_steps, max_ckpt_to_keep=1)
+            with open(os.path.join(self.config.trainer.default_local_dir, "best", "best_val_acc.txt"), "w") as f:
+                f.write(f"step={self.global_steps} avg_acc={avg_acc:.6f} sources={best_ckpt_sources}\n")
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1981,6 +2013,7 @@ class RayPPOTrainer:
             if os.environ.get("VERL_VERBOSE_METRICS", "0") == "1":
                 pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            self._maybe_save_best_checkpoint(val_metrics)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -2300,6 +2333,7 @@ class RayPPOTrainer:
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
+                        self._maybe_save_best_checkpoint(val_metrics)
                     metrics.update(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):

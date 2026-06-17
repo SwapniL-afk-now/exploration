@@ -199,11 +199,25 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._update_weights(
-                weights, peft_config=peft_config, base_sync_done=base_sync_done
+        if peft_config and base_sync_done:
+            # LoRA tensors (e.g. paired lora_a/lora_b for a module) can be split across
+            # multiple buckets. add_lora() needs the complete tensor set in one call, or
+            # vLLM's PackedLoRALayerWeights.pack() can see a lora_a with no matching
+            # lora_b (and vice versa), crashing with `self.lora_b *= self.scaling` on
+            # None. Accumulate across all buckets and add the adapter once at the end.
+            accumulated_lora_weights: dict[str, torch.Tensor] = {}
+            receiver.receive_weights(
+                on_bucket_received=lambda weights: accumulated_lora_weights.update(dict(weights))
             )
-        )
+            self._update_weights(
+                list(accumulated_lora_weights.items()), peft_config=peft_config, base_sync_done=base_sync_done
+            )
+        else:
+            receiver.receive_weights(
+                on_bucket_received=lambda weights: self._update_weights(
+                    weights, peft_config=peft_config, base_sync_done=base_sync_done
+                )
+            )
 
         if self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
