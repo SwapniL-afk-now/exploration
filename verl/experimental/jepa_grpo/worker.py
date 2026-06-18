@@ -33,7 +33,7 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
-from verl.experimental.jepa_grpo.core_algos import lejepa_loss, llm_jepa_loss
+from verl.experimental.jepa_grpo.core_algos import lejepa_loss, llm_jepa_loss, llm_jepa_triplet_loss
 
 
 class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
@@ -208,29 +208,33 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         return packed_ids, packed_pos, last_idx
 
     @staticmethod
+    def _pad_concat_batches(
+        groups: "list[tuple[torch.Tensor, torch.Tensor]]",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Concatenate N (N_i, L_i) batches along the batch dim into one (sum(N_i), L').
+
+        Used to merge the CoT, Code, and (for the triplet mode) wrong-Code
+        views into a single batch for a joint live forward (see jepa_update).
+        Every group's L dimension is zero-padded to the longest one; this is
+        safe because `_extract_embeddings` only ever reads real tokens via
+        `attention_mask` (extra zero-padded columns with mask=0 are simply
+        ignored).
+        """
+        L = max(ids.shape[1] for ids, _ in groups)
+        padded_ids, padded_mask = [], []
+        for ids, mask in groups:
+            pad = (0, L - ids.shape[1])
+            padded_ids.append(torch.nn.functional.pad(ids, pad) if pad[1] else ids)
+            padded_mask.append(torch.nn.functional.pad(mask, pad) if pad[1] else mask)
+        return torch.cat(padded_ids, dim=0), torch.cat(padded_mask, dim=0)
+
     def _pad_concat_batch(
+        self,
         ids_a: torch.Tensor, mask_a: torch.Tensor,
         ids_b: torch.Tensor, mask_b: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Concatenate two (N, L) batches along the batch dim into one (N_a+N_b, L').
-
-        Used to merge the CoT and Code views into a single batch for the
-        LLM-JEPA joint live forward (see jepa_update). The shorter of the two
-        L dimensions is zero-padded to match; this is safe because
-        `_extract_embeddings` only ever reads real tokens via `attention_mask`
-        (extra zero-padded columns with mask=0 are simply ignored).
-        """
-        La, Lb = ids_a.shape[1], ids_b.shape[1]
-        L = max(La, Lb)
-        if La < L:
-            pad = (0, L - La)
-            ids_a = torch.nn.functional.pad(ids_a, pad)
-            mask_a = torch.nn.functional.pad(mask_a, pad)
-        if Lb < L:
-            pad = (0, L - Lb)
-            ids_b = torch.nn.functional.pad(ids_b, pad)
-            mask_b = torch.nn.functional.pad(mask_b, pad)
-        return torch.cat([ids_a, ids_b], dim=0), torch.cat([mask_a, mask_b], dim=0)
+        """Two-group convenience wrapper around `_pad_concat_batches`."""
+        return self._pad_concat_batches([(ids_a, mask_a), (ids_b, mask_b)])
 
     def _extract_embeddings(
         self,
@@ -387,7 +391,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
-        if self.jepa_cfg.loss_type == "llm-jepa-loss" and self.jepa_cfg.predictor_k > 0:
+        if self.jepa_cfg.loss_type in ("llm-jepa-loss", "jepa-triplet-loss") and self.jepa_cfg.predictor_k > 0:
             assert self.jepa_cfg.predictor_token_id >= 0, (
                 "predictor_k > 0 requires a resolved predictor_token_id; "
                 "JEPARayPPOTrainer.init_workers() should have set this before jepa_init()"
@@ -404,11 +408,73 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         engine = self.actor.engine
         cfg = self.jepa_cfg
         use_llm_jepa = cfg.loss_type == "llm-jepa-loss"
+        use_triplet = cfg.loss_type == "jepa-triplet-loss"
 
         with engine.train_mode():
             engine.optimizer_zero_grad()
 
-            if use_llm_jepa:
+            if use_triplet:
+                # -- jepa-triplet-loss: llm-jepa-loss's architecture (one live
+                # encoder, predictor tokens on CoT rows only) plus a hard-negative
+                # triplet term against a "clean wrong" code rollout. The wrong-code
+                # view is data["wrong_*"], padded to the same B rows as cot/code
+                # with `wrong_lengths == 0` marking non-triplet-eligible prompts
+                # (see ray_trainer._build_jepa_batch_triplet) — filter those out
+                # before the joint forward so only the real T <= B wrong rows are
+                # encoded.
+                n_cot = data["cot_input_ids"].shape[0]
+                n_code = data["code_input_ids"].shape[0]
+                wrong_lengths_full = data["wrong_lengths"]
+                wrong_mask = wrong_lengths_full > 0
+                n_wrong = int(wrong_mask.sum().item())
+
+                groups = [
+                    (data["cot_input_ids"], data["cot_attn_mask"]),
+                    (data["code_input_ids"], data["code_attn_mask"]),
+                ]
+                lengths = [data["cot_lengths"], data["code_lengths"]]
+                joint_predictor_k = [cfg.predictor_k] * n_cot + [0] * n_code
+                if n_wrong > 0:
+                    groups.append((data["wrong_input_ids"][wrong_mask], data["wrong_attn_mask"][wrong_mask]))
+                    lengths.append(wrong_lengths_full[wrong_mask])
+                    joint_predictor_k += [0] * n_wrong
+
+                joint_ids, joint_mask = self._pad_concat_batches(groups)
+                joint_lengths = torch.cat(lengths, dim=0)
+
+                joint_emb, logits_anchor = self._extract_embeddings(
+                    joint_ids,
+                    joint_mask,
+                    joint_lengths,
+                    use_ema=False,
+                    requires_grad=True,
+                    predictor_k=joint_predictor_k,
+                    predictor_token_id=cfg.predictor_token_id,
+                )
+                enc_q_cot = joint_emb[:n_cot]
+                enc_a_code = joint_emb[n_cot:n_cot + n_code]
+                if n_wrong > 0:
+                    enc_code_wrong = joint_emb[n_cot + n_code:]
+                else:
+                    enc_code_wrong = joint_emb.new_zeros((0, joint_emb.shape[-1]))
+
+                # SIGReg pool excludes e^w (it's deliberately displaced by the
+                # triplet term — see core_algos.llm_jepa_triplet_loss docstring).
+                all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
+                loss, jepa_metrics = llm_jepa_triplet_loss(
+                    pred_text=enc_q_cot,
+                    enc_code_correct=enc_a_code,
+                    enc_code_wrong=enc_code_wrong,
+                    all_pool=all_pool,
+                    margin=cfg.triplet_margin,
+                    w_tri=cfg.triplet_w,
+                    lambda_=cfg.triplet_sigreg_lambda,
+                    M=cfg.n_projections,
+                    t_min=cfg.t_min,
+                    t_max=cfg.t_max,
+                    s=cfg.epps_pulley_s,
+                )
+            elif use_llm_jepa:
                 # -- LLM-JEPA (arXiv:2509.14252), literal symmetric architecture:
                 # ONE live encoder for both views, no EMA/target network, no
                 # stop-gradient — gradient flows through both Enc(Text)=

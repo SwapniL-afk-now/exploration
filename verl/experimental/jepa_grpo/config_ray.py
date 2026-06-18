@@ -50,14 +50,27 @@ class JEPARayConfig:
     )
     # Which JEPA objective to use. "lejepa" (default) is the existing squared-Euclidean
     # align + SIGReg loss; "llm-jepa-loss" switches to the LLM-JEPA paper's cosine-distance
-    # prediction loss (arXiv:2509.14252) + SIGReg. Mutually exclusive — exactly one is used.
+    # prediction loss (arXiv:2509.14252) + SIGReg; "jepa-triplet-loss" extends
+    # "llm-jepa-loss" with a hard-negative triplet term against a "clean wrong" code
+    # rollout (see core_algos.llm_jepa_triplet_loss). Mutually exclusive — exactly one
+    # is used.
     loss_type: str = "lejepa"
     # Number of tied-weight predictor tokens (paper §3.1). k=0 -> Pred(x) = x (identity),
-    # matching current behavior. Only used when loss_type == "llm-jepa-loss".
+    # matching current behavior. Only used when loss_type in {"llm-jepa-loss", "jepa-triplet-loss"}.
     predictor_k: int = 0
     # Token id used for the appended predictor tokens. Resolved programmatically by
     # ray_trainer.py (which holds the tokenizer) before jepa_init; -1 means unset/unused.
     predictor_token_id: int = -1
+    # -- jepa-triplet-loss only --
+    # Hinge margin for the triplet term: max(0, triplet_margin - <p^c,e^c> + <p^c,e^w>).
+    triplet_margin: float = 0.1
+    # Weight of the triplet term relative to L_align inside the (1-lambda) slot of
+    # L_total: (1-lambda)*(L_align + triplet_w*L_tri) + lambda*L_SIGReg.
+    triplet_w: float = 0.3
+    # Dedicated SIGReg lambda for this mode. Deliberately separate from `sigreg_lambda`
+    # (default 0.1, used by "lejepa"/"llm-jepa-loss") so picking "jepa-triplet-loss"
+    # doesn't silently inherit the other modes' default.
+    triplet_sigreg_lambda: float = 0.05
 
     @classmethod
     def from_config(cls, config: DictConfig | dict | None) -> "JEPARayConfig":

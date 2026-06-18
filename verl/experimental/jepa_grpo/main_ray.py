@@ -102,10 +102,14 @@ def _load_config(overrides: list[str], config_name: str = "jepa_grpo_ray_trainer
     # Apply CLI overrides (key=value pairs from sys.argv)
     for override in overrides:
         key, _, raw = override.partition("=")
+        # A leading "+" is Hydra's "add a new key" marker (e.g. for a key under an
+        # existing-but-empty struct dict like `override_config: {}`). OmegaConf.update
+        # needs force_add=True to actually add it instead of raising "not in struct".
+        force_add = key.startswith("+")
         key = key.lstrip("+~")
         # Coerce value to native Python type (Hydra normally does this; we're doing it manually)
         value = _coerce(raw)
-        OmegaConf.update(cfg, key, value, merge=True)
+        OmegaConf.update(cfg, key, value, merge=True, force_add=force_add)
 
     return cfg
 

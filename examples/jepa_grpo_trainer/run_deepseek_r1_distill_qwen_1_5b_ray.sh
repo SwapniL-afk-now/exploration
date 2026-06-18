@@ -9,7 +9,8 @@
 #   - ActorRolloutRefWorker extended with EMA target encoder + JEPA update
 #   - RayPPOTrainer extended with Code-view rollout and LeJEPA loss step
 #
-# L_total = L_DrGRPO(CoT) + alpha * L_LeJEPA(enc_q_cot, enc_a_code)
+# L_total = L_DrGRPO(CoT) + alpha * L_JEPA(...), where L_JEPA is selected by
+# JEPA_LOSS_TYPE below: lejepa | llm-jepa-loss | jepa-triplet-loss
 #
 # Before first run:
 #   hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --local-dir /workspace/models/DeepSeek-R1-Distill-Qwen-1.5B
@@ -67,9 +68,20 @@ PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-true}
 # dataset's date. DeepSeek-R1-Distill-Qwen is distilled from Qwen2.5, reported with
 # a mid-2024 knowledge cutoff.
 LCB_CUTOFF_DATE=${LCB_CUTOFF_DATE:-2024-08-01}
+# Full 10-benchmark suite (math + code) — expensive. Used for the one-off final
+# evaluation after training, not every test_freq step. Set VAL_FILES=$FULL_VAL_FILES
+# to run it during training instead.
+FULL_VAL_FILES="[${EVAL_DATA_DIR}/math500.parquet,${EVAL_DATA_DIR}/aime26.parquet,${EVAL_DATA_DIR}/minervamath.parquet,${EVAL_DATA_DIR}/olympiadbench.parquet,${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet,${EVAL_DATA_DIR}/humanevalplus.parquet,${EVAL_DATA_DIR}/mbppplus.parquet,${EVAL_DATA_DIR}/livecodebench.parquet]"
+# Fast core-math subset (AIME 24/25/26 + AMC23) used for routine in-training
+# validation and best-checkpoint selection (see BEST_CKPT_SOURCES below). The
+# remaining benchmarks are held out and only evaluated once at the end, with the
+# best checkpoint -- see FINAL_VAL_FILES below.
 if [[ -z "${VAL_FILES:-}" ]]; then
-    VAL_FILES="[${EVAL_DATA_DIR}/math500.parquet,${EVAL_DATA_DIR}/aime26.parquet,${EVAL_DATA_DIR}/minervamath.parquet,${EVAL_DATA_DIR}/olympiadbench.parquet,${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet,${EVAL_DATA_DIR}/humanevalplus.parquet,${EVAL_DATA_DIR}/mbppplus.parquet,${EVAL_DATA_DIR}/livecodebench.parquet]"
+    VAL_FILES="[${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet,${EVAL_DATA_DIR}/aime26.parquet,${EVAL_DATA_DIR}/amc23.parquet]"
 fi
+# Held-out benchmarks for the one-off final evaluation after training, using the
+# best checkpoint (not seen during training validation).
+FINAL_VAL_FILES="[${EVAL_DATA_DIR}/math500.parquet,${EVAL_DATA_DIR}/minervamath.parquet,${EVAL_DATA_DIR}/olympiadbench.parquet,${EVAL_DATA_DIR}/humanevalplus.parquet,${EVAL_DATA_DIR}/mbppplus.parquet,${EVAL_DATA_DIR}/livecodebench.parquet]"
 if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
     mkdir -p "${EVAL_DATA_DIR}"
     for ds in math500 olympiadbench amc23 aime24 aime25 aime26 minervamath; do
@@ -105,42 +117,59 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 ROLLOUT_N=${ROLLOUT_N:-8}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}   # 64/32 = 2 gradient steps per batch, more stable
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
-PPO_MAX_TOKEN_LEN=${PPO_MAX_TOKEN_LEN:-65536}     # 96GB handles this easily; headroom for long CoT batches
-MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
+PPO_MAX_TOKEN_LEN=${PPO_MAX_TOKEN_LEN:-16384}     # matches drgrpo_trainer's PPO_MAX_TOKEN_LEN_PER_GPU
+MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-629}   # 1 epoch: floor(40309 train rows / 64 batch size), drop_last=True
 
 # Actor optimiser
 ACTOR_LR=${ACTOR_LR:-1e-6}
 CLIP_RATIO=${CLIP_RATIO:-0.2}
-USE_LORA=${USE_LORA:-false}   # false -> full fine-tuning; set true to re-enable LoRA
-LORA_RANK=${LORA_RANK:-128}
-LORA_ALPHA=${LORA_ALPHA:-256}
+ENTROPY_COEFF=${ENTROPY_COEFF:-0}
+ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
+USE_LORA=${USE_LORA:-true}   # false -> full fine-tuning; set false to disable LoRA
+LORA_RANK=${LORA_RANK:-512}
+LORA_ALPHA=${LORA_ALPHA:-1024}
+LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 
 # Rollout
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.85}   # safe to push higher with 96GB
+ROLLOUT_TP=${ROLLOUT_TP:-1}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.55}   # leaves headroom for the Code-view rollout + JEPA forward
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}   # more parallel sequences during vLLM rollout
 
 # JEPA
-ALPHA=${ALPHA:-0.1}
+ALPHA=${ALPHA:-0.5}
 EMA_DECAY=${EMA_DECAY:-0.99}
 EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-8}
 MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
-# JEPA objective: "lejepa" (squared-Euclidean align + SIGReg) or
-# "llm-jepa-loss" (default; LLM-JEPA paper arXiv:2509.14252 cosine prediction loss + SIGReg).
-JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-llm-jepa-loss}
+# JEPA objective: "lejepa" (squared-Euclidean align + SIGReg), "llm-jepa-loss"
+# (default; LLM-JEPA paper arXiv:2509.14252 cosine prediction loss + SIGReg), or
+# "jepa-triplet-loss" (llm-jepa-loss + a hard-negative triplet term against a
+# "clean wrong" code rollout; see jepa-llm-hard-neg-triplet-mode-AUDIT.md).
+JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-triplet-loss}
 # Number of LLM-JEPA tied-weight predictor tokens (paper §3.1). Only used when
-# JEPA_LOSS_TYPE=llm-jepa-loss; k=0 is the identity predictor, Pred(x) = x.
+# JEPA_LOSS_TYPE=llm-jepa-loss or jepa-triplet-loss; k=0 is the identity predictor,
+# Pred(x) = x.
 LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
+# Hard-negative triplet hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-triplet-loss.
+TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.1}
+TRIPLET_W=${TRIPLET_W:-0.3}
+TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.05}
 
 SAVE_FREQ=${SAVE_FREQ:-20}
 TEST_FREQ=${TEST_FREQ:-10}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}   # catches val-path bugs/crashes immediately instead of after test_freq steps
+MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}   # only the most recent checkpoint is kept on disk
 
 # Validation rollout
-VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-32}    # more reliable for AIME's 30 problems
+VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}    # matches drgrpo_trainer's VAL_ROLLOUT_N
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-128}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
-VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
+# data_source names (see verl/experimental/fepo/data.py) used to compute the average
+# accuracy that decides whether to overwrite the `best/` checkpoint. Must be a subset
+# of whatever's actually in VAL_FILES, or best-checkpoint tracking silently no-ops.
+BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["aime24","aime25","aime26","amc23"]'}
 
 # KL penalty
 USE_KL_LOSS=${USE_KL_LOSS:-false}   # false -> drop KL entirely; set true to re-enable
@@ -162,12 +191,14 @@ MODEL=(
     actor_rollout_ref.model.path="${MODEL_PATH}"
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.model.enable_gradient_checkpointing=True
+    +actor_rollout_ref.model.override_config.attn_implementation=${ACTOR_ATTENTION_IMPL}
 )
 
 if [[ "${USE_LORA}" == "true" ]]; then
     MODEL+=(
         actor_rollout_ref.model.lora_rank=${LORA_RANK}
         actor_rollout_ref.model.lora_alpha=${LORA_ALPHA}
+        actor_rollout_ref.model.target_modules=${LORA_TARGET_MODULES}
     )
 else
     # The base config defaults lora_rank to 128; verl only treats LoRA as
@@ -178,10 +209,14 @@ else
 fi
 
 ACTOR=(
+    actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
+    # FEPO-style: token-mean for per-token gradient signals
+    actor_rollout_ref.actor.loss_agg_mode=token-mean
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
     actor_rollout_ref.actor.clip_ratio=${CLIP_RATIO}
     actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO}
     actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO}
+    actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}
     actor_rollout_ref.actor.use_dynamic_bsz=True
@@ -189,6 +224,7 @@ ACTOR=(
 
 ROLLOUT=(
     actor_rollout_ref.rollout.n=${ROLLOUT_N}
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}
     actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}
@@ -205,18 +241,25 @@ JEPA=(
     jepa.min_valid_pairs=${MIN_VALID_PAIRS}
     jepa.loss_type=${JEPA_LOSS_TYPE}
     jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
+    jepa.triplet_margin=${TRIPLET_MARGIN}
+    jepa.triplet_w=${TRIPLET_W}
+    jepa.triplet_sigreg_lambda=${TRIPLET_SIGREG_LAMBDA}
 )
 
 TRAINER=(
+    trainer.balance_batch=True
     trainer.nnodes=${NNODES}
     trainer.n_gpus_per_node=${NDEVICES_PER_NODE}
     trainer.total_training_steps=${MAX_OPTIMIZER_STEPS}
     trainer.save_freq=${SAVE_FREQ}
     trainer.test_freq=${TEST_FREQ}
+    trainer.val_before_train=${VAL_BEFORE_TRAIN}
+    trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP}
     trainer.project_name=${PROJECT_NAME}
     trainer.experiment_name=${EXPERIMENT_NAME}
     trainer.default_local_dir=${CKPTS_DIR}
     trainer.logger=${LOGGER}
+    +trainer.best_ckpt_sources=${BEST_CKPT_SOURCES}
 )
 
 ALGORITHM=(

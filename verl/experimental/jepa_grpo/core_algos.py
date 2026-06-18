@@ -255,3 +255,99 @@ def llm_jepa_loss(
         "jepa/n_pairs": int(pred_text.shape[0]),
         "jepa/pool_size": int(all_embeddings.shape[0]),
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM-JEPA hard-negative triplet loss: LLM-JEPA align + triplet hinge + SIGReg
+# ---------------------------------------------------------------------------
+
+def llm_jepa_triplet_loss(
+    pred_text: torch.Tensor,          # (B, d) p^c = Pred(Enc(CoT)), L2-normalized
+    enc_code_correct: torch.Tensor,   # (B, d) e^c = Enc(Code_correct), L2-normalized
+    enc_code_wrong: torch.Tensor,     # (T, d) e^w = Enc(Code_wrong), L2-normalized, T <= B
+    all_pool: torch.Tensor,           # (2B, d) [p^c, e^c] pool for SIGReg; e^w excluded
+    margin: float = 0.1,
+    w_tri: float = 0.3,
+    lambda_: float = 0.05,
+    M: int = 1024,
+    n_freq: int = 17,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    s: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """LLM-JEPA prediction loss + hard-negative triplet term + SIGReg.
+
+    L = (1-λ)·(L_align + w_tri·L_tri) + λ·L_SIGReg
+
+    L_align (over all B pairs): cosine distance, identical to ``llm_jepa_loss``.
+
+    L_tri (over the T <= B triplet-eligible prompts):
+        (1/T) * Σ max(0, margin - <p^c_i, e^c_i> + <p^c_i, e^w_i>)
+    ``enc_code_wrong``'s rows are assumed to be a prefix-aligned subset: row i
+    of ``enc_code_wrong`` corresponds to row i of ``pred_text``/
+    ``enc_code_correct`` (the caller/data-pipeline is responsible for this
+    ordering invariant). When T == 0 (no triplet-eligible prompts in the
+    batch), L_tri is set to exactly 0 — never 0/0.
+
+    ``enc_code_wrong`` is always stop-gradiented (detached) before use: this
+    kills gradient into the wrong-code encoder (the "trash-pole" failure
+    mode) while still letting gradient flow into ``p^c`` (repulsion, via the
+    +<p^c, e^w> term) and ``e^c`` (unaffected, via L_align). This is a mode
+    invariant, not a configurable knob.
+
+    SIGReg is computed on ``all_pool`` = [p^c, e^c] only; e^w is deliberately
+    excluded since it is displaced by the triplet term and would change what
+    "isotropic" means for the target distribution.
+    """
+    B = pred_text.shape[0]
+    T = enc_code_wrong.shape[0]
+    device, dtype = pred_text.device, pred_text.dtype
+
+    cos_sim = (pred_text * enc_code_correct).sum(dim=-1)   # (B,)
+    align = (1.0 - cos_sim).mean()
+
+    if T > 0:
+        pos_scores_tri = cos_sim[:T]
+        neg_scores_tri = (pred_text[:T] * enc_code_wrong.detach()).sum(dim=-1)
+        tri = F.relu(margin - pos_scores_tri + neg_scores_tri)
+        align_tri = tri.mean()
+    else:
+        align_tri = torch.zeros((), device=device, dtype=dtype)
+
+    sig = sigreg_loss(all_pool, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
+
+    loss = (1.0 - lambda_) * (align + w_tri * align_tri) + lambda_ * sig
+
+    metrics = {
+        "jepa/llm_jepa_align_loss": float(align.detach().cpu()),
+        "jepa/llm_jepa_triplet_loss": float(align_tri.detach().cpu()) if T > 0 else 0.0,
+        "jepa/llm_jepa_sigreg_loss": float(sig.detach().cpu()),
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
+        "jepa/llm_jepa_lambda": float(lambda_),
+        "jepa/n_pairs": int(B),
+        "jepa/n_triplets": int(T),
+        "jepa/triplet_frac": float(T / B) if B > 0 else 0.0,
+        "jepa/pool_size": int(all_pool.shape[0]),
+    }
+    if T > 0:
+        with torch.no_grad():
+            violated = (tri > 0).float().mean()
+        metrics["jepa/triplet_pos_score_mean"] = float(pos_scores_tri.detach().mean().cpu())
+        metrics["jepa/triplet_neg_score_mean"] = float(neg_scores_tri.detach().mean().cpu())
+        metrics["jepa/llm_jepa_triplet_violated_frac"] = float(violated.cpu())
+        metrics["jepa/llm_jepa_triplet_margin"] = float(
+            (pos_scores_tri - neg_scores_tri).detach().mean().cpu()
+        )
+        # unbiased=False: population variance, well-defined even for T == 1
+        # (the unbiased N-1 estimator is NaN there).
+        metrics["jepa/hard_neg_ew_variance"] = float(
+            enc_code_wrong.detach().var(dim=0, unbiased=False).mean().cpu()
+        )
+    else:
+        metrics["jepa/triplet_pos_score_mean"] = 0.0
+        metrics["jepa/triplet_neg_score_mean"] = 0.0
+        metrics["jepa/llm_jepa_triplet_violated_frac"] = 0.0
+        metrics["jepa/llm_jepa_triplet_margin"] = 0.0
+        metrics["jepa/hard_neg_ew_variance"] = 0.0
+
+    return loss, metrics
