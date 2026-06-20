@@ -181,7 +181,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
 
-    def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+    def save_checkpoint(
+        self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None, tag: str = "default"
+    ):
         """
         Save an FSDP checkpoint for this rank.
 
@@ -198,6 +200,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             hdfs_path: Unused (for API compatibility).
             global_step: Current training step (used for bookkeeping).
             max_ckpt_to_keep: Number of recent checkpoints to retain.
+            tag: Rotation lineage this checkpoint belongs to (e.g. "best" vs.
+                the default periodic rotation). Checkpoints saved under
+                different tags are rotated independently and never evict
+                each other.
         """
         if local_path is None:
             return
@@ -206,7 +212,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         self.previous_global_step = global_step
 
         if self.rank == 0:
-            self.ensure_checkpoint_capacity(max_ckpt_to_keep)
+            self.ensure_checkpoint_capacity(max_ckpt_to_keep, tag=tag)
 
         local_path = local_mkdir_safe(local_path)
         torch.distributed.barrier()
@@ -355,4 +361,4 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             torch.distributed.barrier()
 
         if self.rank == 0:
-            self.register_checkpoint(local_path, max_ckpt_to_keep)
+            self.register_checkpoint(local_path, max_ckpt_to_keep, tag=tag)

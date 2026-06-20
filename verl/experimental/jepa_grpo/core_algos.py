@@ -138,6 +138,28 @@ def sigreg_loss(
     device = embeddings.device
     dtype = embeddings.dtype
 
+    # SIGReg (Epps-Pulley) tests the embedding distribution against N(0, I_d) via
+    # random 1-D projections, and that test only has dynamic range when the
+    # projected coordinates are O(1)-variance. Callers pass L2-normalized
+    # (unit-sphere) embeddings — required for the cosine alignment term — but the
+    # projection of a unit-norm vector onto a random unit direction has variance
+    # ~1/d (std ~0.026 at d=1536). The empirical characteristic function then sits
+    # pinned at ~1 across t∈[t_min,t_max] for *every* arrangement on the sphere, so
+    # the statistic degenerates into a near-constant scale mismatch that is blind to
+    # the actual anisotropy/collapse it is supposed to penalize.
+    #
+    # Fix: rescale by the global radius only — divide by rms_norm/sqrt(d), where
+    # rms_norm = sqrt(mean_i ||x_i||²). For isotropic unit-sphere data this maps the
+    # mean projected variance to 1 (E_v[(x·v)²] = ||x||²/d), so projections look like
+    # N(0,1) and the loss is low; a collapsed cone keeps its near-constant projection
+    # along most directions (variance ≪ 1, nonzero mean), so the CF stays pinned at 1
+    # and mismatches the Gaussian — high loss, real gradient. Crucially we do NOT
+    # center and do NOT per-dim standardize: both would whiten away the rank/anisotropy
+    # signal (subtracting the mean of a tight cone leaves only its ~isotropic jitter,
+    # which then looks exactly like a well-spread set). Scaling is differentiable.
+    rms_norm = embeddings.pow(2).sum(dim=-1).mean().sqrt()
+    embeddings = embeddings * (d ** 0.5) / (rms_norm + 1e-6)
+
     # M random unit projection directions on S^{d-1}
     v = F.normalize(torch.randn(M, d, device=device, dtype=dtype), dim=-1)  # (M, d)
 
@@ -348,6 +370,106 @@ def llm_jepa_triplet_loss(
         metrics["jepa/triplet_neg_score_mean"] = 0.0
         metrics["jepa/llm_jepa_triplet_violated_frac"] = 0.0
         metrics["jepa/llm_jepa_triplet_margin"] = 0.0
+        metrics["jepa/hard_neg_ew_variance"] = 0.0
+
+    return loss, metrics
+
+
+def llm_jepa_separation_loss(
+    pred_text: torch.Tensor,          # (B, d) p^c = Pred(Enc(CoT)), L2-normalized
+    enc_code_correct: torch.Tensor,   # (B, d) e^c = Enc(Code_correct), L2-normalized
+    enc_code_wrong: torch.Tensor,     # (T, d) e^w = Enc(Code_wrong), L2-normalized, T <= B
+    all_pool: torch.Tensor,           # (2B+T, d) [p^c, e^c, e^w] pool for SIGReg; e^w INCLUDED
+    sep_margin: float = 0.1,
+    sep_w: float = 1.0,
+    lambda_: float = 0.05,
+    M: int = 1024,
+    n_freq: int = 17,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    s: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """LLM-JEPA prediction loss + correctness-separation term + SIGReg.
+
+    L = (1-λ)·(L_align + sep_w·L_sep) + λ·L_SIGReg
+
+    This is an alternative negative-side objective to ``llm_jepa_triplet_loss``.
+    The motivation: the triplet term's separating gradient w.r.t. p^c is
+    ∝ (e^c - e^w), which vanishes at the degenerate point e^c ≈ e^w that the
+    encoder actually sits at (hard_neg_ew_variance → 0, pos ≈ neg). The triplet
+    can only *exploit* a pre-existing gap between correct and wrong code; it
+    cannot *create* one.
+
+    L_sep creates the gap directly with a hinge on the correct/wrong PAIR:
+
+        L_sep = (1/T) Σ relu(sep_margin - (1 - <e^c_i, e^w_i>)).
+
+    Because e^c - e^w cancels the shared-prompt component exactly
+    (e^c = u + δ_c, e^w = u + δ_w ⇒ e^c - e^w = δ_c - δ_w), this margin acts
+    only on the correctness differential — no shared-prompt confound. Its
+    gradient (∂/∂e^c = e^w, ∂/∂e^w = e^c) is unit-magnitude and NON-vanishing
+    even at e^c ≈ e^w, which is exactly the signal the triplet lacked. It is a
+    bounded hinge (no softmax) so there is no runaway repulsion.
+
+    Differences from ``llm_jepa_triplet_loss`` by design:
+      * No weighted negative triplet term (no ``w_tri``); the negative signal
+        is the unweighted L_sep (``sep_w`` defaults to 1.0).
+      * NO stop-gradient: both e^c and e^w move apart (safe — bounded + prompt-
+        canceled).
+      * e^w is INCLUDED in ``all_pool`` for SIGReg, so it cannot collapse to a
+        low-variance pole; each wrong code keeps its own location and the
+        separation is per-prompt rather than a global shift.
+    """
+    B = pred_text.shape[0]
+    T = enc_code_wrong.shape[0]
+    device, dtype = pred_text.device, pred_text.dtype
+
+    cos_sim = (pred_text * enc_code_correct).sum(dim=-1)   # (B,)
+    align = (1.0 - cos_sim).mean()
+
+    if T > 0:
+        # <e^c, e^w> with gradient on BOTH (no detach): push the pair apart.
+        cw_sim = (enc_code_correct[:T] * enc_code_wrong).sum(dim=-1)   # (T,)
+        sep = F.relu(sep_margin - (1.0 - cw_sim))   # active when (1 - <e^c,e^w>) < sep_margin
+        sep_loss = sep.mean()
+    else:
+        sep_loss = torch.zeros((), device=device, dtype=dtype)
+
+    sig = sigreg_loss(all_pool, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
+
+    loss = (1.0 - lambda_) * (align + sep_w * sep_loss) + lambda_ * sig
+
+    metrics = {
+        "jepa/llm_jepa_align_loss": float(align.detach().cpu()),
+        "jepa/separation_loss": float(sep_loss.detach().cpu()) if T > 0 else 0.0,
+        "jepa/llm_jepa_sigreg_loss": float(sig.detach().cpu()),
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
+        "jepa/llm_jepa_lambda": float(lambda_),
+        "jepa/n_pairs": int(B),
+        "jepa/n_triplets": int(T),
+        "jepa/triplet_frac": float(T / B) if B > 0 else 0.0,
+        "jepa/pool_size": int(all_pool.shape[0]),
+    }
+    if T > 0:
+        with torch.no_grad():
+            cw = cw_sim.detach()
+            neg_scores = (pred_text[:T] * enc_code_wrong.detach()).sum(dim=-1)
+        # sep_gap = 1 - <e^c,e^w>; should RISE toward sep_margin as the pair separates.
+        metrics["jepa/sep_gap_mean"] = float((1.0 - cw).mean().cpu())
+        metrics["jepa/sep_cw_sim_mean"] = float(cw.mean().cpu())
+        metrics["jepa/sep_active_frac"] = float((sep > 0).float().mean().cpu())
+        # comparability with triplet runs:
+        metrics["jepa/triplet_pos_score_mean"] = float(cos_sim[:T].detach().mean().cpu())
+        metrics["jepa/triplet_neg_score_mean"] = float(neg_scores.mean().cpu())
+        metrics["jepa/hard_neg_ew_variance"] = float(
+            enc_code_wrong.detach().var(dim=0, unbiased=False).mean().cpu()
+        )
+    else:
+        metrics["jepa/sep_gap_mean"] = 0.0
+        metrics["jepa/sep_cw_sim_mean"] = 0.0
+        metrics["jepa/sep_active_frac"] = 0.0
+        metrics["jepa/triplet_pos_score_mean"] = 0.0
+        metrics["jepa/triplet_neg_score_mean"] = 0.0
         metrics["jepa/hard_neg_ew_variance"] = 0.0
 
     return loss, metrics

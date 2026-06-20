@@ -32,7 +32,22 @@ class JEPARayConfig:
 
     enable: bool = True
     alpha: float = 0.1
+    # Linearly ramp the EFFECTIVE alpha used in jepa_update from 0 -> `alpha`
+    # over this many JEPA-update steps (0 = disabled, full `alpha` from step
+    # 0 — prior behavior). Pre-clip grad_norm is observed to be elevated
+    # (~5) at the very start of training before the predictor/encoder
+    # geometry settles; gradient clipping already bounds the actual optimizer
+    # step, but warming up alpha additionally reduces how much weight that
+    # noisy early direction gets, independent of clip_grad.
+    alpha_warmup_steps: int = 0
     ema_decay: float = 0.99
+    # Gradient-clip max-norm used by jepa_update()'s own optimizer_step() call
+    # (worker.py), separate from the actor's PPO optimizer_step() clip_grad
+    # (typically 1.0). jepa_update shares the actor's optimizer/parameters but
+    # runs as its own backward+step, so without its own (tighter) ceiling, an
+    # occasional JEPA grad-norm spike injects a full-magnitude, uncoordinated
+    # update onto the same LoRA weights the PPO step is trying to keep stable.
+    max_grad_norm: float = 0.5
     embed_micro_batch_size: int = 16
     # Minimum number of valid (cot_correct AND code_correct) pairs to skip step
     min_valid_pairs: int = 2
@@ -69,8 +84,18 @@ class JEPARayConfig:
     triplet_w: float = 0.3
     # Dedicated SIGReg lambda for this mode. Deliberately separate from `sigreg_lambda`
     # (default 0.1, used by "lejepa"/"llm-jepa-loss") so picking "jepa-triplet-loss"
-    # doesn't silently inherit the other modes' default.
+    # doesn't silently inherit the other modes' default. Also reused by
+    # "jepa-separation-loss".
     triplet_sigreg_lambda: float = 0.05
+    # -- jepa-separation-loss only --
+    # Target cosine-distance gap gamma between correct and wrong code:
+    #   L_sep = (1/T) Σ relu(separation_margin - (1 - <e^c,e^w>)).
+    # Keep small so it does not fight the prompt structure.
+    separation_margin: float = 0.1
+    # Weight of L_sep inside the (1-lambda) slot. Default 1.0 = UNWEIGHTED: unlike
+    # the triplet term (triplet_w), the negative-side separation term is not
+    # down-weighted. L = (1-lambda)*(L_align + separation_w*L_sep) + lambda*L_SIGReg.
+    separation_w: float = 1.0
 
     @classmethod
     def from_config(cls, config: DictConfig | dict | None) -> "JEPARayConfig":

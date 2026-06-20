@@ -8,7 +8,9 @@ defaults:
 jepa:
   enable: true
   alpha: 0.1
+  alpha_warmup_steps: 0
   ema_decay: 0.99
+  max_grad_norm: 0.5
   embed_micro_batch_size: 16
   min_valid_pairs: 2
   sigreg_lambda: 0.1
@@ -17,12 +19,15 @@ jepa:
   t_max: 5.0
   epps_pulley_s: 1.0
   code_system_prompt: "You are a Python programming expert. Solve the following math problem by writing a complete, executable Python program that prints the answer."
-  loss_type: lejepa  # lejepa | llm-jepa-loss | jepa-triplet-loss
+  loss_type: lejepa  # lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss
   predictor_k: 0
   # -- jepa-triplet-loss only --
   triplet_margin: 0.1
   triplet_w: 0.3
   triplet_sigreg_lambda: 0.05
+  # -- jepa-separation-loss only --
+  separation_margin: 0.1
+  separation_w: 1.0
 
 # ── Algorithm (GRPO, no KL) ─────────────────────────────────────────────────
 algorithm:

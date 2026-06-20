@@ -36,6 +36,7 @@ from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
 from verl.trainer.ppo.metric_utils import compute_data_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.utils.metric import reduce_metrics
+from verl.utils.profiler.performance import simple_timer
 
 
 class JEPARayPPOTrainer(RayPPOTrainer):
@@ -64,7 +65,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         if self.jepa_cfg.enable:
             import dataclasses
 
-            if self.jepa_cfg.loss_type in ("llm-jepa-loss", "jepa-triplet-loss") and self.jepa_cfg.predictor_k > 0:
+            if self.jepa_cfg.loss_type in ("llm-jepa-loss", "jepa-triplet-loss", "jepa-separation-loss") and self.jepa_cfg.predictor_k > 0:
                 self.jepa_cfg.predictor_token_id = self._resolve_predictor_token_id()
 
             cfg_dict = dataclasses.asdict(self.jepa_cfg)
@@ -497,109 +498,125 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 )
 
                 # ── Step 1: CoT rollout ──────────────────────────────────
-                gen_batch = self._get_gen_batch(batch)
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                rollout_n = self.config.actor_rollout_ref.rollout.n
-                gen_batch_rep = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                with simple_timer("cot_gen", timing_raw):
+                    gen_batch = self._get_gen_batch(batch)
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    rollout_n = self.config.actor_rollout_ref.rollout.n
+                    gen_batch_rep = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
 
-                cot_gen_output = self.async_rollout_manager.generate_sequences(gen_batch_rep)
-                batch = batch.repeat(repeat_times=rollout_n, interleave=True)
-                batch = batch.union(cot_gen_output)
-                if "response_mask" not in batch.batch.keys():
-                    batch.batch["response_mask"] = compute_response_mask(batch)
+                    cot_gen_output = self.async_rollout_manager.generate_sequences(gen_batch_rep)
+                    batch = batch.repeat(repeat_times=rollout_n, interleave=True)
+                    batch = batch.union(cot_gen_output)
+                    if "response_mask" not in batch.batch.keys():
+                        batch.batch["response_mask"] = compute_response_mask(batch)
 
                 # ── Step 2: CoT rewards & advantages ────────────────────
-                if self.use_rm and "rm_scores" not in batch.batch.keys():
-                    batch = batch.union(self._compute_reward_colocate(batch))
-                reward_tensor, reward_extra_infos = extract_reward(batch)
-                batch.batch["token_level_scores"] = reward_tensor
-                if not self.config.algorithm.use_kl_in_reward:
-                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-                batch = compute_advantage(
-                    batch,
-                    adv_estimator=self.config.algorithm.adv_estimator,
-                    gamma=self.config.algorithm.gamma,
-                    lam=self.config.algorithm.lam,
-                    num_repeat=rollout_n,
-                    norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-                    config=self.config.algorithm,
-                )
+                with simple_timer("cot_reward_adv", timing_raw):
+                    if self.use_rm and "rm_scores" not in batch.batch.keys():
+                        batch = batch.union(self._compute_reward_colocate(batch))
+                    reward_tensor, reward_extra_infos = extract_reward(batch)
+                    batch.batch["token_level_scores"] = reward_tensor
+                    if not self.config.algorithm.use_kl_in_reward:
+                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                    batch = compute_advantage(
+                        batch,
+                        adv_estimator=self.config.algorithm.adv_estimator,
+                        gamma=self.config.algorithm.gamma,
+                        lam=self.config.algorithm.lam,
+                        num_repeat=rollout_n,
+                        norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                        config=self.config.algorithm,
+                    )
 
                 # ── Step 3: Compute old log-probs & (optional) ref ──────
-                old_log_prob, _old_log_prob_mfu = self._compute_old_log_prob(batch)
-                batch = batch.union(old_log_prob)
-                if self.use_reference_policy:
-                    ref_log_prob = self._compute_ref_log_prob(batch)
-                    batch = batch.union(ref_log_prob)
+                with simple_timer("old_log_prob", timing_raw):
+                    old_log_prob, _old_log_prob_mfu = self._compute_old_log_prob(batch)
+                    batch = batch.union(old_log_prob)
+                    if self.use_reference_policy:
+                        ref_log_prob = self._compute_ref_log_prob(batch)
+                        batch = batch.union(ref_log_prob)
 
                 # Sleep rollout replicas before backward (frees KV cache)
-                self.checkpoint_manager.sleep_replicas()
+                with simple_timer("sleep_replicas_1", timing_raw):
+                    self.checkpoint_manager.sleep_replicas()
 
                 # ── Step 4: GRPO actor update ────────────────────────────
-                actor_output = self._update_actor(batch)
-                actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                metrics.update(actor_metrics)
+                with simple_timer("update_actor", timing_raw):
+                    actor_output = self._update_actor(batch)
+                    actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    metrics.update(actor_metrics)
 
                 # ── Step 5: JEPA (if enabled) ────────────────────────────
                 if self.jepa_cfg.enable:
                     # 5a. Code-view rollout (wake rollout replicas first)
-                    self.checkpoint_manager.update_weights(self.global_steps)
+                    with simple_timer("weight_sync_1", timing_raw):
+                        self.checkpoint_manager.update_weights(self.global_steps)
 
-                    code_gen_batch = self._tokenize_code_prompts(
-                        # Use un-repeated batch so prompts appear once
-                        DataProto(
-                            batch=batch.batch[:len(batch.batch) // rollout_n],
-                            non_tensor_batch={
-                                k: v[:len(batch.batch) // rollout_n]
-                                for k, v in batch.non_tensor_batch.items()
-                            },
-                            meta_info=batch.meta_info,
+                    with simple_timer("code_gen", timing_raw):
+                        code_gen_batch = self._tokenize_code_prompts(
+                            # Use un-repeated batch so prompts appear once
+                            DataProto(
+                                batch=batch.batch[:len(batch.batch) // rollout_n],
+                                non_tensor_batch={
+                                    k: v[:len(batch.batch) // rollout_n]
+                                    for k, v in batch.non_tensor_batch.items()
+                                },
+                                meta_info=batch.meta_info,
+                            )
                         )
-                    )
-                    code_gen_batch_rep = code_gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-                    code_gen_output = self.async_rollout_manager.generate_sequences(code_gen_batch_rep)
-                    # AgentLoop echoes raw_prompt back into output; remove before union to avoid key collision
-                    code_gen_output.non_tensor_batch.pop("raw_prompt", None)
+                        code_gen_batch_rep = code_gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                        code_gen_output = self.async_rollout_manager.generate_sequences(code_gen_batch_rep)
+                        # AgentLoop echoes raw_prompt back into output; remove before union to avoid key collision
+                        code_gen_output.non_tensor_batch.pop("raw_prompt", None)
 
-                    code_batch = code_gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-                    code_batch = code_batch.union(code_gen_output)
-                    if "response_mask" not in code_batch.batch.keys():
-                        code_batch.batch["response_mask"] = compute_response_mask(code_batch)
+                        code_batch = code_gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                        code_batch = code_batch.union(code_gen_output)
+                        if "response_mask" not in code_batch.batch.keys():
+                            code_batch.batch["response_mask"] = compute_response_mask(code_batch)
 
                     # 5b. Code rewards (math match)
-                    if self.use_rm and "rm_scores" not in code_batch.batch.keys():
-                        code_batch = code_batch.union(self._compute_reward_colocate(code_batch))
-                    code_reward_tensor, _ = extract_reward(code_batch)
+                    with simple_timer("code_reward", timing_raw):
+                        if self.use_rm and "rm_scores" not in code_batch.batch.keys():
+                            code_batch = code_batch.union(self._compute_reward_colocate(code_batch))
+                        code_reward_tensor, _ = extract_reward(code_batch)
 
                     # Sleep rollout before JEPA backward
-                    self.checkpoint_manager.sleep_replicas()
+                    with simple_timer("sleep_replicas_2", timing_raw):
+                        self.checkpoint_manager.sleep_replicas()
 
                     # 5c. Build JEPA pairs
-                    build_fn = (
-                        self._build_jepa_batch_triplet
-                        if self.jepa_cfg.loss_type == "jepa-triplet-loss"
-                        else self._build_jepa_batch
-                    )
-                    jepa_batch = build_fn(
-                        batch_cot=batch,
-                        batch_code=code_batch,
-                        reward_tensor_cot=reward_tensor,
-                        reward_tensor_code=code_reward_tensor,
-                    )
+                    with simple_timer("jepa_build_batch", timing_raw):
+                        build_fn = (
+                            self._build_jepa_batch_triplet
+                            if self.jepa_cfg.loss_type in ("jepa-triplet-loss", "jepa-separation-loss")
+                            else self._build_jepa_batch
+                        )
+                        jepa_batch = build_fn(
+                            batch_cot=batch,
+                            batch_code=code_batch,
+                            reward_tensor_cot=reward_tensor,
+                            reward_tensor_code=code_reward_tensor,
+                        )
 
                     if jepa_batch is not None:
                         # 5d. JEPA update on worker (embedding extract + backward + EMA sync)
-                        jepa_td = jepa_batch.to_tensordict()
-                        jepa_output = self.actor_rollout_wg.jepa_update(jepa_td)
-                        # ONE_TO_ALL dispatch returns a list; take rank-0 output
-                        if isinstance(jepa_output, list):
-                            jepa_output = jepa_output[0] if jepa_output else None
-                        if jepa_output is not None:
-                            for k, v in jepa_output.items():
-                                if isinstance(v, torch.Tensor):
-                                    metrics[k] = float(v.item())
-                        if "n_correct_cot_mean" in jepa_batch.meta_info:
-                            metrics["jepa/n_correct_cot_mean"] = jepa_batch.meta_info["n_correct_cot_mean"]
+                        with simple_timer("jepa_update", timing_raw):
+                            jepa_td = jepa_batch.to_tensordict()
+                            # Broadcast to match jepa_td's batch dim (TensorDict requires
+                            # assigned tensors to share the leading batch_size shape).
+                            jepa_td["global_step"] = torch.full(
+                                (jepa_td.batch_size[0],), float(self.global_steps)
+                            )
+                            jepa_output = self.actor_rollout_wg.jepa_update(jepa_td)
+                            # ONE_TO_ALL dispatch returns a list; take rank-0 output
+                            if isinstance(jepa_output, list):
+                                jepa_output = jepa_output[0] if jepa_output else None
+                            if jepa_output is not None:
+                                for k, v in jepa_output.items():
+                                    if isinstance(v, torch.Tensor):
+                                        metrics[k] = float(v.item())
+                            if "n_correct_cot_mean" in jepa_batch.meta_info:
+                                metrics["jepa/n_correct_cot_mean"] = jepa_batch.meta_info["n_correct_cot_mean"]
                     else:
                         metrics["jepa/skipped"] = 1.0
                         metrics["jepa/n_valid_pairs"] = 0.0
@@ -610,7 +627,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     metrics["code/avg_reward"] = float(code_rew_scalar.mean())
 
                 # ── Step 6: Weight sync to rollout (wakes vLLM) ─────────
-                self.checkpoint_manager.update_weights(self.global_steps)
+                with simple_timer("weight_sync_2", timing_raw):
+                    self.checkpoint_manager.update_weights(self.global_steps)
 
                 # ── CoT-based train metrics (rich grouped stats) ─────────
                 cot_rew_scalar = reward_tensor.sum(dim=-1)
@@ -625,7 +643,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 if self.config.trainer.test_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
-                    val_metrics = self._validate()
+                    with simple_timer("validate", timing_raw):
+                        val_metrics = self._validate()
                     metrics.update(val_metrics)
                     self._maybe_save_best_checkpoint(val_metrics)
 
@@ -633,7 +652,11 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
-                    self._save_checkpoint()
+                    with simple_timer("save_checkpoint", timing_raw):
+                        self._save_checkpoint()
+
+                metrics.update({f"timing_s/{k}": v for k, v in timing_raw.items()})
+                metrics["timing_s/step_total"] = sum(timing_raw.values())
 
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)

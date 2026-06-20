@@ -1017,14 +1017,21 @@ class FSDPEngine(BaseEngine):
         """
         self.optimizer.zero_grad()
 
-    def optimizer_step(self):
+    def optimizer_step(self, clip_grad_override: Optional[float] = None):
         """
         Clip gradients, skip update if non-finite, and step optimizer.
+
+        Args:
+            clip_grad_override: If provided, use this gradient-clip max-norm
+                instead of `self.optimizer_config.clip_grad`. Lets a caller
+                that shares this engine's optimizer (e.g. an auxiliary loss's
+                update) apply a tighter trust region than the main step.
 
         Returns:
             grad_norm (float): Norm of gradients before clipping.
         """
-        assert self.optimizer_config.clip_grad is not None
+        clip_grad = clip_grad_override if clip_grad_override is not None else self.optimizer_config.clip_grad
+        assert clip_grad is not None
 
         # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__.
         scaler = getattr(self, "scaler", None)
@@ -1035,13 +1042,11 @@ class FSDPEngine(BaseEngine):
             scaler.unscale_(self.optimizer)
 
         if isinstance(self.module, FSDP):
-            grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
+            grad_norm = self.module.clip_grad_norm_(clip_grad)
         elif isinstance(self.module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=self.optimizer_config.clip_grad)
+            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=clip_grad)
         else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.module.parameters(), max_norm=self.optimizer_config.clip_grad
-            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.module.parameters(), max_norm=clip_grad)
 
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
@@ -1114,6 +1119,7 @@ class FSDPEngine(BaseEngine):
         hdfs_path: Optional[str] = None,
         global_step: int = 0,
         max_ckpt_to_keep: Optional[int] = None,
+        tag: str = "default",
         **kwargs,
     ) -> None:
         """
@@ -1124,7 +1130,11 @@ class FSDPEngine(BaseEngine):
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.save_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            global_step=global_step,
+            max_ckpt_to_keep=max_ckpt_to_keep,
+            tag=tag,
         )
 
         torch.distributed.barrier()

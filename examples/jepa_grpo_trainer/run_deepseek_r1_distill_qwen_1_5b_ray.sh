@@ -56,7 +56,7 @@ export WANDB_MODE=${WANDB_MODE:-online}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
 
 ########################### user-adjustable ###########################
-MODEL_PATH=${MODEL_PATH:-/workspace/models/DeepSeek-R1-Distill-Qwen-1.5B}
+MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
 TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/deepscaler_preview_train.parquet}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
@@ -107,7 +107,7 @@ if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
 fi
 
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
-PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_dapo_math}
+PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_deepscaler}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-deepseek_r1_distill_qwen_1_5b_jepa_grpo_ray-${RUN_TIMESTAMP}}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 LOGGER=${LOGGER:-'["console","wandb"]'}
@@ -118,13 +118,13 @@ ROLLOUT_N=${ROLLOUT_N:-8}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}   # 64/32 = 2 gradient steps per batch, more stable
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
-PPO_MAX_TOKEN_LEN=${PPO_MAX_TOKEN_LEN:-16384}     # matches drgrpo_trainer's PPO_MAX_TOKEN_LEN_PER_GPU
+PPO_MAX_TOKEN_LEN=${PPO_MAX_TOKEN_LEN:-24576}     # 1.5x: 32768 OOM'd at step 80 (save+eval boundary) on the ~9.2GB full-vocab lm_head logits block; 24576 shrinks that block to ~6.9GB for real headroom
 MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-629}   # 1 epoch: floor(40309 train rows / 64 batch size), drop_last=True
 
 # Actor optimiser
 ACTOR_LR=${ACTOR_LR:-1e-6}
 CLIP_RATIO=${CLIP_RATIO:-0.2}
-ENTROPY_COEFF=${ENTROPY_COEFF:-0}
+ENTROPY_COEFF=${ENTROPY_COEFF:-0.00}   # small entropy bonus; previously 0 let the policy drift unconstrained (length blow-up)
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
 USE_LORA=${USE_LORA:-true}   # false -> full fine-tuning; set false to disable LoRA
 LORA_RANK=${LORA_RANK:-512}
@@ -134,6 +134,9 @@ LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 # Rollout
 ROLLOUT_TP=${ROLLOUT_TP:-1}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.55}   # leaves headroom for the Code-view rollout + JEPA forward
+# Gradient checkpointing: True (default) recomputes activations in backward to save memory;
+# False is faster on update_actor/jepa_update but uses more activation memory (OOM risk).
+GRAD_CKPT=${GRAD_CKPT:-True}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}   # more parallel sequences during vLLM rollout
 
 # JEPA
@@ -153,9 +156,30 @@ LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
 # Hard-negative triplet hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-triplet-loss.
 TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.1}
 TRIPLET_W=${TRIPLET_W:-0.3}
-TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.05}
+TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.5}   # SIGReg must both replace the dropped LLM-JEPA NTP anti-collapse leg AND fight the pretrained LLM's anisotropy prior, so it needs far more weight than LeJEPA's from-scratch default (0.05/0.1); 0.3 still lost (pos/neg re-converged, margin went negative by step ~24)
+# Separation-loss hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-separation-loss.
+# L_sep = (1/T) Σ relu(SEPARATION_MARGIN - (1 - <e^c,e^w>)); creates the correct/wrong
+# gap the triplet's vanishing (e^c-e^w) gradient could not. e^w is added to the SIGReg
+# pool here so it cannot collapse. SEPARATION_W=1.0 => unweighted negative term.
+SEPARATION_MARGIN=${SEPARATION_MARGIN:-0.1}
+SEPARATION_W=${SEPARATION_W:-1.0}
+# Number of random projection directions for SIGReg's Epps-Pulley statistic.
+# More directions = sharper, lower-variance anti-collapse gradient (LeJEPA default
+# 1024 is calibrated for large from-scratch batches; our per-step pool is only
+# ~2*valid_pairs embeddings, so the statistic is noisy and easily outrun by the
+# dense alignment gradient — raise it to stabilize SIGReg's gradient direction).
+N_PROJECTIONS=${N_PROJECTIONS:-8192}
+# Gradient-clip max-norm for jepa_update()'s own optimizer step, tighter than the
+# actor's PPO clip_grad (typically 1.0) since jepa_update shares the actor's
+# optimizer/parameters but runs as its own uncoordinated backward+step.
+JEPA_MAX_GRAD_NORM=${JEPA_MAX_GRAD_NORM:-0.5}
+# Ramp effective jepa.alpha from 0 -> ALPHA over this many jepa_update steps
+# (0 disables warmup, full alpha from step 0). Pre-clip jepa/grad_norm is
+# elevated (~5) at the very start before the predictor/encoder geometry
+# settles; this reduces how much weight that early noisy direction gets.
+ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-10}
 
-SAVE_FREQ=${SAVE_FREQ:-20}
+SAVE_FREQ=${SAVE_FREQ:-10}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}   # catches val-path bugs/crashes immediately instead of after test_freq steps
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}   # only the most recent checkpoint is kept on disk
@@ -172,8 +196,8 @@ VAL_TOP_P=${VAL_TOP_P:-0.95}
 BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["aime24","aime25","aime26","amc23"]'}
 
 # KL penalty
-USE_KL_LOSS=${USE_KL_LOSS:-false}   # false -> drop KL entirely; set true to re-enable
-KL_COEF=${KL_COEF:-0.0}
+USE_KL_LOSS=${USE_KL_LOSS:-true}   # anchors policy to the reference model; false -> drop KL entirely
+KL_COEF=${KL_COEF:-0.001}   # small but nonzero; previously 0.0 left policy drift unbounded (see grad_norm/ppo_kl blowup)
 ########################### end user-adjustable ###########################
 
 DATA=(
@@ -190,7 +214,7 @@ DATA=(
 MODEL=(
     actor_rollout_ref.model.path="${MODEL_PATH}"
     actor_rollout_ref.model.use_remove_padding=True
-    actor_rollout_ref.model.enable_gradient_checkpointing=True
+    actor_rollout_ref.model.enable_gradient_checkpointing=${GRAD_CKPT}
     +actor_rollout_ref.model.override_config.attn_implementation=${ACTOR_ATTENTION_IMPL}
 )
 
@@ -244,6 +268,11 @@ JEPA=(
     jepa.triplet_margin=${TRIPLET_MARGIN}
     jepa.triplet_w=${TRIPLET_W}
     jepa.triplet_sigreg_lambda=${TRIPLET_SIGREG_LAMBDA}
+    jepa.separation_margin=${SEPARATION_MARGIN}
+    jepa.separation_w=${SEPARATION_W}
+    jepa.n_projections=${N_PROJECTIONS}
+    jepa.alpha_warmup_steps=${ALPHA_WARMUP_STEPS}
+    jepa.max_grad_norm=${JEPA_MAX_GRAD_NORM}
 )
 
 TRAINER=(

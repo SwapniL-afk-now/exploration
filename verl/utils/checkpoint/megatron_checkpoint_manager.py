@@ -626,12 +626,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     logger=logger,
                 )
 
-    def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+    def save_checkpoint(
+        self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None, tag: str = "default"
+    ):
         # record the previous global step
         self.previous_global_step = global_step
 
         if not self.checkpoint_config.async_save:
-            self.ensure_checkpoint_capacity(max_ckpt_to_keep)
+            self.ensure_checkpoint_capacity(max_ckpt_to_keep, tag=tag)
 
         local_path = local_mkdir_safe(local_path)
         dist_checkpoint_path = get_dist_checkpoint_path(local_path)
@@ -882,7 +884,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 with open(local_latest_checkpointed_iteration, "w") as f:
                     f.write(str(global_step))
 
-            self.register_checkpoint(local_path, max_ckpt_to_keep)
+            self.register_checkpoint(local_path, max_ckpt_to_keep, tag=tag)
 
         if self.checkpoint_config.async_save:
             assert async_save_request is not None, "Async save request should not be None when using async save."

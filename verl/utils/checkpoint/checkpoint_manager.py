@@ -56,7 +56,11 @@ class BaseCheckpointManager:
         if checkpoint_save_contents is None:
             checkpoint_save_contents = ["model", "optimizer", "extra"]
         self.previous_global_step = None
-        self.previous_saved_paths = []
+        # Keyed by `tag` so independently-rotated checkpoint lineages (e.g. the
+        # periodic "default" rotation vs. a "best" snapshot) never evict each
+        # other's files. Callers that omit `tag` all share the "default" bucket,
+        # which reproduces the previous single-list behavior exactly.
+        self.previous_saved_paths: dict[str, list[str]] = {}
 
         self.model = model
         self.optimizer = optimizer
@@ -122,7 +126,12 @@ class BaseCheckpointManager:
         raise NotImplementedError
 
     def save_checkpoint(
-        self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep: int = None
+        self,
+        local_path: str,
+        hdfs_path: str = None,
+        global_step: int = 0,
+        max_ckpt_to_keep: int = None,
+        tag: str = "default",
     ):
         raise NotImplementedError
 
@@ -141,35 +150,55 @@ class BaseCheckpointManager:
                 continue
             shutil.rmtree(abs_path, ignore_errors=True)
 
-    def ensure_checkpoint_capacity(self, max_ckpt_to_keep: int):
+    def ensure_checkpoint_capacity(self, max_ckpt_to_keep: int, tag: str = "default"):
         """
         Remove old checkpoints to make room for a new one, keeping a safety buffer.
 
         With max_ckpt_to_keep=1, this does nothing - we keep the existing checkpoint
         until the new save completes successfully (handled by register_checkpoint).
         For max_ckpt_to_keep >= 2, we keep (max_ckpt_to_keep - 1) checkpoints before save.
+
+        `tag` scopes the rotation to an independent lineage of checkpoints (e.g.
+        "best" vs. the default periodic rotation) so they never evict each other.
         """
         if not (max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 1):
             return
-        if len(self.previous_saved_paths) >= max_ckpt_to_keep:
-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+        paths = self.previous_saved_paths.setdefault(tag, [])
+        if len(paths) >= max_ckpt_to_keep:
+            keep_start = len(paths) - max_ckpt_to_keep + 1
+            retained = paths[keep_start:]
+            # Never delete a path that is still being retained (constant-path lineages).
+            to_remove = [p for p in paths[:keep_start] if p not in retained]
+            self.remove_previous_save_local_path(to_remove)
+            self.previous_saved_paths[tag] = retained
 
-    def register_checkpoint(self, new_path: str, max_ckpt_to_keep: int):
+    def register_checkpoint(self, new_path: str, max_ckpt_to_keep: int, tag: str = "default"):
         """
         Register a successfully saved checkpoint and enforce retention limit.
 
         Adds the new checkpoint path to tracking and removes excess old
-        checkpoints beyond max_ckpt_to_keep.
+        checkpoints beyond max_ckpt_to_keep, scoped to `tag`'s own lineage.
         """
-        self.previous_saved_paths.append(new_path)
+        paths = self.previous_saved_paths.setdefault(tag, [])
+        # A constant, repeatedly-overwritten path (e.g. the single "best/actor"
+        # snapshot, which has no global_step in its name) is logically one rotation
+        # slot, not a new lineage entry. Re-registering the same path must NOT
+        # enqueue a duplicate — otherwise the FIFO immediately "evicts the oldest",
+        # which is the very directory that was just overwritten, deleting the live
+        # checkpoint. Treat a repeat of the most-recent path as an in-place overwrite.
+        if paths and paths[-1] == new_path:
+            return
+        paths.append(new_path)
         if not (max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 0):
             return
-        if len(self.previous_saved_paths) > max_ckpt_to_keep:
-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+        if len(paths) > max_ckpt_to_keep:
+            keep_start = len(paths) - max_ckpt_to_keep
+            retained = paths[keep_start:]
+            # Defensive: never delete a path that is still being retained (guards
+            # against any residual duplicate paths within the same lineage).
+            to_remove = [p for p in paths[:keep_start] if p not in retained]
+            self.remove_previous_save_local_path(to_remove)
+            self.previous_saved_paths[tag] = retained
 
     @staticmethod
     def get_rng_state():

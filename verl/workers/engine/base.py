@@ -80,9 +80,17 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def optimizer_step(self):
+    def optimizer_step(self, clip_grad_override: Optional[float] = None):
         """
         Perform an optimization step using the optimizer.
+
+        Args:
+            clip_grad_override: If provided, use this gradient-clip max-norm
+                instead of the engine's configured `optimizer_config.clip_grad`.
+                Used by callers (e.g. an auxiliary loss's update) that need a
+                tighter trust region than the main optimizer step on the same
+                underlying optimizer. Defaults to None, which preserves the
+                existing `optimizer_config.clip_grad` behavior unchanged.
         """
         raise NotImplementedError
 
@@ -185,6 +193,7 @@ class BaseEngine:
         hdfs_path: Optional[str] = None,
         global_step: int = 0,
         max_ckpt_to_keep: Optional[int] = None,
+        tag: str = "default",
         **kwargs,
     ) -> None:
         """
@@ -195,6 +204,10 @@ class BaseEngine:
             hdfs_path: Optional HDFS path to copy checkpoint.
             global_step: Integer training step number for naming.
             max_ckpt_to_keep: Maximum number of recent checkpoints to retain.
+            tag: Rotation lineage this checkpoint belongs to (e.g. "best" vs.
+                the default periodic rotation). Checkpoints saved under
+                different tags are rotated independently and never evict
+                each other.
             **kwargs: Arbitrary keyword arguments.
         """
         raise NotImplementedError

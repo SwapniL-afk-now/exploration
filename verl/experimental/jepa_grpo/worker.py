@@ -23,17 +23,23 @@ Extends ActorRolloutRefWorker with:
 from __future__ import annotations
 
 import contextlib
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from tensordict import TensorDict
 
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import tensordict_utils as tu
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
-from verl.experimental.jepa_grpo.core_algos import lejepa_loss, llm_jepa_loss, llm_jepa_triplet_loss
+from verl.experimental.jepa_grpo.core_algos import (
+    lejepa_loss,
+    llm_jepa_loss,
+    llm_jepa_separation_loss,
+    llm_jepa_triplet_loss,
+)
 
 
 class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
@@ -332,6 +338,12 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                     attention_mask=packed_attn,
                     position_ids=packed_pos,
                     use_cache=False,
+                    # Only the anchor scalar below needs *a* logits tensor, not the
+                    # full (N, max_rlen, vocab) one HF computes by default (logits_to_keep=0).
+                    # With long packed batches this materializes tens of GB just to be
+                    # multiplied by zero — logits_to_keep=1 keeps only the last position's
+                    # logits, cutting that allocation by a factor of max_rlen.
+                    logits_to_keep=1,
                 )
         finally:
             handle.remove()
@@ -360,6 +372,127 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 all_embs.append(emb)
 
         return torch.stack(all_embs, dim=0), logits_anchor  # (N, d), scalar
+
+    def _embed_chunked_no_grad(
+        self,
+        ids: torch.Tensor,
+        mask: torch.Tensor,
+        lengths: torch.Tensor,
+        use_ema: bool,
+        micro_bs: int,
+    ) -> torch.Tensor:
+        """No-grad embedding extraction, chunked to bound forward activation memory.
+
+        No backward is needed here (used for the EMA Code target encoder in
+        "lejepa" mode), so this is just a plain loop + concat — no GradCache
+        machinery required.
+        """
+        N = ids.shape[0]
+        if N <= micro_bs:
+            emb, _ = self._extract_embeddings(ids, mask, lengths, use_ema=use_ema, requires_grad=False)
+            return emb
+        chunks = []
+        for start in range(0, N, micro_bs):
+            end = min(start + micro_bs, N)
+            emb, _ = self._extract_embeddings(
+                ids[start:end], mask[start:end], lengths[start:end], use_ema=use_ema, requires_grad=False,
+            )
+            chunks.append(emb)
+        return torch.cat(chunks, dim=0)
+
+    def _embed_chunked_with_backward(
+        self,
+        ids: torch.Tensor,
+        mask: torch.Tensor,
+        lengths: torch.Tensor,
+        predictor_k: "list[int]",
+        loss_fn: "Callable[[torch.Tensor], tuple[torch.Tensor, dict]]",
+        micro_bs: int,
+        alpha: float,
+    ) -> dict:
+        """Embed the joint (N, L) batch, compute a loss over it, and run backward
+        — splitting the forward+backward into micro-batches of size `micro_bs`
+        rows when N > micro_bs, so peak activation memory is bounded by one
+        micro-batch instead of the full joint batch (the cause of the
+        "Tried to allocate ... GiB" OOM during `scaled_loss.backward()` at full
+        batch size: 64 prompts x up to 3 views/prompt x up to ~3072+predictor_k
+        tokens each, all packed into a single forward, easily exceeds the
+        94.97 GiB card once activations for backward are retained).
+
+        Implements GradCache (Gao et al., "Scaling Deep Contrastive Learning
+        Batch Size under Memory Limited Setup"): the JEPA/SIGReg/triplet losses
+        are global statistics over the *whole* embedding pool, so they can't be
+        computed independently per chunk — but the loss's gradient w.r.t. each
+        row's embedding CAN be computed cheaply once the full (N, d) embedding
+        tensor is assembled (d is tiny vs. activation memory). Three passes:
+          1. Forward each chunk (grad enabled) to get its embeddings, then
+             immediately detach+clone into a fresh leaf tensor and let that
+             chunk's transformer activation graph be freed before processing
+             the next chunk.
+          2. Concatenate the detached per-chunk leaves into the full (N, d)
+             tensor, run the actual loss function on it (cheap — no transformer
+             involved), and call .backward(). This populates `.grad` on each
+             detached per-chunk leaf with exactly the gradient the full-batch
+             loss would have produced for that chunk's rows.
+          3. Re-forward each chunk (grad enabled, same inputs) and backward
+             using that cached `.grad` as the upstream gradient — this is the
+             ONLY pass that touches model parameters, and it only ever holds
+             one chunk's activations at a time. The per-chunk `logits_anchor`
+             is included in this same backward call (see `_extract_embeddings`)
+             so FSDP1's root-module post-backward hook still fires correctly
+             for every chunk.
+
+        Trades 2x forward compute (each chunk's transformer forward runs twice:
+        once to cache embeddings, once for the real backward) for activation
+        memory bounded by `micro_bs` rows instead of N rows — exact, not an
+        approximation, since the loss is computed once on the full pool.
+
+        Returns the metrics dict from `loss_fn`; backward is a side effect, the
+        caller must still call `engine.optimizer_step()` afterward.
+        """
+        N = ids.shape[0]
+        cfg = self.jepa_cfg
+
+        if N <= micro_bs:
+            joint_emb, logits_anchor = self._extract_embeddings(
+                ids, mask, lengths, use_ema=False, requires_grad=True,
+                predictor_k=predictor_k, predictor_token_id=cfg.predictor_token_id,
+            )
+            loss, metrics = loss_fn(joint_emb)
+            (alpha * loss + logits_anchor).backward()
+            return metrics
+
+        bounds = [(s, min(s + micro_bs, N)) for s in range(0, N, micro_bs)]
+
+        # Pass 1: cache detached per-chunk embeddings (each chunk's forward
+        # graph is freed once its embedding is detached and we move on).
+        cached = []
+        for start, end in bounds:
+            chunk_emb, _ = self._extract_embeddings(
+                ids[start:end], mask[start:end], lengths[start:end], use_ema=False, requires_grad=True,
+                predictor_k=predictor_k[start:end], predictor_token_id=cfg.predictor_token_id,
+            )
+            cached.append(chunk_emb.detach().clone().requires_grad_(True))
+
+        # Pass 2: compute the real loss on the full assembled pool, backward
+        # into the cached per-chunk leaves only (cheap — no transformer graph).
+        joint_emb_cached = torch.cat(cached, dim=0)
+        loss, metrics = loss_fn(joint_emb_cached)
+        (alpha * loss).backward()
+
+        # Pass 3: re-forward each chunk live and backprop the cached gradient
+        # through it into the model parameters, one chunk's activations at a time.
+        for (start, end), cached_chunk in zip(bounds, cached):
+            chunk_emb_live, chunk_logits_anchor = self._extract_embeddings(
+                ids[start:end], mask[start:end], lengths[start:end], use_ema=False, requires_grad=True,
+                predictor_k=predictor_k[start:end], predictor_token_id=cfg.predictor_token_id,
+            )
+            torch.autograd.backward(
+                [chunk_emb_live, chunk_logits_anchor],
+                [cached_chunk.grad, torch.ones((), device=chunk_logits_anchor.device, dtype=chunk_logits_anchor.dtype)],
+            )
+
+        return metrics
 
     # --------------------------------------------------------- JEPA update ---
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -391,7 +524,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
-        if self.jepa_cfg.loss_type in ("llm-jepa-loss", "jepa-triplet-loss") and self.jepa_cfg.predictor_k > 0:
+        if self.jepa_cfg.loss_type in ("llm-jepa-loss", "jepa-triplet-loss", "jepa-separation-loss") and self.jepa_cfg.predictor_k > 0:
             assert self.jepa_cfg.predictor_token_id >= 0, (
                 "predictor_k > 0 requires a resolved predictor_token_id; "
                 "JEPARayPPOTrainer.init_workers() should have set this before jepa_init()"
@@ -408,7 +541,28 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         engine = self.actor.engine
         cfg = self.jepa_cfg
         use_llm_jepa = cfg.loss_type == "llm-jepa-loss"
-        use_triplet = cfg.loss_type == "jepa-triplet-loss"
+        use_separation = cfg.loss_type == "jepa-separation-loss"
+        # Both triplet and separation share the same 3-view (cot/code/wrong)
+        # joint-forward path; they differ only in the loss fn + SIGReg pool.
+        use_triplet = cfg.loss_type in ("jepa-triplet-loss", "jepa-separation-loss")
+
+        # Bounds peak activation memory during the joint forward+backward to
+        # roughly `micro_bs` rows instead of the full joint batch (which can be
+        # up to 3 views x train_batch_size rows in triplet mode) — see
+        # `_embed_chunked_with_backward`'s docstring for the OOM this fixes.
+        micro_bs = max(1, cfg.embed_micro_batch_size)
+
+        # Linear alpha warmup: ramps the EFFECTIVE alpha from 0 -> cfg.alpha
+        # over cfg.alpha_warmup_steps JEPA-update calls (disabled when 0, the
+        # default — full alpha from the first call, matching prior behavior).
+        # `global_step` is set by ray_trainer.py on the input TensorDict;
+        # falls back to "no warmup" (full alpha) if absent for any reason.
+        if cfg.alpha_warmup_steps > 0:
+            default_step = torch.tensor([float(cfg.alpha_warmup_steps)])
+            step = float(data.get("global_step", default_step)[0].item())
+            alpha = cfg.alpha * min(1.0, step / cfg.alpha_warmup_steps)
+        else:
+            alpha = cfg.alpha
 
         with engine.train_mode():
             engine.optimizer_zero_grad()
@@ -442,47 +596,60 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 joint_ids, joint_mask = self._pad_concat_batches(groups)
                 joint_lengths = torch.cat(lengths, dim=0)
 
-                joint_emb, logits_anchor = self._extract_embeddings(
-                    joint_ids,
-                    joint_mask,
-                    joint_lengths,
-                    use_ema=False,
-                    requires_grad=True,
-                    predictor_k=joint_predictor_k,
-                    predictor_token_id=cfg.predictor_token_id,
-                )
-                enc_q_cot = joint_emb[:n_cot]
-                enc_a_code = joint_emb[n_cot:n_cot + n_code]
-                if n_wrong > 0:
-                    enc_code_wrong = joint_emb[n_cot + n_code:]
-                else:
-                    enc_code_wrong = joint_emb.new_zeros((0, joint_emb.shape[-1]))
+                def _triplet_loss_fn(joint_emb, _n_cot=n_cot, _n_code=n_code, _n_wrong=n_wrong):
+                    enc_q_cot = joint_emb[:_n_cot]
+                    enc_a_code = joint_emb[_n_cot:_n_cot + _n_code]
+                    if _n_wrong > 0:
+                        enc_code_wrong = joint_emb[_n_cot + _n_code:]
+                    else:
+                        enc_code_wrong = joint_emb.new_zeros((0, joint_emb.shape[-1]))
+                    if use_separation:
+                        # jepa-separation-loss: e^w is INCLUDED in the SIGReg pool
+                        # (it must not collapse), and the negative signal is the
+                        # unweighted correctness-separation hinge L_sep, not a
+                        # weighted triplet — see core_algos.llm_jepa_separation_loss.
+                        all_pool = torch.cat([enc_q_cot, enc_a_code, enc_code_wrong], dim=0)
+                        return llm_jepa_separation_loss(
+                            pred_text=enc_q_cot,
+                            enc_code_correct=enc_a_code,
+                            enc_code_wrong=enc_code_wrong,
+                            all_pool=all_pool,
+                            sep_margin=cfg.separation_margin,
+                            sep_w=cfg.separation_w,
+                            lambda_=cfg.triplet_sigreg_lambda,
+                            M=cfg.n_projections,
+                            t_min=cfg.t_min,
+                            t_max=cfg.t_max,
+                            s=cfg.epps_pulley_s,
+                        )
+                    # SIGReg pool excludes e^w (it's deliberately displaced by the
+                    # triplet term — see core_algos.llm_jepa_triplet_loss docstring).
+                    all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
+                    return llm_jepa_triplet_loss(
+                        pred_text=enc_q_cot,
+                        enc_code_correct=enc_a_code,
+                        enc_code_wrong=enc_code_wrong,
+                        all_pool=all_pool,
+                        margin=cfg.triplet_margin,
+                        w_tri=cfg.triplet_w,
+                        lambda_=cfg.triplet_sigreg_lambda,
+                        M=cfg.n_projections,
+                        t_min=cfg.t_min,
+                        t_max=cfg.t_max,
+                        s=cfg.epps_pulley_s,
+                    )
 
-                # SIGReg pool excludes e^w (it's deliberately displaced by the
-                # triplet term — see core_algos.llm_jepa_triplet_loss docstring).
-                all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
-                loss, jepa_metrics = llm_jepa_triplet_loss(
-                    pred_text=enc_q_cot,
-                    enc_code_correct=enc_a_code,
-                    enc_code_wrong=enc_code_wrong,
-                    all_pool=all_pool,
-                    margin=cfg.triplet_margin,
-                    w_tri=cfg.triplet_w,
-                    lambda_=cfg.triplet_sigreg_lambda,
-                    M=cfg.n_projections,
-                    t_min=cfg.t_min,
-                    t_max=cfg.t_max,
-                    s=cfg.epps_pulley_s,
+                jepa_metrics = self._embed_chunked_with_backward(
+                    joint_ids, joint_mask, joint_lengths, joint_predictor_k, _triplet_loss_fn, micro_bs, alpha,
                 )
             elif use_llm_jepa:
                 # -- LLM-JEPA (arXiv:2509.14252), literal symmetric architecture:
                 # ONE live encoder for both views, no EMA/target network, no
                 # stop-gradient — gradient flows through both Enc(Text)=
                 # Pred(...) and Enc(Code). CoT and Code rows are packed into a
-                # SINGLE joint batch and run through ONE forward call so FSDP1
-                # still sees exactly one forward per backward; only the CoT
-                # rows get `predictor_k` tied-weight predictor tokens appended
-                # (k=0 -> Pred(x) = x, per the paper §3.1).
+                # SINGLE joint batch; only the CoT rows get `predictor_k`
+                # tied-weight predictor tokens appended (k=0 -> Pred(x) = x,
+                # per the paper §3.1).
                 n_cot = data["cot_input_ids"].shape[0]
                 n_code = data["code_input_ids"].shape[0]
                 joint_ids, joint_mask = self._pad_concat_batch(
@@ -492,75 +659,80 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 joint_lengths = torch.cat([data["cot_lengths"], data["code_lengths"]], dim=0)
                 joint_predictor_k = [cfg.predictor_k] * n_cot + [0] * n_code
 
-                joint_emb, logits_anchor = self._extract_embeddings(
-                    joint_ids,
-                    joint_mask,
-                    joint_lengths,
-                    use_ema=False,
-                    requires_grad=True,
-                    predictor_k=joint_predictor_k,
-                    predictor_token_id=cfg.predictor_token_id,
-                )
-                enc_q_cot = joint_emb[:n_cot]
-                enc_a_code = joint_emb[n_cot:]
+                def _llm_jepa_loss_fn(joint_emb, _n_cot=n_cot):
+                    enc_q_cot = joint_emb[:_n_cot]
+                    enc_a_code = joint_emb[_n_cot:]
+                    # No .detach() on either view — both contribute gradient,
+                    # matching the paper's no-stop-gradient design.
+                    all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
+                    return llm_jepa_loss(
+                        pred_text=enc_q_cot,
+                        enc_code=enc_a_code,
+                        all_embeddings=all_pool,
+                        lambda_=cfg.sigreg_lambda,
+                        M=cfg.n_projections,
+                        t_min=cfg.t_min,
+                        t_max=cfg.t_max,
+                        s=cfg.epps_pulley_s,
+                    )
 
-                # No .detach() on either view — both contribute gradient,
-                # matching the paper's no-stop-gradient design.
-                all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
-                loss, jepa_metrics = llm_jepa_loss(
-                    pred_text=enc_q_cot,
-                    enc_code=enc_a_code,
-                    all_embeddings=all_pool,
-                    lambda_=cfg.sigreg_lambda,
-                    M=cfg.n_projections,
-                    t_min=cfg.t_min,
-                    t_max=cfg.t_max,
-                    s=cfg.epps_pulley_s,
+                jepa_metrics = self._embed_chunked_with_backward(
+                    joint_ids, joint_mask, joint_lengths, joint_predictor_k, _llm_jepa_loss_fn, micro_bs, alpha,
                 )
             else:
                 # -- LeJEPA (default, unchanged): live CoT encoder + EMA Code
                 # target encoder, two separate forwards (Code pass is
                 # no_grad so it never enters the autograd/FSDP1 hook graph).
-                enc_q_cot, logits_anchor = self._extract_embeddings(
-                    data["cot_input_ids"],
-                    data["cot_attn_mask"],
-                    data["cot_lengths"],
-                    use_ema=False,
-                    requires_grad=True,
-                )
-                enc_a_code, _ = self._extract_embeddings(
-                    data["code_input_ids"],
-                    data["code_attn_mask"],
-                    data["code_lengths"],
-                    use_ema=True,
-                    requires_grad=False,
-                )
-                all_pool = torch.cat([enc_q_cot, enc_a_code.detach()], dim=0)
-                loss, jepa_metrics = lejepa_loss(
-                    enc_q_cot=enc_q_cot,
-                    enc_a_code=enc_a_code.detach(),
-                    all_embeddings=all_pool,
-                    lambda_=cfg.sigreg_lambda,
-                    M=cfg.n_projections,
-                    t_min=cfg.t_min,
-                    t_max=cfg.t_max,
-                    s=cfg.epps_pulley_s,
+                n_cot = data["cot_input_ids"].shape[0]
+                enc_a_code = self._embed_chunked_no_grad(
+                    data["code_input_ids"], data["code_attn_mask"], data["code_lengths"],
+                    use_ema=True, micro_bs=micro_bs,
                 )
 
-            # logits_anchor (= 0 * logits_scalar) ties backward to the root FSDP
-            # module's actual output so its post-backward hook fires correctly.
-            scaled_loss = cfg.alpha * loss + logits_anchor
-            scaled_loss.backward()
-            grad_norm = engine.optimizer_step()
+                def _lejepa_loss_fn(enc_q_cot, _enc_a_code=enc_a_code):
+                    all_pool = torch.cat([enc_q_cot, _enc_a_code.detach()], dim=0)
+                    return lejepa_loss(
+                        enc_q_cot=enc_q_cot,
+                        enc_a_code=_enc_a_code.detach(),
+                        all_embeddings=all_pool,
+                        lambda_=cfg.sigreg_lambda,
+                        M=cfg.n_projections,
+                        t_min=cfg.t_min,
+                        t_max=cfg.t_max,
+                        s=cfg.epps_pulley_s,
+                    )
+
+                jepa_metrics = self._embed_chunked_with_backward(
+                    data["cot_input_ids"], data["cot_attn_mask"], data["cot_lengths"],
+                    [0] * n_cot, _lejepa_loss_fn, micro_bs, alpha,
+                )
+
+            grad_norm = engine.optimizer_step(clip_grad_override=self.jepa_cfg.max_grad_norm)
 
         # Update EMA after optimizer step
         self._sync_ema()
 
+        # The joint-forward batch size varies per step (triplet-eligible row count,
+        # response lengths), so PyTorch's caching allocator's reserved high-water-mark
+        # creeps upward across steps. checkpoint_manager.update_weights() (called next,
+        # outside this RPC) resumes vLLM's KV-cache pool with expandable_segments
+        # deliberately disabled (see engine_workers.py's set_expandable_segments(False)
+        # bracket around weight sync) — if this process is still holding onto a large
+        # reserved-but-unused block from this step's forward/backward, vLLM's resume can
+        # OOM even though the actual *allocated* memory would fit. Release it now.
+        aggressive_empty_cache(force_sync=True)
+
+        # jepa_metrics already carries the per-mode total under its own key
+        # ("jepa/lejepa_loss" for lejepa, "jepa/llm_jepa_loss" for both
+        # llm-jepa-loss and jepa-triplet-loss) — read it back instead of
+        # keeping a `loss` tensor reference, since the actual loss tensor now
+        # lives inside the (possibly micro-batched) loss_fn closures above.
+        _total_loss_value = jepa_metrics.get("jepa/lejepa_loss", jepa_metrics.get("jepa/llm_jepa_loss", 0.0))
         out = {
             # Generic key valid for either loss_type; mode-specific totals
             # ("jepa/lejepa_loss" / "jepa/llm_jepa_loss") are also present via
             # jepa_metrics below.
-            "jepa/total_loss": torch.tensor(loss.detach().item()),
+            "jepa/total_loss": torch.tensor(float(_total_loss_value)),
             "jepa/n_valid_pairs": torch.tensor(float(n_pairs)),
             "jepa/skipped": torch.tensor(0.0),
             "jepa/grad_norm": torch.tensor(float(grad_norm) if grad_norm is not None else 0.0),

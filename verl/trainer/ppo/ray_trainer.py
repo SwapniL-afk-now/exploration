@@ -1168,7 +1168,9 @@ class RayPPOTrainer:
                 f"avg acc over {best_ckpt_sources} = {avg_acc:.4f}"
             )
             best_local_path = os.path.join(self.config.trainer.default_local_dir, "best", "actor")
-            self.actor_rollout_wg.save_checkpoint(best_local_path, None, self.global_steps, max_ckpt_to_keep=1)
+            self.actor_rollout_wg.save_checkpoint(
+                best_local_path, None, self.global_steps, max_ckpt_to_keep=1, tag="best"
+            )
             with open(os.path.join(self.config.trainer.default_local_dir, "best", "best_val_acc.txt"), "w") as f:
                 f.write(f"step={self.global_steps} avg_acc={avg_acc:.6f} sources={best_ckpt_sources}\n")
 

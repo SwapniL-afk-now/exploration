@@ -66,42 +66,42 @@ class TestCheckpointCleanupLogic:
         Regression test: max_ckpt_to_keep=1 must NOT delete existing checkpoint before save.
         """
         ckpt_100 = self._create_checkpoint_dir(100)
-        manager.previous_saved_paths = [ckpt_100]
+        manager.previous_saved_paths = {"default": [ckpt_100]}
 
         manager.ensure_checkpoint_capacity(max_ckpt_to_keep=1)
 
         assert os.path.exists(ckpt_100), "Bug: checkpoint deleted before save!"
-        assert manager.previous_saved_paths == [ckpt_100]
+        assert manager.previous_saved_paths["default"] == [ckpt_100]
 
     def test_max_ckpt_1_deletes_old_after_save(self, manager):
         """After save succeeds, old checkpoint should be deleted."""
         ckpt_100 = self._create_checkpoint_dir(100)
-        manager.previous_saved_paths = [ckpt_100]
+        manager.previous_saved_paths = {"default": [ckpt_100]}
 
         ckpt_200 = self._create_checkpoint_dir(200)
         manager.register_checkpoint(ckpt_200, max_ckpt_to_keep=1)
 
         assert not os.path.exists(ckpt_100)
         assert os.path.exists(ckpt_200)
-        assert manager.previous_saved_paths == [ckpt_200]
+        assert manager.previous_saved_paths["default"] == [ckpt_200]
 
     def test_max_ckpt_2_keeps_one_before_save(self, manager):
         """With max_ckpt_to_keep=2, pre-save cleanup keeps 1 checkpoint."""
         ckpt_100 = self._create_checkpoint_dir(100)
         ckpt_200 = self._create_checkpoint_dir(200)
-        manager.previous_saved_paths = [ckpt_100, ckpt_200]
+        manager.previous_saved_paths = {"default": [ckpt_100, ckpt_200]}
 
         manager.ensure_checkpoint_capacity(max_ckpt_to_keep=2)
 
         assert not os.path.exists(ckpt_100)
         assert os.path.exists(ckpt_200)
-        assert len(manager.previous_saved_paths) == 1
+        assert len(manager.previous_saved_paths["default"]) == 1
 
     def test_max_ckpt_0_keeps_all(self, manager):
         """max_ckpt_to_keep=0 means unlimited - no deletions."""
         ckpt_100 = self._create_checkpoint_dir(100)
         ckpt_200 = self._create_checkpoint_dir(200)
-        manager.previous_saved_paths = [ckpt_100, ckpt_200]
+        manager.previous_saved_paths = {"default": [ckpt_100, ckpt_200]}
 
         manager.ensure_checkpoint_capacity(max_ckpt_to_keep=0)
         ckpt_300 = self._create_checkpoint_dir(300)
@@ -110,7 +110,7 @@ class TestCheckpointCleanupLogic:
         assert os.path.exists(ckpt_100)
         assert os.path.exists(ckpt_200)
         assert os.path.exists(ckpt_300)
-        assert len(manager.previous_saved_paths) == 3
+        assert len(manager.previous_saved_paths["default"]) == 3
 
     def test_full_save_cycle_max_ckpt_1(self, manager):
         """Simulate multiple save cycles with max_ckpt_to_keep=1."""
@@ -118,7 +118,7 @@ class TestCheckpointCleanupLogic:
         manager.ensure_checkpoint_capacity(1)
         ckpt_100 = self._create_checkpoint_dir(100)
         manager.register_checkpoint(ckpt_100, 1)
-        assert manager.previous_saved_paths == [ckpt_100]
+        assert manager.previous_saved_paths["default"] == [ckpt_100]
 
         # Second save - existing checkpoint must survive pre-save
         manager.ensure_checkpoint_capacity(1)
@@ -127,7 +127,7 @@ class TestCheckpointCleanupLogic:
         ckpt_200 = self._create_checkpoint_dir(200)
         manager.register_checkpoint(ckpt_200, 1)
         assert not os.path.exists(ckpt_100)
-        assert manager.previous_saved_paths == [ckpt_200]
+        assert manager.previous_saved_paths["default"] == [ckpt_200]
 
         # Third save
         manager.ensure_checkpoint_capacity(1)
@@ -136,4 +136,76 @@ class TestCheckpointCleanupLogic:
         ckpt_300 = self._create_checkpoint_dir(300)
         manager.register_checkpoint(ckpt_300, 1)
         assert not os.path.exists(ckpt_200)
-        assert manager.previous_saved_paths == [ckpt_300]
+        assert manager.previous_saved_paths["default"] == [ckpt_300]
+
+    def test_default_tag_backward_compatible(self, manager):
+        """Omitting `tag` entirely must behave exactly like the old single-list design."""
+        manager.ensure_checkpoint_capacity(1)
+        ckpt_100 = self._create_checkpoint_dir(100)
+        manager.register_checkpoint(ckpt_100, 1)
+        assert manager.previous_saved_paths == {"default": [ckpt_100]}
+
+        manager.ensure_checkpoint_capacity(1)
+        ckpt_200 = self._create_checkpoint_dir(200)
+        manager.register_checkpoint(ckpt_200, 1)
+        assert not os.path.exists(ckpt_100)
+        assert manager.previous_saved_paths == {"default": [ckpt_200]}
+
+    def test_tags_are_independent_fifos(self, manager):
+        """
+        Regression test for the "best checkpoint deleted by periodic rotation" bug:
+        a checkpoint saved under a different tag must survive rotation of the
+        "default" tag's lineage, and vice versa.
+        """
+        ckpt_default_1 = self._create_checkpoint_dir(100)
+        manager.register_checkpoint(ckpt_default_1, max_ckpt_to_keep=1, tag="default")
+
+        ckpt_best = self._create_checkpoint_dir(101)
+        manager.register_checkpoint(ckpt_best, max_ckpt_to_keep=1, tag="best")
+
+        # Best checkpoint must not have evicted the default-tag checkpoint (different lineage).
+        assert os.path.exists(ckpt_default_1)
+        assert os.path.exists(ckpt_best)
+
+        ckpt_default_2 = self._create_checkpoint_dir(120)
+        manager.ensure_checkpoint_capacity(max_ckpt_to_keep=1, tag="default")
+        manager.register_checkpoint(ckpt_default_2, max_ckpt_to_keep=1, tag="default")
+
+        # The new "default" save should evict the OLD "default" checkpoint...
+        assert not os.path.exists(ckpt_default_1)
+        assert os.path.exists(ckpt_default_2)
+        # ...but must never touch the "best" checkpoint, which lives in its own lineage.
+        assert os.path.exists(ckpt_best)
+        assert manager.previous_saved_paths["best"] == [ckpt_best]
+        assert manager.previous_saved_paths["default"] == [ckpt_default_2]
+
+    def test_constant_path_overwrite_is_not_self_evicted(self, manager):
+        """
+        Regression test for the "best checkpoint deleted in the same step it is
+        saved" bug. The best checkpoint always writes to the SAME path
+        (".../best/actor", no global_step), and is re-registered every time
+        accuracy improves. Re-registering an identical path must be treated as an
+        in-place overwrite, NOT a new FIFO entry — otherwise rotation immediately
+        evicts "the oldest", which is the directory that was just (re)written,
+        leaving the tracked path pointing at a deleted directory.
+        """
+        best_path = os.path.join(self.test_dir, "best", "actor")
+        os.makedirs(best_path, exist_ok=True)
+        with open(os.path.join(best_path, "model.txt"), "w") as f:
+            f.write("step=0")
+
+        # First best save (e.g. step 0).
+        manager.ensure_checkpoint_capacity(max_ckpt_to_keep=1, tag="best")
+        manager.register_checkpoint(best_path, max_ckpt_to_keep=1, tag="best")
+        assert os.path.exists(best_path)
+
+        # Second best save to the SAME path (e.g. step 10, accuracy improved). The
+        # FSDP save overwrites best_path in place; re-register must not delete it.
+        with open(os.path.join(best_path, "model.txt"), "w") as f:
+            f.write("step=10")
+        manager.ensure_checkpoint_capacity(max_ckpt_to_keep=1, tag="best")
+        manager.register_checkpoint(best_path, max_ckpt_to_keep=1, tag="best")
+
+        assert os.path.exists(best_path), "Bug: best checkpoint deleted in the step it was saved!"
+        assert os.path.exists(os.path.join(best_path, "model.txt"))
+        assert manager.previous_saved_paths["best"] == [best_path]
