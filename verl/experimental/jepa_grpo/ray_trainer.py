@@ -25,6 +25,7 @@ on the actor worker itself so gradients are never shipped over Ray.
 from __future__ import annotations
 
 import uuid
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -58,6 +59,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.jepa_cfg = JEPARayConfig.from_config(self.config.get("jepa", {}))
+        self.jepa_cfg.validate(self.config.actor_rollout_ref.rollout.n)
 
     # ------------------------------------------------------ worker setup ----
     def init_workers(self):
@@ -150,58 +152,74 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 return line
         return response.strip()
 
+    @staticmethod
+    def _group_rows_by_uid(
+        uids: np.ndarray, view_tags: np.ndarray, rew: torch.Tensor
+    ) -> tuple[dict, dict, list]:
+        """Group row indices by (uid, view), preserving first-seen prompt order.
+
+        Replaces the old `flat_idx = p_idx * rollout_n + g` stride arithmetic,
+        which assumed two SEPARATE, fixed-stride rollout_n-sized batches. Now
+        that cot+code rows live in one combined batch (built via
+        `DataProto.concat`, not positional interleaving — see fit()), the
+        only thing that ties a prompt's rows together is a shared `uid`.
+
+        Returns (cot_by_uid, code_by_uid, valid_uids) where valid_uids is the
+        ordered list of uids with >=1 correct cot row AND >=1 correct code row.
+        """
+        cot_by_uid: dict = defaultdict(list)
+        code_by_uid: dict = defaultdict(list)
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v == "cot":
+                cot_by_uid[u].append(i)
+            elif v == "code":
+                code_by_uid[u].append(i)
+
+        valid_uids = []
+        for u in dict.fromkeys(uids):  # dedup, preserves first-seen order
+            cot_idxs = cot_by_uid.get(u, [])
+            code_idxs = code_by_uid.get(u, [])
+            if cot_idxs and code_idxs and (rew[cot_idxs] > 0).any() and (rew[code_idxs] > 0).any():
+                valid_uids.append(u)
+        return cot_by_uid, code_by_uid, valid_uids
+
     def _build_jepa_batch(
         self,
-        batch_cot: DataProto,
-        batch_code: DataProto,
-        reward_tensor_cot: torch.Tensor,
-        reward_tensor_code: torch.Tensor,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
     ) -> DataProto | None:
-        """Build per-prompt JEPA pairs from CoT and Code rollout batches.
+        """Build per-prompt JEPA pairs from a combined CoT+Code rollout batch.
 
         Only prompts where at least one CoT rollout AND at least one Code
         rollout are correct are included.
 
-        The CoT view embedding uses the CoT PROMPT tokens (same for all n
+        The CoT view embedding uses the CoT PROMPT tokens (same for all
         rollouts of the same prompt).  The Code view embedding uses the full
         Code sequence (prompt + first correct response).
 
         Returns None if fewer than min_valid_pairs pairs exist.
         """
-        rollout_n = self.config.actor_rollout_ref.rollout.n
-        n_prompts = len(batch_cot) // rollout_n
+        uids = batch.non_tensor_batch["uid"]
+        rew = reward_tensor.sum(dim=-1)  # (B,) summed over token dim
 
-        # Rewards are (n_prompts * rollout_n,) — scalar per sequence
-        rew_cot = reward_tensor_cot.sum(dim=-1)   # (B,) summed over token dim
-        rew_code = reward_tensor_code.sum(dim=-1)
+        cot_by_uid, code_by_uid, valid_uids = self._group_rows_by_uid(uids, view_tags, rew)
 
-        # Reshape to (n_prompts, rollout_n)
-        rew_cot_grouped = rew_cot.view(n_prompts, rollout_n)    # (P, G)
-        cot_any_correct = (rew_cot_grouped > 0).any(dim=-1)     # (P,)
-
-        # Code batch may also have rollout_n samples per prompt
-        code_rollout_n = len(batch_code) // n_prompts
-        rew_code_grouped = rew_code.view(n_prompts, code_rollout_n)  # (P, G_code)
-        code_any_correct = (rew_code_grouped > 0).any(dim=-1)        # (P,)
-
-        valid_mask = cot_any_correct & code_any_correct  # (P,)
-        valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
-
-        if len(valid_indices) < self.jepa_cfg.min_valid_pairs:
+        if len(valid_uids) < self.jepa_cfg.min_valid_pairs:
             return None
 
         # -- CoT view: encode the CoT PROMPT tokens of each valid prompt --
-        # Take the first rollout's input_ids up to the prompt (response_mask tells us)
-        cot_input_ids = batch_cot.batch["input_ids"]        # (B, L)
-        response_mask = batch_cot.batch.get("response_mask", None)
+        # Take the first cot rollout's input_ids up to the prompt (response_mask tells us)
+        cot_input_ids = batch.batch["input_ids"]        # (B, L)
+        response_mask = batch.batch.get("response_mask", None)
 
         cot_prompt_ids_list = []
         cot_prompt_mask_list = []
         cot_prompt_lengths = []
-        for p_idx in valid_indices.tolist():
-            flat_idx = p_idx * rollout_n  # first rollout for this prompt
+        for u in valid_uids:
+            flat_idx = cot_by_uid[u][0]  # first cot rollout for this prompt
             ids = cot_input_ids[flat_idx]  # (L,)
-            attn = batch_cot.batch["attention_mask"][flat_idx]  # (L,)
+            attn = batch.batch["attention_mask"][flat_idx]  # (L,)
 
             if response_mask is not None:
                 # Prompt = positions where response_mask == 0 AND attention_mask == 1
@@ -229,24 +247,23 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         ])
 
         # -- Code view: full sequence (prompt + first correct response) --
-        code_input_ids = batch_code.batch["input_ids"]     # (B_code, L_code)
-        code_attn_mask = batch_code.batch["attention_mask"]
+        code_input_ids = batch.batch["input_ids"]     # same combined batch
+        code_attn_mask = batch.batch["attention_mask"]
 
         code_ids_list = []
         code_mask_list = []
         code_lengths = []
-        for p_idx in valid_indices.tolist():
+        for u in valid_uids:
             # Find first correct code rollout for this prompt
             first_correct = None
-            for g in range(code_rollout_n):
-                if rew_code_grouped[p_idx, g] > 0:
-                    first_correct = g
+            for flat_idx in code_by_uid[u]:
+                if rew[flat_idx] > 0:
+                    first_correct = flat_idx
                     break
             if first_correct is None:
-                first_correct = 0  # fallback (shouldn't happen)
-            flat_idx = p_idx * code_rollout_n + first_correct
-            ids = code_input_ids[flat_idx]
-            attn = code_attn_mask[flat_idx]
+                first_correct = code_by_uid[u][0]  # fallback (shouldn't happen)
+            ids = code_input_ids[first_correct]
+            attn = code_attn_mask[first_correct]
             code_ids_list.append(ids)
             code_mask_list.append(attn)
             code_lengths.append(int(attn.sum()))
@@ -274,10 +291,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
     # ------------------------------------ JEPA triplet batch construction ---
     def _build_jepa_batch_triplet(
         self,
-        batch_cot: DataProto,
-        batch_code: DataProto,
-        reward_tensor_cot: torch.Tensor,
-        reward_tensor_code: torch.Tensor,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
     ) -> DataProto | None:
         """Build the jepa-triplet-loss batch: full correct-CoT response, first
         correct code response, and (when available) a "clean wrong" code
@@ -303,56 +319,44 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         code_correct) pairs exist. T == 0 (no triplet-eligible prompts) is
         allowed; the loss function handles it.
         """
-        rollout_n = self.config.actor_rollout_ref.rollout.n
-        n_prompts = len(batch_cot) // rollout_n
+        uids = batch.non_tensor_batch["uid"]
+        rew = reward_tensor.sum(dim=-1)
 
-        rew_cot = reward_tensor_cot.sum(dim=-1)
-        rew_code = reward_tensor_code.sum(dim=-1)
+        cot_by_uid, code_by_uid, valid_uids = self._group_rows_by_uid(uids, view_tags, rew)
 
-        rew_cot_grouped = rew_cot.view(n_prompts, rollout_n)
-        cot_any_correct = (rew_cot_grouped > 0).any(dim=-1)
-
-        code_rollout_n = len(batch_code) // n_prompts
-        rew_code_grouped = rew_code.view(n_prompts, code_rollout_n)
-        code_any_correct = (rew_code_grouped > 0).any(dim=-1)
-
-        valid_mask = cot_any_correct & code_any_correct
-        valid_indices_all = valid_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
-
-        if len(valid_indices_all) < self.jepa_cfg.min_valid_pairs:
+        if len(valid_uids) < self.jepa_cfg.min_valid_pairs:
             return None
 
-        cot_input_ids = batch_cot.batch["input_ids"]
-        cot_attn_mask = batch_cot.batch["attention_mask"]
-        code_input_ids = batch_code.batch["input_ids"]
-        code_attn_mask = batch_code.batch["attention_mask"]
-        code_response_mask = batch_code.batch.get("response_mask", None)
-        reward_models = batch_code.non_tensor_batch.get("reward_model", [{}] * len(batch_code))
-        data_sources = batch_code.non_tensor_batch.get("data_source", [None] * len(batch_code))
+        cot_input_ids = batch.batch["input_ids"]
+        cot_attn_mask = batch.batch["attention_mask"]
+        code_input_ids = batch.batch["input_ids"]
+        code_attn_mask = batch.batch["attention_mask"]
+        code_response_mask = batch.batch.get("response_mask", None)
+        reward_models = batch.non_tensor_batch.get("reward_model", [{}] * len(batch))
+        data_sources = batch.non_tensor_batch.get("data_source", [None] * len(batch))
 
         pad_id = self.tokenizer.pad_token_id or 0
 
         per_prompt = {}
         triplet_eligible, others = [], []
-        for p_idx in valid_indices_all:
+        for u in valid_uids:
             # First correct CoT rollout (full sequence), and a count of how
             # many CoT rollouts were correct (audit metric).
             first_correct_cot = None
             n_correct_cot = 0
-            for g in range(rollout_n):
-                if rew_cot_grouped[p_idx, g] > 0:
+            for flat_idx in cot_by_uid[u]:
+                if rew[flat_idx] > 0:
                     n_correct_cot += 1
                     if first_correct_cot is None:
-                        first_correct_cot = g
-            cot_flat_idx = p_idx * rollout_n + first_correct_cot
+                        first_correct_cot = flat_idx
+            cot_flat_idx = first_correct_cot
 
             # First correct code rollout (full sequence)
-            first_correct_code = None
-            for g in range(code_rollout_n):
-                if rew_code_grouped[p_idx, g] > 0:
-                    first_correct_code = g
+            code_flat_idx = None
+            for flat_idx in code_by_uid[u]:
+                if rew[flat_idx] > 0:
+                    code_flat_idx = flat_idx
                     break
-            code_flat_idx = p_idx * code_rollout_n + first_correct_code
 
             ground_truth = reward_models[code_flat_idx].get("ground_truth") if isinstance(
                 reward_models[code_flat_idx], dict
@@ -363,10 +367,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             # not correct. Filtered to definite-wrong BEFORE taking "first"
             # (never let a crash/parse-failure stand in as e^w).
             wrong_flat_idx = None
-            for g in range(code_rollout_n):
-                if rew_code_grouped[p_idx, g] > 0:
+            for cand_idx in code_by_uid[u]:
+                if rew[cand_idx] > 0:
                     continue
-                cand_idx = p_idx * code_rollout_n + g
                 if code_response_mask is not None:
                     # response_mask is only the trailing `response_length` slice of
                     # the full attention_mask (see compute_response_mask), not a
@@ -385,10 +388,10 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     wrong_flat_idx = cand_idx
                     break
 
-            per_prompt[p_idx] = (cot_flat_idx, code_flat_idx, wrong_flat_idx, n_correct_cot)
-            (triplet_eligible if wrong_flat_idx is not None else others).append(p_idx)
+            per_prompt[u] = (cot_flat_idx, code_flat_idx, wrong_flat_idx, n_correct_cot)
+            (triplet_eligible if wrong_flat_idx is not None else others).append(u)
 
-        ordered_indices = triplet_eligible + others   # T-prefix invariant
+        ordered_uids = triplet_eligible + others   # T-prefix invariant
         T = len(triplet_eligible)
 
         def _real_tokens(ids_tensor, mask_tensor, flat_idx):
@@ -401,8 +404,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         code_ids_list, code_lengths = [], []
         wrong_ids_list, wrong_lengths = [], []
         n_correct_cot_list = []
-        for p_idx in ordered_indices:
-            cot_flat_idx, code_flat_idx, wrong_flat_idx, n_correct_cot = per_prompt[p_idx]
+        for u in ordered_uids:
+            cot_flat_idx, code_flat_idx, wrong_flat_idx, n_correct_cot = per_prompt[u]
             ids, length = _real_tokens(cot_input_ids, cot_attn_mask, cot_flat_idx)
             cot_ids_list.append(ids)
             cot_lengths.append(length)
@@ -497,20 +500,51 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                # ── Step 1: CoT rollout ──────────────────────────────────
+                # ── Step 1: unified CoT + Code rollout ──────────────────
+                # Both views now contribute to the GRPO update below (the old
+                # code generated a SEPARATE rollout_n-sized Code batch later,
+                # whose reward only ever fed JEPA pairing — half the rollout
+                # compute never reached the policy gradient). GRPO's grouping
+                # is uid-based (compute_grpo_outcome_advantage groups by
+                # data.non_tensor_batch["uid"], not by position), so the cot
+                # and code sub-batches just need matching uids per prompt —
+                # no positional interleaving is required.
                 with simple_timer("cot_gen", timing_raw):
-                    gen_batch = self._get_gen_batch(batch)
-                    gen_batch.meta_info["global_steps"] = self.global_steps
                     rollout_n = self.config.actor_rollout_ref.rollout.n
-                    gen_batch_rep = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                    n_cot = self.jepa_cfg.n_cot
+                    n_code = self.jepa_cfg.n_code
 
-                    cot_gen_output = self.async_rollout_manager.generate_sequences(gen_batch_rep)
-                    batch = batch.repeat(repeat_times=rollout_n, interleave=True)
-                    batch = batch.union(cot_gen_output)
+                    sub_batches = []
+
+                    if n_cot > 0:
+                        gen_batch_cot = self._get_gen_batch(batch)
+                        gen_batch_cot.meta_info["global_steps"] = self.global_steps
+                        gen_batch_cot_rep = gen_batch_cot.repeat(repeat_times=n_cot, interleave=True)
+                        cot_gen_output = self.async_rollout_manager.generate_sequences(gen_batch_cot_rep)
+
+                        cot_sub = batch.repeat(repeat_times=n_cot, interleave=True)
+                        cot_sub = cot_sub.union(cot_gen_output)
+                        cot_sub.non_tensor_batch["view"] = np.array(["cot"] * len(cot_sub), dtype=object)
+                        sub_batches.append(cot_sub)
+
+                    if n_code > 0:
+                        code_gen_batch = self._tokenize_code_prompts(batch)  # batch is still un-repeated here
+                        code_gen_batch.meta_info["global_steps"] = self.global_steps
+                        code_gen_batch_rep = code_gen_batch.repeat(repeat_times=n_code, interleave=True)
+                        code_gen_output = self.async_rollout_manager.generate_sequences(code_gen_batch_rep)
+                        # AgentLoop echoes raw_prompt back into output; remove before union to avoid key collision
+                        code_gen_output.non_tensor_batch.pop("raw_prompt", None)
+
+                        code_sub = batch.repeat(repeat_times=n_code, interleave=True)
+                        code_sub = code_sub.union(code_gen_output)
+                        code_sub.non_tensor_batch["view"] = np.array(["code"] * len(code_sub), dtype=object)
+                        sub_batches.append(code_sub)
+
+                    batch = DataProto.concat(sub_batches)
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
-                # ── Step 2: CoT rewards & advantages ────────────────────
+                # ── Step 2: rewards & advantages (full cot+code batch) ──
                 with simple_timer("cot_reward_adv", timing_raw):
                     if self.use_rm and "rm_scores" not in batch.batch.keys():
                         batch = batch.union(self._compute_reward_colocate(batch))
@@ -547,44 +581,20 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     metrics.update(actor_metrics)
 
                 # ── Step 5: JEPA (if enabled) ────────────────────────────
+                # The code-framed rollouts already live in `batch` (tagged
+                # view=="code" in Step 1) and already received reward in
+                # Step 2 — no separate rollout/reward pass needed here
+                # anymore, only pair-building for the auxiliary loss.
+                view_tags = batch.non_tensor_batch["view"]
+                rew_scalar_all = reward_tensor.sum(dim=-1)
+                cot_mask_rows = (view_tags == "cot")
+                code_mask_rows = (view_tags == "code")
+
                 if self.jepa_cfg.enable:
-                    # 5a. Code-view rollout (wake rollout replicas first)
-                    with simple_timer("weight_sync_1", timing_raw):
-                        self.checkpoint_manager.update_weights(self.global_steps)
+                    metrics["jepa/n_cot"] = float(n_cot)
+                    metrics["jepa/n_code"] = float(n_code)
 
-                    with simple_timer("code_gen", timing_raw):
-                        code_gen_batch = self._tokenize_code_prompts(
-                            # Use un-repeated batch so prompts appear once
-                            DataProto(
-                                batch=batch.batch[:len(batch.batch) // rollout_n],
-                                non_tensor_batch={
-                                    k: v[:len(batch.batch) // rollout_n]
-                                    for k, v in batch.non_tensor_batch.items()
-                                },
-                                meta_info=batch.meta_info,
-                            )
-                        )
-                        code_gen_batch_rep = code_gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-                        code_gen_output = self.async_rollout_manager.generate_sequences(code_gen_batch_rep)
-                        # AgentLoop echoes raw_prompt back into output; remove before union to avoid key collision
-                        code_gen_output.non_tensor_batch.pop("raw_prompt", None)
-
-                        code_batch = code_gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-                        code_batch = code_batch.union(code_gen_output)
-                        if "response_mask" not in code_batch.batch.keys():
-                            code_batch.batch["response_mask"] = compute_response_mask(code_batch)
-
-                    # 5b. Code rewards (math match)
-                    with simple_timer("code_reward", timing_raw):
-                        if self.use_rm and "rm_scores" not in code_batch.batch.keys():
-                            code_batch = code_batch.union(self._compute_reward_colocate(code_batch))
-                        code_reward_tensor, _ = extract_reward(code_batch)
-
-                    # Sleep rollout before JEPA backward
-                    with simple_timer("sleep_replicas_2", timing_raw):
-                        self.checkpoint_manager.sleep_replicas()
-
-                    # 5c. Build JEPA pairs
+                    # Build JEPA pairs
                     with simple_timer("jepa_build_batch", timing_raw):
                         build_fn = (
                             self._build_jepa_batch_triplet
@@ -592,14 +602,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                             else self._build_jepa_batch
                         )
                         jepa_batch = build_fn(
-                            batch_cot=batch,
-                            batch_code=code_batch,
-                            reward_tensor_cot=reward_tensor,
-                            reward_tensor_code=code_reward_tensor,
+                            batch=batch,
+                            reward_tensor=reward_tensor,
+                            view_tags=view_tags,
                         )
 
                     if jepa_batch is not None:
-                        # 5d. JEPA update on worker (embedding extract + backward + EMA sync)
+                        # JEPA update on worker (embedding extract + backward + EMA sync)
                         with simple_timer("jepa_update", timing_raw):
                             jepa_td = jepa_batch.to_tensordict()
                             # Broadcast to match jepa_td's batch dim (TensorDict requires
@@ -621,19 +630,28 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         metrics["jepa/skipped"] = 1.0
                         metrics["jepa/n_valid_pairs"] = 0.0
 
-                    # Track code accuracy
-                    code_rew_scalar = code_reward_tensor.sum(dim=-1)
-                    metrics["code/pass_at_1"] = float((code_rew_scalar > 0).float().mean())
-                    metrics["code/avg_reward"] = float(code_rew_scalar.mean())
+                    # Sleep rollout before JEPA backward (no JEPA-only generation left to wait on,
+                    # but jepa_update is a separate worker RPC, same as before)
+                    with simple_timer("sleep_replicas_2", timing_raw):
+                        self.checkpoint_manager.sleep_replicas()
+
+                # Track code/cot accuracy (sliced from the single combined reward_tensor)
+                code_rew_scalar = rew_scalar_all[torch.from_numpy(code_mask_rows)]
+                metrics["code/pass_at_1"] = float((code_rew_scalar > 0).float().mean()) if len(code_rew_scalar) else 0.0
+                metrics["code/avg_reward"] = float(code_rew_scalar.mean()) if len(code_rew_scalar) else 0.0
 
                 # ── Step 6: Weight sync to rollout (wakes vLLM) ─────────
                 with simple_timer("weight_sync_2", timing_raw):
                     self.checkpoint_manager.update_weights(self.global_steps)
 
                 # ── CoT-based train metrics (rich grouped stats) ─────────
-                cot_rew_scalar = reward_tensor.sum(dim=-1)
-                metrics["cot/pass_at_1"] = float((cot_rew_scalar > 0).float().mean())
-                metrics["cot/avg_reward"] = float(cot_rew_scalar.mean())
+                cot_rew_scalar = rew_scalar_all[torch.from_numpy(cot_mask_rows)]
+                metrics["cot/pass_at_1"] = float((cot_rew_scalar > 0).float().mean()) if len(cot_rew_scalar) else 0.0
+                metrics["cot/avg_reward"] = float(cot_rew_scalar.mean()) if len(cot_rew_scalar) else 0.0
+                # NOTE: compute_data_metrics/_compute_train_comparison_metrics below now span
+                # the FULL combined (cot+code) batch, not cot-only as before this change — this
+                # is intended (both modalities now receive gradient), but means train/accuracy,
+                # response_length/* etc. will show a discontinuity at the cutover step in wandb.
                 metrics.update(compute_data_metrics(batch=batch, use_critic=False))
                 metrics.update(self._compute_train_comparison_metrics(batch))
                 metrics["train/global_step"] = self.global_steps

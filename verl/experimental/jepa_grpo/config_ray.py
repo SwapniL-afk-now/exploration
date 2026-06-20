@@ -31,6 +31,14 @@ class JEPARayConfig:
     """
 
     enable: bool = True
+    # Split of actor_rollout_ref.rollout.n completions per prompt between the
+    # CoT-framed and Code-framed system prompts. Both subsets contribute to
+    # the GRPO policy-gradient update (the old behavior generated a SEPARATE,
+    # full rollout_n-sized Code batch on top of the CoT one, whose reward was
+    # used only for JEPA pairing — half the rollout compute never reached the
+    # policy gradient). n_cot + n_code must equal rollout_n; see validate().
+    n_cot: int = 4
+    n_code: int = 4
     alpha: float = 0.1
     # Linearly ramp the EFFECTIVE alpha used in jepa_update from 0 -> `alpha`
     # over this many JEPA-update steps (0 = disabled, full `alpha` from step
@@ -103,6 +111,26 @@ class JEPARayConfig:
             return cls()
         merged = OmegaConf.merge(OmegaConf.structured(cls), OmegaConf.create(config))
         return OmegaConf.to_object(merged)
+
+    def validate(self, rollout_n: int) -> None:
+        """Cross-check the cot/code split against actor_rollout_ref.rollout.n.
+
+        Called explicitly by JEPARayPPOTrainer.__init__ (this dataclass has no
+        visibility into the sibling `actor_rollout_ref.rollout.n` Hydra node on
+        its own). Fails fast at trainer construction, before any Ray workers
+        spin up, instead of surfacing as a shape mismatch deep inside fit().
+        """
+        if self.n_cot < 0 or self.n_code < 0:
+            raise ValueError(f"jepa.n_cot ({self.n_cot}) and jepa.n_code ({self.n_code}) must be >= 0")
+        if self.n_cot + self.n_code != rollout_n:
+            raise ValueError(
+                f"jepa.n_cot ({self.n_cot}) + jepa.n_code ({self.n_code}) must equal "
+                f"actor_rollout_ref.rollout.n ({rollout_n})"
+            )
+        if self.enable and self.n_code == 0:
+            raise ValueError(
+                "jepa.enable=True requires jepa.n_code > 0 (no code-framed rollouts to build JEPA pairs from)"
+            )
 
 
 def jepa_enabled(config: DictConfig | dict | None) -> bool:

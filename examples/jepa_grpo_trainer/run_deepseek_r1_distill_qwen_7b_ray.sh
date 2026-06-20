@@ -113,6 +113,13 @@ LOGGER=${LOGGER:-'["console","wandb"]'}
 # Training size
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 ROLLOUT_N=${ROLLOUT_N:-8}
+# Split of ROLLOUT_N completions/prompt between CoT-framed and Code-framed
+# system prompts (see jepa.n_cot/jepa.n_code below). Both views now
+# contribute to the GRPO policy-gradient update, not just CoT — the
+# code-framed subset is additionally used to build JEPA pairs. Must sum to
+# ROLLOUT_N.
+N_COT=${N_COT:-4}
+N_CODE=${N_CODE:-4}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}    # 64/16 = 4 gradient steps per batch; smaller for 7B activation memory
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}  # halved vs. 1.5B; 7B activations are ~5x larger per token
@@ -209,6 +216,8 @@ ROLLOUT=(
 )
 
 JEPA=(
+    jepa.n_cot=${N_COT}
+    jepa.n_code=${N_CODE}
     jepa.alpha=${ALPHA}
     jepa.ema_decay=${EMA_DECAY}
     jepa.embed_micro_batch_size=${EMBED_MICRO_BATCH_SIZE}
