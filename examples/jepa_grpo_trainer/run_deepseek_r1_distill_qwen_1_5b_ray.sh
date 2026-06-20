@@ -147,22 +147,49 @@ GRAD_CKPT=${GRAD_CKPT:-True}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}   # more parallel sequences during vLLM rollout
 
 # JEPA
-ALPHA=${ALPHA:-0.5}
+# Scaled down from 0.5: jepa/grad_norm was measured at ~13-17x actor/grad_norm
+# even after alpha=0.5 and max_grad_norm clipping (JEPA's loss is averaged
+# over a ~30-80 row pool vs PPO's token-mean over ~370k tokens, so it survives
+# backward much less diluted) — JEPA's update was dominating the shared LoRA
+# weights instead of the RL signal. 0.01 is a first attempt at parity; compare
+# jepa/grad_norm vs actor/grad_norm in this run to see if it lands closer.
+ALPHA=${ALPHA:-0.005}
 EMA_DECAY=${EMA_DECAY:-0.99}
 EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-8}
 MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
-# JEPA objective: "lejepa" (squared-Euclidean align + SIGReg), "llm-jepa-loss"
-# (default; LLM-JEPA paper arXiv:2509.14252 cosine prediction loss + SIGReg), or
-# "jepa-triplet-loss" (llm-jepa-loss + a hard-negative triplet term against a
-# "clean wrong" code rollout; see jepa-llm-hard-neg-triplet-mode-AUDIT.md).
+# JEPA objective (one of four; see verl/experimental/jepa_grpo/core_algos.py):
+#   "lejepa"             - squared-Euclidean align (live CoT vs EMA-target Code)
+#                          + SIGReg. Uses SIGREG_LAMBDA.
+#   "llm-jepa-loss"      - LLM-JEPA paper arXiv:2509.14252 cosine prediction loss
+#                          (one shared encoder, no EMA) + SIGReg. Uses SIGREG_LAMBDA.
+#   "jepa-triplet-loss"  - llm-jepa-loss + a hard-negative triplet term against a
+#                          "clean wrong" code rollout; see
+#                          jepa-llm-hard-neg-triplet-mode-AUDIT.md. Uses
+#                          TRIPLET_MARGIN/TRIPLET_W/TRIPLET_SIGREG_LAMBDA.
+#   "jepa-separation-loss" - llm-jepa-loss + a direct correct/wrong code-pair
+#                          separation hinge (creates the gap the triplet's
+#                          vanishing gradient cannot). Uses
+#                          SEPARATION_MARGIN/SEPARATION_W/TRIPLET_SIGREG_LAMBDA.
 JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-triplet-loss}
+case "${JEPA_LOSS_TYPE}" in
+    lejepa|llm-jepa-loss|jepa-triplet-loss|jepa-separation-loss) ;;
+    *) echo "ERROR: JEPA_LOSS_TYPE='${JEPA_LOSS_TYPE}' is invalid. Must be one of:" \
+            "lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss" >&2
+       exit 1 ;;
+esac
+# SIGReg anti-collapse weight for the modes that read the GENERAL lambda
+# (lejepa, llm-jepa-loss). The triplet/separation modes use TRIPLET_SIGREG_LAMBDA
+# instead (see worker.py: lambda_=cfg.triplet_sigreg_lambda there vs
+# cfg.sigreg_lambda here). Pretrained LLMs need far more SIGReg weight than
+# LeJEPA's from-scratch default (0.1) to fight their anisotropy prior.
+SIGREG_LAMBDA=${SIGREG_LAMBDA:-0.5}
 # Number of LLM-JEPA tied-weight predictor tokens (paper §3.1). Only used when
 # JEPA_LOSS_TYPE=llm-jepa-loss or jepa-triplet-loss; k=0 is the identity predictor,
 # Pred(x) = x.
 LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
 # Hard-negative triplet hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-triplet-loss.
 TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.1}
-TRIPLET_W=${TRIPLET_W:-0.3}
+TRIPLET_W=${TRIPLET_W:-1.0}
 TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.5}   # SIGReg must both replace the dropped LLM-JEPA NTP anti-collapse leg AND fight the pretrained LLM's anisotropy prior, so it needs far more weight than LeJEPA's from-scratch default (0.05/0.1); 0.3 still lost (pos/neg re-converged, margin went negative by step ~24)
 # Separation-loss hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-separation-loss.
 # L_sep = (1/T) Σ relu(SEPARATION_MARGIN - (1 - <e^c,e^w>)); creates the correct/wrong
@@ -184,11 +211,11 @@ JEPA_MAX_GRAD_NORM=${JEPA_MAX_GRAD_NORM:-0.5}
 # (0 disables warmup, full alpha from step 0). Pre-clip jepa/grad_norm is
 # elevated (~5) at the very start before the predictor/encoder geometry
 # settles; this reduces how much weight that early noisy direction gets.
-ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-10}
+ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-0}
 
 SAVE_FREQ=${SAVE_FREQ:-10}
 TEST_FREQ=${TEST_FREQ:-10}
-VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}   # catches val-path bugs/crashes immediately instead of after test_freq steps
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}   # skip the step-0 pre-train validation; go straight into training
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}   # only the most recent checkpoint is kept on disk
 
 # Validation rollout
@@ -203,8 +230,8 @@ VAL_TOP_P=${VAL_TOP_P:-0.95}
 BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["aime24","aime25","aime26","amc23"]'}
 
 # KL penalty
-USE_KL_LOSS=${USE_KL_LOSS:-true}   # anchors policy to the reference model; false -> drop KL entirely
-KL_COEF=${KL_COEF:-0.001}   # small but nonzero; previously 0.0 left policy drift unbounded (see grad_norm/ppo_kl blowup)
+USE_KL_LOSS=${USE_KL_LOSS:-false}   # anchors policy to the reference model; false -> drop KL entirely
+KL_COEF=${KL_COEF:-0.0}   # NOTE: 0.0 previously caused a grad_norm/ppo_kl blowup in this exact script — watch actor/ppo_kl and actor/grad_norm closely
 ########################### end user-adjustable ###########################
 
 DATA=(
@@ -274,6 +301,7 @@ JEPA=(
     jepa.min_valid_pairs=${MIN_VALID_PAIRS}
     jepa.loss_type=${JEPA_LOSS_TYPE}
     jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
+    jepa.sigreg_lambda=${SIGREG_LAMBDA}
     jepa.triplet_margin=${TRIPLET_MARGIN}
     jepa.triplet_w=${TRIPLET_W}
     jepa.triplet_sigreg_lambda=${TRIPLET_SIGREG_LAMBDA}

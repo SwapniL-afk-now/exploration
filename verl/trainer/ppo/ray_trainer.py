@@ -1141,38 +1141,59 @@ class RayPPOTrainer:
         self.checkpoint_manager.sleep_replicas()
 
     def _maybe_save_best_checkpoint(self, val_metrics: dict):
-        """Save a separate `best/` checkpoint snapshot whenever the average pass@1
-        accuracy across `trainer.best_ckpt_sources` improves. This mirrors the
-        DeepScaleR/Dr.GRPO convention of selecting checkpoints by mean accuracy over a
-        held-out core math benchmark set, independent of the `latest` checkpoint kept
-        via `max_actor_ckpt_to_keep`.
+        """Save a separate `best/` checkpoint snapshot whenever the combined
+        selection score across `trainer.best_ckpt_sources` improves. The score is
+        the equal-weight mean of two metrics, each averaged over the sources:
+          - avg@k  (`val-core/{source}/acc/mean@{k}`)  — mean per-sample accuracy
+          - pass@k (`val-core/{source}/acc/best@{k}/mean`) — best-of-k success rate
+
+        Using both guards against picking a checkpoint that looks good on only one
+        axis (e.g. high pass@k from a few lucky samples while avg@k regresses, or
+        vice versa). This mirrors the DeepScaleR/Dr.GRPO convention of selecting on
+        a held-out core math benchmark set, independent of the `latest` checkpoint
+        kept via `max_actor_ckpt_to_keep`.
         """
         best_ckpt_sources = self.config.trainer.get("best_ckpt_sources", None)
         if not best_ckpt_sources:
             return
 
-        accs = []
+        avg_scores = []   # avg@k  per source (mean accuracy)
+        pass_scores = []  # pass@k per source (best-of-k)
         for source in best_ckpt_sources:
-            prefix = f"val-core/{source}/acc/mean@"
-            matches = [v for k, v in val_metrics.items() if k.startswith(prefix)]
-            if matches:
-                accs.append(matches[0])
-        if not accs:
+            avg_matches = [v for k, v in val_metrics.items() if k.startswith(f"val-core/{source}/acc/mean@")]
+            pass_matches = [
+                v for k, v in val_metrics.items()
+                if k.startswith(f"val-core/{source}/acc/best@") and k.endswith("/mean")
+            ]
+            if avg_matches:
+                avg_scores.append(avg_matches[0])
+            if pass_matches:
+                pass_scores.append(pass_matches[0])
+        # Require BOTH metrics to be present so the combined score is comparable
+        # across steps (mixing a both-axes score with an avg-only score would let
+        # an inferior checkpoint win whenever pass@k happened to be missing).
+        if not avg_scores or not pass_scores:
             return
 
-        avg_acc = sum(accs) / len(accs)
-        if avg_acc > getattr(self, "best_val_acc", float("-inf")):
-            self.best_val_acc = avg_acc
+        avg_at_k = sum(avg_scores) / len(avg_scores)
+        pass_at_k = sum(pass_scores) / len(pass_scores)
+        combined = 0.5 * (avg_at_k + pass_at_k)
+        if combined > getattr(self, "best_val_score", float("-inf")):
+            self.best_val_score = combined
             print(
                 f"New best checkpoint at step {self.global_steps}: "
-                f"avg acc over {best_ckpt_sources} = {avg_acc:.4f}"
+                f"combined={combined:.4f} (avg@k={avg_at_k:.4f}, pass@k={pass_at_k:.4f}) "
+                f"over {best_ckpt_sources}"
             )
             best_local_path = os.path.join(self.config.trainer.default_local_dir, "best", "actor")
             self.actor_rollout_wg.save_checkpoint(
                 best_local_path, None, self.global_steps, max_ckpt_to_keep=1, tag="best"
             )
             with open(os.path.join(self.config.trainer.default_local_dir, "best", "best_val_acc.txt"), "w") as f:
-                f.write(f"step={self.global_steps} avg_acc={avg_acc:.6f} sources={best_ckpt_sources}\n")
+                f.write(
+                    f"step={self.global_steps} combined={combined:.6f} "
+                    f"avg_at_k={avg_at_k:.6f} pass_at_k={pass_at_k:.6f} sources={best_ckpt_sources}\n"
+                )
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe

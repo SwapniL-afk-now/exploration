@@ -521,21 +521,72 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         gen_batch_cot.meta_info["global_steps"] = self.global_steps
                         gen_batch_cot_rep = gen_batch_cot.repeat(repeat_times=n_cot, interleave=True)
                         cot_gen_output = self.async_rollout_manager.generate_sequences(gen_batch_cot_rep)
+                        # Each generate_sequences call attaches its own per-call "timing"
+                        # diagnostics dict to meta_info. Pop+merge into timing_raw (the
+                        # pattern used elsewhere in verl, e.g. ray_trainer.py's
+                        # `timing_raw.update(combined_gen_output.meta_info["timing"])`)
+                        # instead of letting it ride along on the DataProto — otherwise it
+                        # collides later: cot's and code's "timing" dicts are different
+                        # objects, and both union() and DataProto.concat() assert equality
+                        # on overlapping non-"metrics" meta_info keys.
+                        if "timing" in cot_gen_output.meta_info:
+                            timing_raw.update(
+                                {f"cot_gen/{k}": v for k, v in cot_gen_output.meta_info.pop("timing").items()}
+                            )
+                        # AgentLoop echoes raw_prompt back into its output. cot_sub is unioned
+                        # onto `batch.repeat(...)` (not onto a gen_batch that itself carries
+                        # raw_prompt — unlike the old code), so if only ONE of cot/code drops
+                        # this key, DataProto.concat ends up with a non_tensor_batch entry whose
+                        # length matches just one sub instead of the full combined batch size.
+                        # Drop it symmetrically from both; nothing downstream reads it.
+                        cot_gen_output.non_tensor_batch.pop("raw_prompt", None)
 
                         cot_sub = batch.repeat(repeat_times=n_cot, interleave=True)
+                        # .repeat() passes meta_info by reference (verl/protocol.py), so
+                        # cot_sub.meta_info IS batch.meta_info here — decouple with a shallow
+                        # copy before union() mutates it, so this sub's union() can't leak
+                        # into the shared `batch` object (and from there into code_sub below).
+                        cot_sub.meta_info = dict(cot_sub.meta_info)
                         cot_sub = cot_sub.union(cot_gen_output)
                         cot_sub.non_tensor_batch["view"] = np.array(["cot"] * len(cot_sub), dtype=object)
                         sub_batches.append(cot_sub)
+
+                    if n_cot > 0 and n_code > 0:
+                        # Issuing a second vLLM engine RPC immediately after generate_sequences()
+                        # returns reproducibly segfaults vLLM's executor (cuMemcpy) at the start
+                        # of the first real training step — reproduced 3x, including once where
+                        # the "second RPC" was a checkpoint_manager.sleep_replicas() call (NOT
+                        # another generation), so this isn't specific to generation-vs-generation;
+                        # it's specific to back-to-back vLLM RPCs with no real wall-clock gap.
+                        # generate_sequences() is wrapped in asyncio.run (verl/utils/ray_utils.py),
+                        # which should block until fully complete, but empirically something in
+                        # vLLM's async engine (e.g. background request/KV-cache bookkeeping) is
+                        # still settling when the next RPC submits new CUDA work. The old code
+                        # never hit this because substantial real CPU/FSDP work (reward,
+                        # advantage, old-logprob) always sat between its two generate_sequences
+                        # calls — never back-to-back. A plain delay is a blunt instrument, but
+                        # it's the minimal, lowest-risk way to give vLLM's async state time to
+                        # drain without restructuring the data flow (see git history for two
+                        # real bugs introduced by data-flow changes in this same unification).
+                        import time as _time
+                        _time.sleep(5)
 
                     if n_code > 0:
                         code_gen_batch = self._tokenize_code_prompts(batch)  # batch is still un-repeated here
                         code_gen_batch.meta_info["global_steps"] = self.global_steps
                         code_gen_batch_rep = code_gen_batch.repeat(repeat_times=n_code, interleave=True)
                         code_gen_output = self.async_rollout_manager.generate_sequences(code_gen_batch_rep)
-                        # AgentLoop echoes raw_prompt back into output; remove before union to avoid key collision
+                        # See cot_gen_output comment above — drop symmetrically from both views.
                         code_gen_output.non_tensor_batch.pop("raw_prompt", None)
+                        # See cot_gen_output comment above — pop+merge "timing" instead of
+                        # letting it collide with cot's (different) "timing" dict at union/concat.
+                        if "timing" in code_gen_output.meta_info:
+                            timing_raw.update(
+                                {f"code_gen/{k}": v for k, v in code_gen_output.meta_info.pop("timing").items()}
+                            )
 
                         code_sub = batch.repeat(repeat_times=n_code, interleave=True)
+                        code_sub.meta_info = dict(code_sub.meta_info)  # see cot_sub comment above
                         code_sub = code_sub.union(code_gen_output)
                         code_sub.non_tensor_batch["view"] = np.array(["code"] * len(code_sub), dtype=object)
                         sub_batches.append(code_sub)
@@ -630,10 +681,16 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         metrics["jepa/skipped"] = 1.0
                         metrics["jepa/n_valid_pairs"] = 0.0
 
-                    # Sleep rollout before JEPA backward (no JEPA-only generation left to wait on,
-                    # but jepa_update is a separate worker RPC, same as before)
-                    with simple_timer("sleep_replicas_2", timing_raw):
-                        self.checkpoint_manager.sleep_replicas()
+                    # NOTE: do NOT sleep the rollout replicas here. vLLM was already put
+                    # to sleep at sleep_replicas_1 (above, before update_actor) and nothing
+                    # wakes it again until weight_sync_2 at the end of the step. The
+                    # pre-unification loop had a weight_sync_1 (wake) + a separate JEPA-only
+                    # code generation between the two sleeps, so this second sleep acted on an
+                    # AWAKE engine; unification removed that wake+generation but left this
+                    # sleep behind. Sleeping an already-slept engine reproducibly segfaults
+                    # vLLM's executor in cuMemcpy at the first training step (EngineCore dies
+                    # -> "collective_rpc sleep ... cancelled" -> EngineDeadError). jepa_update
+                    # is a worker-side FSDP RPC and does not touch the rollout engine.
 
                 # Track code/cot accuracy (sliced from the single combined reward_tensor)
                 code_rew_scalar = rew_scalar_all[torch.from_numpy(code_mask_rows)]

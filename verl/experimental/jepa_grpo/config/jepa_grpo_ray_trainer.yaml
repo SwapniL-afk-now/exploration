@@ -7,6 +7,8 @@ defaults:
 # ── JEPA hyperparameters ────────────────────────────────────────────────────
 jepa:
   enable: true
+  n_cot: 4
+  n_code: 4
   alpha: 0.1
   alpha_warmup_steps: 0
   ema_decay: 0.99
