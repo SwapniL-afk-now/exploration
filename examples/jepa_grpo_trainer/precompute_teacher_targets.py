@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tp-size", type=int, default=1, help="vLLM tensor-parallel size for the teacher")
     p.add_argument("--gpu-mem-frac", type=float, default=0.85)
     p.add_argument("--encode-batch-size", type=int, default=16)
+    p.add_argument("--gen-batch-prompts", type=int, default=64, help="Prompts per vLLM generate() call")
+    p.add_argument("--save-responses", default="", help="Optional .pt path to also save {index: [correct_texts]}")
     return p.parse_args()
 
 
@@ -122,11 +124,19 @@ def main() -> None:
     )
 
     rows = df.to_dict("records")
+    # CoT-only: each row's `prompt` already carries the step-by-step \boxed{} system
+    # prompt (fepo.data.make_messages), so no code/tool view is generated here.
     prompt_texts = [
         teacher_tok.apply_chat_template(_row_messages(r["prompt"]), tokenize=False, add_generation_prompt=True)
         for r in rows
     ]
-    gen = teacher.generate(prompt_texts, sampling)
+    # Generate in fixed prompt batches (mirrors the train-time batching of 64).
+    gen = []
+    bsz = max(1, args.gen_batch_prompts)
+    for i in range(0, len(prompt_texts), bsz):
+        chunk = prompt_texts[i : i + bsz]
+        gen.extend(teacher.generate(chunk, sampling))
+        print(f"[precompute] generated {min(i + bsz, len(prompt_texts))}/{len(prompt_texts)} prompts", flush=True)
 
     # ---- Phase 1b: verify -> keep correct teacher-correct responses ----
     kept: list[tuple[int, str, list[str]]] = []  # (index, ref_prompt_text, correct_responses)
@@ -164,6 +174,7 @@ def main() -> None:
     ).to(device).eval()
 
     cache: dict[int, torch.Tensor] = {}
+    responses_by_idx: dict[int, list[str]] = {}
     for idx, prompt, responses in kept:
         prompt_text = ref_tok.apply_chat_template(
             _row_messages(prompt), tokenize=False, add_generation_prompt=True
@@ -172,10 +183,16 @@ def main() -> None:
             ref_model, ref_tok, prompt_text, responses, device, args.encode_batch_size
         )
         cache[idx] = targets.half()
+        responses_by_idx[idx] = responses
 
     torch.save(cache, args.out)
     print(f"[precompute] wrote {len(cache)} questions -> {args.out} "
           f"(d={next(iter(cache.values())).shape[-1] if cache else 'n/a'})")
+
+    # Persist the raw teacher-correct response texts (default: alongside the target cache).
+    resp_path = args.save_responses or (args.out + ".responses.pt")
+    torch.save(responses_by_idx, resp_path)
+    print(f"[precompute] wrote correct response texts for {len(responses_by_idx)} questions -> {resp_path}")
 
 
 if __name__ == "__main__":

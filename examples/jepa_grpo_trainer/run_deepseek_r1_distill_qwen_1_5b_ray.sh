@@ -200,6 +200,9 @@ esac
 TEACHER_CACHE=${TEACHER_CACHE:-/workspace/jepa-grpo-cache/teacher_targets.pt}
 N_TARGETS_PER_Q=${N_TARGETS_PER_Q:-4}
 TCR_MATCH=${TCR_MATCH:-cycle}
+# Which student rollouts become JEPA anchors: "correct" (default; today's behavior),
+# "all" (correct + wrong, reward-stratified prompt-averaged), or "wrong" (ablation).
+JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
 # SIGReg anti-collapse weight for the modes that read the GENERAL lambda
 # (lejepa, llm-jepa-loss). The triplet/separation modes use TRIPLET_SIGREG_LAMBDA
 # instead (see worker.py: lambda_=cfg.triplet_sigreg_lambda there vs
@@ -349,6 +352,7 @@ JEPA=(
     jepa.teacher_cache_path=${TEACHER_CACHE}
     jepa.n_targets_per_q=${N_TARGETS_PER_Q}
     jepa.tcr_match=${TCR_MATCH}
+    jepa.jepa_anchor_set=${JEPA_ANCHOR_SET}
 )
 
 TRAINER=(

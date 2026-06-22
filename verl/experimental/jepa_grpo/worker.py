@@ -581,11 +581,16 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 lengths = [data["cot_lengths"]]
                 joint_predictor_k = [cfg.predictor_k] * n_cot
                 teacher_target = data["teacher_target"]
+                # Reward-stratified, prompt-averaged aggregation tensors (built 1:1 with the
+                # CoT anchor rows; correct & wrong anchors share the identical [PRED] path).
+                anchor_group_id = data.get("anchor_group_id", None)
+                anchor_is_correct = data.get("anchor_is_correct", None)
 
                 joint_ids, joint_mask = self._pad_concat_batches(groups)
                 joint_lengths = torch.cat(lengths, dim=0)
 
-                def _loss_fn(joint_emb, _teacher_target=teacher_target):
+                def _loss_fn(joint_emb, _teacher_target=teacher_target,
+                             _group_id=anchor_group_id, _is_correct=anchor_is_correct):
                     pred_text = joint_emb
                     return llm_jepa_tcr_loss(
                         pred_text=pred_text,
@@ -593,6 +598,8 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                             device=pred_text.device, dtype=pred_text.dtype
                         ),
                         all_pool=pred_text,   # SIGReg over student preds only
+                        group_id=_group_id,
+                        is_correct=_is_correct,
                         lambda_=cfg.triplet_sigreg_lambda,
                         M=cfg.n_projections,
                         t_min=cfg.t_min,
@@ -613,7 +620,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                     "jepa/skipped": torch.tensor(0.0),
                     "jepa/grad_norm": torch.tensor(float(grad_norm) if grad_norm is not None else 0.0),
                 }
-                out.update({f"jepa/{k}": torch.tensor(float(v)) for k, v in jepa_metrics.items()})
+                # Loss fns already namespace their keys with "jepa/"; do NOT re-prefix
+                # (that produced "jepa/jepa/..."). Keep the keys as returned.
+                out.update({k: torch.tensor(float(v)) for k, v in jepa_metrics.items()})
                 return TensorDict(out, batch_size=[])
 
             wrong_lengths_full = data["wrong_lengths"]
@@ -747,5 +756,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             "jepa/skipped": torch.tensor(0.0),
             "jepa/grad_norm": torch.tensor(float(grad_norm) if grad_norm is not None else 0.0),
         }
-        out.update({f"jepa/{k}": torch.tensor(float(v)) for k, v in jepa_metrics.items()})
+        # Loss fns already namespace their keys with "jepa/"; do NOT re-prefix
+        # (that produced "jepa/jepa/..."). Keep the keys as returned.
+        out.update({k: torch.tensor(float(v)) for k, v in jepa_metrics.items()})
         return TensorDict(out, batch_size=[])

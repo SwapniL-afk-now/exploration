@@ -24,6 +24,7 @@ on the actor worker itself so gradients are never shipped over Ray.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections import defaultdict
 from typing import Any
@@ -38,6 +39,8 @@ from verl.trainer.ppo.metric_utils import compute_data_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler.performance import simple_timer
+
+logger = logging.getLogger(__name__)
 
 
 class JEPARayPPOTrainer(RayPPOTrainer):
@@ -635,19 +638,36 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 info = extra_infos[i]
                 idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
 
+        anchor_set = self.jepa_cfg.jepa_anchor_set
         cot_ids_list, cot_lengths, target_list = [], [], []
+        group_id_list, is_correct_list = [], []
         n_correct_cot_list = []
+        group_counter = 0
         for u in dict.fromkeys(uids):  # dedup, preserves first-seen order
             ds_idx = idx_by_uid.get(u)
             targets = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
             if targets is None or targets.numel() == 0:
                 continue
-            correct_cot = [i for i in cot_by_uid.get(u, []) if rew[i] > 0]
-            if not correct_cot:
+            # Select anchors by reward according to jepa_anchor_set. All anchors share the
+            # identical [x, y_S, [PRED]] format and predict the teacher-correct target.
+            cot_idxs = cot_by_uid.get(u, [])
+            if anchor_set == "correct":
+                selected = [i for i in cot_idxs if rew[i] > 0]
+            elif anchor_set == "wrong":
+                selected = [i for i in cot_idxs if rew[i] <= 0]
+            else:  # "all"
+                selected = list(cot_idxs)
+            # Defensive: drop degenerate zero-length rows (would yield a zero embedding
+            # in the encoder and pollute the stratified means). Normal rollouts always
+            # carry the prompt, so this is just a safety net.
+            selected = [i for i in selected if int(all_attn_mask[i].sum()) > 0]
+            if not selected:
                 continue
             n_u = targets.shape[0]
-            n_correct_cot_list.append(len(correct_cot))
-            for j, cot_idx in enumerate(correct_cot):
+            n_correct_cot_list.append(sum(1 for i in selected if rew[i] > 0))
+            gid = group_counter
+            group_counter += 1
+            for j, cot_idx in enumerate(selected):
                 ids = all_input_ids[cot_idx][all_attn_mask[cot_idx].bool()]
                 cot_ids_list.append(ids)
                 cot_lengths.append(int(all_attn_mask[cot_idx].sum()))
@@ -656,6 +676,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 else:  # cycle
                     t_row = j % n_u
                 target_list.append(targets[t_row])
+                group_id_list.append(gid)
+                is_correct_list.append(bool(rew[cot_idx] > 0))
 
         A = len(cot_ids_list)
         if A < self.jepa_cfg.min_valid_pairs:
@@ -676,10 +698,34 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             "cot_attn_mask": cot_padded_mask,
             "cot_lengths": torch.tensor(cot_lengths, dtype=torch.long),
             "teacher_target": teacher_target,
+            "anchor_group_id": torch.tensor(group_id_list, dtype=torch.long),
+            "anchor_is_correct": torch.tensor(is_correct_list, dtype=torch.bool),
         })
         jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
         jepa_batch.meta_info["n_anchors"] = A
         return jepa_batch
+
+    # ------------------------------------------------ memory diagnostics -----
+    @staticmethod
+    def _log_gpu_mem(tag: str) -> None:
+        """Log device-level GPU memory (used/total MiB) at a phase boundary.
+
+        Uses `nvidia-smi` rather than torch so the driver process does NOT create
+        a CUDA context (which would itself consume GPU memory on this memory-tight
+        colocated setup). Device-level used memory captures BOTH the vLLM EngineCore
+        and the FSDP-actor worker processes. Best-effort: never raises into the loop.
+        """
+        try:
+            import subprocess
+
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            logger.info("[jepa-gpu-mem] %s: %s MiB (used,total per GPU)", tag, out.replace("\n", " | "))
+        except Exception as e:  # noqa: BLE001 - diagnostics must never break training
+            logger.warning("[jepa-gpu-mem] %s: snapshot failed (%s)", tag, e)
 
     # ---------------------------------------------------- training loop -----
     def fit(self):
@@ -843,17 +889,39 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         config=self.config.algorithm,
                     )
 
+                # Sleep rollout replicas BEFORE old_log_prob so vLLM releases its KV
+                # reservation before the actor recomputes log-probs (the ~7 GiB lm_head
+                # logits block). Previously the sleep sat AFTER old_log_prob, so that block
+                # was allocated while vLLM still held its full KV pool -> OOM near the card
+                # ceiling (logs: "Tried to allocate 6.90 GiB ... 92.14 GiB in use").
+                # Called exactly once per step; vLLM is woken again only at weight_sync_2.
+                #
+                # DRAIN GUARD: issuing a vLLM RPC (sleep_replicas IS one) immediately after
+                # generate_sequences() reproducibly segfaults vLLM's executor when there is no
+                # real wall-clock gap (see the same-class issue + _time.sleep(5) guard in the
+                # Step-1 cot/code generation block). The old ordering was safe only because
+                # old_log_prob (~14 s of FSDP work) sat between generation and the sleep; the
+                # reward/advantage block above is only ~15 ms, so we reinstate the documented
+                # short drain before the sleep RPC.
+                self._log_gpu_mem("after_gen_before_sleep")
+                import time as _time
+                _time.sleep(5)
+                with simple_timer("sleep_replicas_1", timing_raw):
+                    self.checkpoint_manager.sleep_replicas()
+                self._log_gpu_mem("after_sleep")
+
                 # ── Step 3: Compute old log-probs & (optional) ref ──────
+                # Actor/FSDP-only (compute_log_prob); does NOT call vLLM. All rollout outputs
+                # it reads are already materialized in `batch` (DataProto.concat in Step 1),
+                # so sleeping vLLM first is safe.
+                self._log_gpu_mem("before_old_log_prob")
                 with simple_timer("old_log_prob", timing_raw):
                     old_log_prob, _old_log_prob_mfu = self._compute_old_log_prob(batch)
                     batch = batch.union(old_log_prob)
                     if self.use_reference_policy:
                         ref_log_prob = self._compute_ref_log_prob(batch)
                         batch = batch.union(ref_log_prob)
-
-                # Sleep rollout replicas before backward (frees KV cache)
-                with simple_timer("sleep_replicas_1", timing_raw):
-                    self.checkpoint_manager.sleep_replicas()
+                self._log_gpu_mem("after_old_log_prob")
 
                 # ── Step 4: GRPO actor update ────────────────────────────
                 with simple_timer("update_actor", timing_raw):
@@ -939,8 +1007,10 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 metrics["code/avg_reward"] = float(code_rew_scalar.mean()) if len(code_rew_scalar) else 0.0
 
                 # ── Step 6: Weight sync to rollout (wakes vLLM) ─────────
+                self._log_gpu_mem("before_weight_sync_2")
                 with simple_timer("weight_sync_2", timing_raw):
                     self.checkpoint_manager.update_weights(self.global_steps)
+                self._log_gpu_mem("after_weight_sync_2")
 
                 # ── CoT-based train metrics (rich grouped stats) ─────────
                 cot_rew_scalar = rew_scalar_all[torch.from_numpy(cot_mask_rows)]

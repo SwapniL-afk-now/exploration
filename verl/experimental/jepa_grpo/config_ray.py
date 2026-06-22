@@ -109,6 +109,15 @@ class JEPARayConfig:
     #   "cycle"  — anchor j uses target [j % n_u] (default; deterministic)
     #   "random" — anchor j uses a uniformly random cached target
     tcr_match: str = "cycle"
+    # Which student rollouts become JEPA anchors (jepa-tcr-loss only). All anchors,
+    # correct or wrong, use the identical [x, y_S, [PRED]xk] -> sg(z_T^+) format; the
+    # [PRED] token predicts the teacher-correct latent from the student's response
+    # context (refinement for correct, latent correction for wrong). Reward-stratified,
+    # prompt-averaged so wrong-anchor counts never implicitly weight the loss.
+    #   "correct" — only rew>0 rollouts (default; reproduces today's selection)
+    #   "all"     — every rollout (correct + wrong)
+    #   "wrong"   — only rew<=0 rollouts (analysis ablation)
+    jepa_anchor_set: str = "correct"
     # Number of tied-weight predictor tokens (paper §3.1). k=0 -> Pred(x) = x
     # (identity), so for a real predictive separation set predictor_k > 0.
     predictor_k: int = 0
@@ -171,6 +180,11 @@ class JEPARayConfig:
             if self.tcr_match not in ("cycle", "random"):
                 raise ValueError(
                     f"jepa.tcr_match must be 'cycle' or 'random'; got {self.tcr_match!r}"
+                )
+            if self.jepa_anchor_set not in ("correct", "all", "wrong"):
+                raise ValueError(
+                    f"jepa.jepa_anchor_set must be 'correct', 'all' or 'wrong'; "
+                    f"got {self.jepa_anchor_set!r}"
                 )
         if self.n_cot < 0 or self.n_code < 0:
             raise ValueError(f"jepa.n_cot ({self.n_cot}) and jepa.n_code ({self.n_code}) must be >= 0")
