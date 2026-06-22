@@ -178,13 +178,28 @@ MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
 #                          SEPARATION_TAU (or InfoNCE when SEPARATION_MODE=info).
 #                          Uses SEPARATION_TAU/SEPARATION_MODE/SEPARATION_W/
 #                          TRIPLET_SIGREG_LAMBDA (SEPARATION_MARGIN is ignored).
+#   "jepa-tcr-loss"      - Teacher-Correct Representation alignment (correct-only):
+#                          NO separation term. Each correct student CoT anchor is
+#                          pulled toward a PRECOMPUTED teacher-correct target (offline
+#                          3B teacher solution text encoded by a frozen student-size
+#                          reference model -> 1536-d student space, no projector),
+#                          + SIGReg over the student preds alone. Run
+#                          precompute_teacher_targets.py first; point TEACHER_CACHE at
+#                          its output. Uses TEACHER_CACHE/N_TARGETS_PER_Q/TCR_MATCH/
+#                          TRIPLET_SIGREG_LAMBDA (SEPARATION_* are ignored).
 JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-clreg-loss}
 case "${JEPA_LOSS_TYPE}" in
-    lejepa|llm-jepa-loss|jepa-triplet-loss|jepa-separation-loss|jepa-clreg-loss) ;;
+    lejepa|llm-jepa-loss|jepa-triplet-loss|jepa-separation-loss|jepa-clreg-loss|jepa-tcr-loss) ;;
     *) echo "ERROR: JEPA_LOSS_TYPE='${JEPA_LOSS_TYPE}' is invalid. Must be one of:" \
-            "lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss | jepa-clreg-loss" >&2
+            "lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss | jepa-clreg-loss | jepa-tcr-loss" >&2
        exit 1 ;;
 esac
+# jepa-tcr-loss only: offline teacher-target cache + per-question target controls.
+# TEACHER_CACHE is the .pt written by precompute_teacher_targets.py (keyed by dataset
+# index). TCR_MATCH is "cycle" (deterministic anchor->target) or "random".
+TEACHER_CACHE=${TEACHER_CACHE:-/workspace/jepa-grpo-cache/teacher_targets.pt}
+N_TARGETS_PER_Q=${N_TARGETS_PER_Q:-4}
+TCR_MATCH=${TCR_MATCH:-cycle}
 # SIGReg anti-collapse weight for the modes that read the GENERAL lambda
 # (lejepa, llm-jepa-loss). The triplet/separation modes use TRIPLET_SIGREG_LAMBDA
 # instead (see worker.py: lambda_=cfg.triplet_sigreg_lambda there vs
@@ -331,6 +346,9 @@ JEPA=(
     jepa.n_projections=${N_PROJECTIONS}
     jepa.alpha_warmup_steps=${ALPHA_WARMUP_STEPS}
     jepa.max_grad_norm=${JEPA_MAX_GRAD_NORM}
+    jepa.teacher_cache_path=${TEACHER_CACHE}
+    jepa.n_targets_per_q=${N_TARGETS_PER_Q}
+    jepa.tcr_match=${TCR_MATCH}
 )
 
 TRAINER=(

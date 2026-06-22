@@ -37,6 +37,7 @@ from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
 from verl.experimental.jepa_grpo.core_algos import (
     llm_jepa_clreg_loss,
     llm_jepa_separation_loss,
+    llm_jepa_tcr_loss,
 )
 
 
@@ -520,9 +521,12 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
-        assert self.jepa_cfg.loss_type in ("jepa-separation-loss", "jepa-clreg-loss"), (
+        assert self.jepa_cfg.loss_type in (
+            "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss"
+        ), (
             f"worker.jepa_update only supports loss_type in "
-            f"{{'jepa-separation-loss', 'jepa-clreg-loss'}}, got {self.jepa_cfg.loss_type!r}"
+            f"{{'jepa-separation-loss', 'jepa-clreg-loss', 'jepa-tcr-loss'}}, "
+            f"got {self.jepa_cfg.loss_type!r}"
         )
         if self.jepa_cfg.predictor_k > 0:
             assert self.jepa_cfg.predictor_token_id >= 0, (
@@ -568,6 +572,50 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             # `*_lengths == 0` marking padding rows (see ray_trainer builders) —
             # filter those out before the joint forward so only real rows are
             # encoded. The joint forward + loss differ per loss_type below.
+            if cfg.loss_type == "jepa-tcr-loss":
+                # CoT-only: encode the A correct student anchors (predictor tokens
+                # on every row); the teacher targets are precomputed constants that
+                # bypass the encoder entirely. SIGReg pool = student preds alone.
+                n_cot = data["cot_input_ids"].shape[0]
+                groups = [(data["cot_input_ids"], data["cot_attn_mask"])]
+                lengths = [data["cot_lengths"]]
+                joint_predictor_k = [cfg.predictor_k] * n_cot
+                teacher_target = data["teacher_target"]
+
+                joint_ids, joint_mask = self._pad_concat_batches(groups)
+                joint_lengths = torch.cat(lengths, dim=0)
+
+                def _loss_fn(joint_emb, _teacher_target=teacher_target):
+                    pred_text = joint_emb
+                    return llm_jepa_tcr_loss(
+                        pred_text=pred_text,
+                        teacher_target=_teacher_target.to(
+                            device=pred_text.device, dtype=pred_text.dtype
+                        ),
+                        all_pool=pred_text,   # SIGReg over student preds only
+                        lambda_=cfg.triplet_sigreg_lambda,
+                        M=cfg.n_projections,
+                        t_min=cfg.t_min,
+                        t_max=cfg.t_max,
+                        s=cfg.epps_pulley_s,
+                    )
+
+                jepa_metrics = self._embed_chunked_with_backward(
+                    joint_ids, joint_mask, joint_lengths, joint_predictor_k, _loss_fn, micro_bs, alpha,
+                )
+                grad_norm = engine.optimizer_step(clip_grad_override=self.jepa_cfg.max_grad_norm)
+                self._sync_ema()
+                aggressive_empty_cache(force_sync=True)
+                _total_loss_value = jepa_metrics.get("jepa/llm_jepa_loss", 0.0)
+                out = {
+                    "jepa/total_loss": torch.tensor(float(_total_loss_value)),
+                    "jepa/n_valid_pairs": torch.tensor(float(n_pairs)),
+                    "jepa/skipped": torch.tensor(0.0),
+                    "jepa/grad_norm": torch.tensor(float(grad_norm) if grad_norm is not None else 0.0),
+                }
+                out.update({f"jepa/{k}": torch.tensor(float(v)) for k, v in jepa_metrics.items()})
+                return TensorDict(out, batch_size=[])
+
             wrong_lengths_full = data["wrong_lengths"]
             wrong_mask = wrong_lengths_full > 0
             n_wrong = int(wrong_mask.sum().item())

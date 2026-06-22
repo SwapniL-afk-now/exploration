@@ -83,9 +83,32 @@ class JEPARayConfig:
     #       same GRPO group, scored with a DPO log-sigmoid at temperature
     #       separation_tau (or InfoNCE when separation_mode="info"). Same stop-grad
     #       rule and code-only SIGReg pool (see core_algos.llm_jepa_clreg_loss).
+    #   "jepa-tcr-loss" — Teacher-Correct Representation alignment (correct-only):
+    #       drops the separation term entirely; each correct student CoT anchor p_i
+    #       is pulled toward a PRECOMPUTED teacher-correct target z_T+ (offline 3B
+    #       teacher solution text encoded by a frozen student-size reference model,
+    #       so targets live in the 1536-d student space — no projector), + SIGReg
+    #       over the student preds alone. Uses teacher_cache_path / n_targets_per_q /
+    #       tcr_match / triplet_sigreg_lambda (separation_* are ignored). See
+    #       core_algos.llm_jepa_tcr_loss.
     # (The separate JEPAGRPOTrainer entrypoint in trainer.py uses its own EMA
     # "lejepa" loss and does not read this field.)
     loss_type: str = "jepa-separation-loss"
+    # -- jepa-tcr-loss only --
+    # Path to the offline teacher-target cache produced by
+    # examples/jepa_grpo_trainer/precompute_teacher_targets.py: a torch.save dict
+    # {dataset_index (int): float16 tensor (n_i, d)} of L2-normalized teacher-correct
+    # target embeddings in student space. Empty => tcr mode cannot run.
+    teacher_cache_path: str = ""
+    # Max teacher targets kept/used per question (the offline pass caps at this; the
+    # builder cycles anchors over whatever is cached).
+    n_targets_per_q: int = 4
+    # Anchor->target matching when a question has multiple cached targets (both
+    # resolved at batch-build time so the worker only ever sees one target per
+    # anchor):
+    #   "cycle"  — anchor j uses target [j % n_u] (default; deterministic)
+    #   "random" — anchor j uses a uniformly random cached target
+    tcr_match: str = "cycle"
     # Number of tied-weight predictor tokens (paper §3.1). k=0 -> Pred(x) = x
     # (identity), so for a real predictive separation set predictor_k > 0.
     predictor_k: int = 0
@@ -127,16 +150,28 @@ class JEPARayConfig:
         its own). Fails fast at trainer construction, before any Ray workers
         spin up, instead of surfacing as a shape mismatch deep inside fit().
         """
-        if self.enable and self.loss_type not in ("jepa-separation-loss", "jepa-clreg-loss"):
+        if self.enable and self.loss_type not in (
+            "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss"
+        ):
             raise ValueError(
-                f"jepa.loss_type must be 'jepa-separation-loss' or 'jepa-clreg-loss' "
-                f"(the supported ray/worker objectives); got {self.loss_type!r}"
+                f"jepa.loss_type must be 'jepa-separation-loss', 'jepa-clreg-loss' or "
+                f"'jepa-tcr-loss' (the supported ray/worker objectives); got {self.loss_type!r}"
             )
         if self.enable and self.loss_type == "jepa-clreg-loss" and self.separation_mode not in ("dpo", "info"):
             raise ValueError(
                 f"jepa.separation_mode must be 'dpo' or 'info' for jepa-clreg-loss; "
                 f"got {self.separation_mode!r}"
             )
+        if self.enable and self.loss_type == "jepa-tcr-loss":
+            if not self.teacher_cache_path:
+                raise ValueError(
+                    "jepa.loss_type='jepa-tcr-loss' requires jepa.teacher_cache_path "
+                    "(the offline teacher-target cache from precompute_teacher_targets.py)"
+                )
+            if self.tcr_match not in ("cycle", "random"):
+                raise ValueError(
+                    f"jepa.tcr_match must be 'cycle' or 'random'; got {self.tcr_match!r}"
+                )
         if self.n_cot < 0 or self.n_code < 0:
             raise ValueError(f"jepa.n_cot ({self.n_cot}) and jepa.n_code ({self.n_code}) must be >= 0")
         if self.n_cot + self.n_code != rollout_n:
@@ -144,7 +179,10 @@ class JEPARayConfig:
                 f"jepa.n_cot ({self.n_cot}) + jepa.n_code ({self.n_code}) must equal "
                 f"actor_rollout_ref.rollout.n ({rollout_n})"
             )
-        if self.enable and self.n_code == 0:
+        # tcr mode aligns CoT anchors only — it does not need correct CODE rollouts,
+        # so n_code==0 (all rollout budget on CoT) is allowed there. The other modes
+        # build their positive/negative from code rollouts and still require n_code>0.
+        if self.enable and self.n_code == 0 and self.loss_type != "jepa-tcr-loss":
             raise ValueError(
                 "jepa.enable=True requires jepa.n_code > 0 (no code-framed rollouts to build JEPA pairs from)"
             )

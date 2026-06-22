@@ -61,6 +61,16 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         self.jepa_cfg = JEPARayConfig.from_config(self.config.get("jepa", {}))
         self.jepa_cfg.validate(self.config.actor_rollout_ref.rollout.n)
 
+        # jepa-tcr-loss: load the offline teacher-target cache once. Keyed by the
+        # dataset row index (extra_info["index"]); each value is a (n_i, d) tensor
+        # of L2-normalized teacher-correct target embeddings in student space.
+        self.teacher_targets: dict[int, torch.Tensor] | None = None
+        if self.jepa_cfg.enable and self.jepa_cfg.loss_type == "jepa-tcr-loss":
+            raw = torch.load(self.jepa_cfg.teacher_cache_path, map_location="cpu")
+            self.teacher_targets = {
+                int(k): v.float() for k, v in raw.items() if v is not None and v.numel() > 0
+            }
+
     # ------------------------------------------------------ worker setup ----
     def init_workers(self):
         super().init_workers()
@@ -582,6 +592,95 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         jepa_batch.meta_info["n_wrong"] = W
         return jepa_batch
 
+    def _build_jepa_batch_tcr(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> DataProto | None:
+        """Build the jepa-tcr-loss batch: CoT-only correct student anchors, each
+        paired with a PRECOMPUTED teacher-correct target embedding.
+
+        Unlike the clreg/separation builders this has a single block:
+          - cot block: every CORRECT CoT rollout (rew>0) of every prompt whose
+            dataset index has cached teacher targets is an anchor. Code/wrong
+            rollouts are ignored entirely (the teacher target replaces e^c, and
+            there is no separation term).
+          - teacher_target block: a (A, d) float tensor aligned 1:1 to the anchor
+            rows, drawn from this prompt's cached targets `Z_u` (n_u, d) by either
+            cycle (`j % n_u`) or random matching (jepa.tcr_match).
+
+        Prompts with no cached teacher targets contribute no anchors (their JEPA
+        signal is simply absent). Returns None if fewer than min_valid_pairs
+        anchors exist (worker also guards via min_valid_pairs).
+        """
+        assert self.teacher_targets is not None, "teacher target cache not loaded"
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        # Group correct CoT rows by uid, preserving first-seen order. Record each
+        # uid's dataset index so we can look its teacher targets up in the cache.
+        cot_by_uid: dict = defaultdict(list)
+        idx_by_uid: dict = {}
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v != "cot":
+                continue
+            cot_by_uid[u].append(i)
+            if u not in idx_by_uid:
+                info = extra_infos[i]
+                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
+
+        cot_ids_list, cot_lengths, target_list = [], [], []
+        n_correct_cot_list = []
+        for u in dict.fromkeys(uids):  # dedup, preserves first-seen order
+            ds_idx = idx_by_uid.get(u)
+            targets = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
+            if targets is None or targets.numel() == 0:
+                continue
+            correct_cot = [i for i in cot_by_uid.get(u, []) if rew[i] > 0]
+            if not correct_cot:
+                continue
+            n_u = targets.shape[0]
+            n_correct_cot_list.append(len(correct_cot))
+            for j, cot_idx in enumerate(correct_cot):
+                ids = all_input_ids[cot_idx][all_attn_mask[cot_idx].bool()]
+                cot_ids_list.append(ids)
+                cot_lengths.append(int(all_attn_mask[cot_idx].sum()))
+                if self.jepa_cfg.tcr_match == "random":
+                    t_row = int(torch.randint(n_u, (1,)).item())
+                else:  # cycle
+                    t_row = j % n_u
+                target_list.append(targets[t_row])
+
+        A = len(cot_ids_list)
+        if A < self.jepa_cfg.min_valid_pairs:
+            return None
+
+        max_len = max(s.shape[0] for s in cot_ids_list)
+        cot_padded_ids = torch.stack([
+            torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in cot_ids_list
+        ])
+        cot_padded_mask = torch.stack([
+            torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, max_len - length))
+            for length in cot_lengths
+        ])
+        teacher_target = torch.nn.functional.normalize(torch.stack(target_list, dim=0).float(), dim=-1)
+
+        jepa_batch = DataProto.from_single_dict({
+            "cot_input_ids": cot_padded_ids,
+            "cot_attn_mask": cot_padded_mask,
+            "cot_lengths": torch.tensor(cot_lengths, dtype=torch.long),
+            "teacher_target": teacher_target,
+        })
+        jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
+        jepa_batch.meta_info["n_anchors"] = A
+        return jepa_batch
+
     # ---------------------------------------------------- training loop -----
     def fit(self):
         """JEPA-GRPO training loop.
@@ -781,7 +880,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         # Both supported loss_types use a 3-view (cot/code/clean-wrong)
                         # builder; clreg (v3) collects ALL anchors/wrongs per group
                         # with group ids, the hinge mode one matched triplet per group.
-                        if self.jepa_cfg.loss_type == "jepa-clreg-loss":
+                        if self.jepa_cfg.loss_type == "jepa-tcr-loss":
+                            jepa_batch = self._build_jepa_batch_tcr(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
+                        elif self.jepa_cfg.loss_type == "jepa-clreg-loss":
                             jepa_batch = self._build_jepa_batch_clreg(
                                 batch=batch,
                                 reward_tensor=reward_tensor,

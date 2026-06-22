@@ -436,3 +436,62 @@ def llm_jepa_clreg_loss(
         metrics["jepa/hard_neg_ew_variance"] = 0.0
 
     return loss, metrics
+
+
+# ---------------------------------------------------------------------------
+# TCR (Teacher-Correct Representation) loss: align-to-teacher + SIGReg
+# ---------------------------------------------------------------------------
+
+def llm_jepa_tcr_loss(
+    pred_text: torch.Tensor,          # (A, d) p_i = Pred(Enc(correct student CoT_i)), L2-normalized
+    teacher_target: torch.Tensor,     # (A, d) z_T+ paired to anchor i (precomputed, constant), L2-normalized
+    all_pool: torch.Tensor,           # (A, d) SIGReg pool — STUDENT preds only (the only thing that moves)
+    lambda_: float = 0.5,
+    M: int = 1024,
+    n_freq: int = 17,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    s: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Teacher-Correct Representation (TCR) alignment loss.
+
+    L = (1-λ)·L_align + λ·L_SIGReg
+
+    L_align = (1/A) Σ_i (1 - <p_i, sg(z_T+_i)>)
+
+    Applied to CORRECT student CoT rollouts only (the batch builder filters to
+    rew>0 anchors). Each anchor p_i is pulled toward a precomputed teacher-correct
+    target z_T+_i that lives in the SAME 1536-d student representation space: the
+    target is the teacher's verified-correct *solution text* encoded offline by a
+    frozen student-size reference model — so there is no projector and no
+    cross-dimension cosine (the teacher 3B contributes only the solution text).
+
+    STOP-GRADIENT on the teacher target (it is a cached constant; ``.detach()`` is
+    defensive and keeps the convention explicit). There is NO separation term —
+    SIGReg over the student preds alone supplies the anti-collapse pressure that
+    the dropped correct/wrong contrast used to provide. SIGReg keeps the
+    global-radius rescale that is load-bearing on unit-sphere inputs (see
+    sigreg_loss).
+    """
+    A = pred_text.shape[0]
+    device, dtype = pred_text.device, pred_text.dtype
+
+    # L_align: cosine distance to the stop-gradiented teacher target.
+    pos_sim = (pred_text * teacher_target.detach()).sum(dim=-1)   # (A,)
+    align = (1.0 - pos_sim).mean() if A > 0 else torch.zeros((), device=device, dtype=dtype)
+
+    sig = sigreg_loss(all_pool, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
+
+    loss = (1.0 - lambda_) * align + lambda_ * sig
+
+    metrics = {
+        "jepa/tcr_align_loss": float(align.detach().cpu()),
+        "jepa/tcr_sigreg_loss": float(sig.detach().cpu()),
+        "jepa/tcr_loss": float(loss.detach().cpu()),
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),   # alias read back by worker
+        "jepa/tcr_lambda": float(lambda_),
+        "jepa/n_anchors": int(A),
+        "jepa/tcr_pos_score_mean": float(pos_sim.detach().mean().cpu()) if A > 0 else 0.0,
+        "jepa/pool_size": int(all_pool.shape[0]),
+    }
+    return loss, metrics
