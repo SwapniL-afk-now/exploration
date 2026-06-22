@@ -57,7 +57,8 @@ export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
 
 ########################### user-adjustable ###########################
 MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
-TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/deepscaler_preview_train.parquet}
+# Dataset matched to the dr_grpo baseline (examples/drgrpo_trainer): DAPO-Math-17k.
+TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
 
@@ -108,7 +109,7 @@ fi
 
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
 PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_deepscaler}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-deepseek_r1_distill_qwen_1_5b_jepa_grpo_ray-${RUN_TIMESTAMP}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-deepseek_r1_distill_qwen_1_5b_jepa_grpo_ray_nosep_nokl-${RUN_TIMESTAMP}}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 
@@ -126,10 +127,10 @@ PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}   # 64/32 = 2 gradient steps per 
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
 PPO_MAX_TOKEN_LEN=${PPO_MAX_TOKEN_LEN:-24576}     # 1.5x: 32768 OOM'd at step 80 (save+eval boundary) on the ~9.2GB full-vocab lm_head logits block; 24576 shrinks that block to ~6.9GB for real headroom
-MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-629}   # 1 epoch: floor(40309 train rows / 64 batch size), drop_last=True
+MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}   # fixed-length run on dapo-math-17k, matches the dr_grpo baseline
 
 # Actor optimiser
-ACTOR_LR=${ACTOR_LR:-1e-6}
+ACTOR_LR=${ACTOR_LR:-5e-7}   # matched to the dr_grpo baseline (examples/drgrpo_trainer)
 CLIP_RATIO=${CLIP_RATIO:-0.2}
 ENTROPY_COEFF=${ENTROPY_COEFF:-0.00}   # small entropy bonus; previously 0 let the policy drift unconstrained (length blow-up)
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
@@ -170,11 +171,18 @@ MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
 #                          separation hinge (creates the gap the triplet's
 #                          vanishing gradient cannot). Uses
 #                          SEPARATION_MARGIN/SEPARATION_W/TRIPLET_SIGREG_LAMBDA.
-JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-triplet-loss}
+#   "jepa-clreg-loss"    - v3 CLReg objective (jepa_separation_loss.md): replaces
+#                          the 1:1 hinge with a per-GRPO-group FULL cross product
+#                          of every correct anchor against EVERY wrong joint
+#                          embedding, scored by a DPO log-sigmoid at temperature
+#                          SEPARATION_TAU (or InfoNCE when SEPARATION_MODE=info).
+#                          Uses SEPARATION_TAU/SEPARATION_MODE/SEPARATION_W/
+#                          TRIPLET_SIGREG_LAMBDA (SEPARATION_MARGIN is ignored).
+JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-clreg-loss}
 case "${JEPA_LOSS_TYPE}" in
-    lejepa|llm-jepa-loss|jepa-triplet-loss|jepa-separation-loss) ;;
+    lejepa|llm-jepa-loss|jepa-triplet-loss|jepa-separation-loss|jepa-clreg-loss) ;;
     *) echo "ERROR: JEPA_LOSS_TYPE='${JEPA_LOSS_TYPE}' is invalid. Must be one of:" \
-            "lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss" >&2
+            "lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss | jepa-clreg-loss" >&2
        exit 1 ;;
 esac
 # SIGReg anti-collapse weight for the modes that read the GENERAL lambda
@@ -190,19 +198,32 @@ LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
 # Hard-negative triplet hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-triplet-loss.
 TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.1}
 TRIPLET_W=${TRIPLET_W:-1.0}
-TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.5}   # SIGReg must both replace the dropped LLM-JEPA NTP anti-collapse leg AND fight the pretrained LLM's anisotropy prior, so it needs far more weight than LeJEPA's from-scratch default (0.05/0.1); 0.3 still lost (pos/neg re-converged, margin went negative by step ~24)
+TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.3}   # SIGReg must both replace the dropped LLM-JEPA NTP anti-collapse leg AND fight the pretrained LLM's anisotropy prior, so it needs far more weight than LeJEPA's from-scratch default (0.05/0.1); 0.3 still lost (pos/neg re-converged, margin went negative by step ~24)
 # Separation-loss hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-separation-loss.
 # L_sep = (1/T) Σ relu(SEPARATION_MARGIN - (1 - <e^c,e^w>)); creates the correct/wrong
 # gap the triplet's vanishing (e^c-e^w) gradient could not. e^w is added to the SIGReg
 # pool here so it cannot collapse. SEPARATION_W=1.0 => unweighted negative term.
 SEPARATION_MARGIN=${SEPARATION_MARGIN:-0.1}
-SEPARATION_W=${SEPARATION_W:-1.0}
+SEPARATION_W=${SEPARATION_W:-0.0}   # 0.0 => separation/CLReg negative term OFF (align + SIGReg only)
+# CLReg (v3) hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-clreg-loss
+# (SEPARATION_MARGIN is ignored in that mode). SEPARATION_TAU is the contrastive
+# temperature replacing the hinge margin; SEPARATION_MODE selects the negative
+# form: "dpo" (averaged-pairwise log-sigmoid, doc default) or "info" (InfoNCE).
+# Re-tune SEPARATION_W once live (bounded hinge -> unbounded log-sigmoid); sweep
+# SEPARATION_TAU in {0.1,0.3,0.5,0.7,0.9}.
+SEPARATION_TAU=${SEPARATION_TAU:-0.5}
+SEPARATION_MODE=${SEPARATION_MODE:-dpo}
 # Number of random projection directions for SIGReg's Epps-Pulley statistic.
+# Each direction is a random unit vector in R^d, where d is the encoder's final
+# hidden size (DeepSeek-R1-Distill-Qwen-1.5B: hidden_size=1536; d is read off the
+# pooled embeddings automatically, this knob is only the COUNT of directions).
+# Set to d=1536 so the directions match the embedding dimensionality (one per
+# hidden dim) — enough to span the space while keeping the statistic stable.
 # More directions = sharper, lower-variance anti-collapse gradient (LeJEPA default
 # 1024 is calibrated for large from-scratch batches; our per-step pool is only
 # ~2*valid_pairs embeddings, so the statistic is noisy and easily outrun by the
-# dense alignment gradient — raise it to stabilize SIGReg's gradient direction).
-N_PROJECTIONS=${N_PROJECTIONS:-8192}
+# dense alignment gradient — keep it >= d to stabilize SIGReg's gradient direction).
+N_PROJECTIONS=${N_PROJECTIONS:-4096}
 # Gradient-clip max-norm for jepa_update()'s own optimizer step, tighter than the
 # actor's PPO clip_grad (typically 1.0) since jepa_update shares the actor's
 # optimizer/parameters but runs as its own uncoordinated backward+step.
@@ -231,7 +252,7 @@ BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["aime24","aime25","aime26","amc23"]'}
 
 # KL penalty
 USE_KL_LOSS=${USE_KL_LOSS:-false}   # anchors policy to the reference model; false -> drop KL entirely
-KL_COEF=${KL_COEF:-0.0}   # NOTE: 0.0 previously caused a grad_norm/ppo_kl blowup in this exact script — watch actor/ppo_kl and actor/grad_norm closely
+KL_COEF=${KL_COEF:-0.001}   # NOTE: 0.0 previously caused a grad_norm/ppo_kl blowup in this exact script — watch actor/ppo_kl and actor/grad_norm closely
 ########################### end user-adjustable ###########################
 
 DATA=(
@@ -302,11 +323,11 @@ JEPA=(
     jepa.loss_type=${JEPA_LOSS_TYPE}
     jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
     jepa.sigreg_lambda=${SIGREG_LAMBDA}
-    jepa.triplet_margin=${TRIPLET_MARGIN}
-    jepa.triplet_w=${TRIPLET_W}
     jepa.triplet_sigreg_lambda=${TRIPLET_SIGREG_LAMBDA}
     jepa.separation_margin=${SEPARATION_MARGIN}
     jepa.separation_w=${SEPARATION_W}
+    jepa.separation_tau=${SEPARATION_TAU}
+    jepa.separation_mode=${SEPARATION_MODE}
     jepa.n_projections=${N_PROJECTIONS}
     jepa.alpha_warmup_steps=${ALPHA_WARMUP_STEPS}
     jepa.max_grad_norm=${JEPA_MAX_GRAD_NORM}

@@ -230,155 +230,10 @@ def lejepa_loss(
 # LLM-JEPA loss: cosine-distance prediction alignment + SIGReg
 # ---------------------------------------------------------------------------
 
-def llm_jepa_loss(
-    pred_text: torch.Tensor,        # (B_joint, d) L2-normalized Pred(Enc(Text)) embeddings
-    enc_code: torch.Tensor,         # (B_joint, d) L2-normalized Enc(Code) embeddings
-    all_embeddings: torch.Tensor,   # (N_pool, d)  L2-normalized pool for SIGReg
-    lambda_: float = 0.05,          # SIGReg vs align mixing
-    M: int = 1024,
-    n_freq: int = 17,
-    t_min: float = -5.0,
-    t_max: float = 5.0,
-    s: float = 1.0,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """LLM-JEPA prediction loss (Huang, LeCun, Balestriero — arXiv:2509.14252, eq. 2),
-    combined with SIGReg for anti-collapse.
-
-    L = (1-λ)·d(Pred(Enc(Text)), Enc(Code)) + λ·L_SIGReg
-
-    d is cosine distance (1 - cosine similarity), per the paper's main result
-    (§3.1 "The metric" — confirmed best vs. ℓ2-norm/MSE in the ablation, Table 3).
-    Both inputs are already L2-normalized so cosine similarity reduces to a dot
-    product. ``pred_text`` is Pred(Enc(Text)): with k=0 tied-weight predictor
-    tokens this is just Enc(Text) (Pred(x) = x per the paper); with k>0 it is the
-    embedding of the last appended predictor token (see worker._extract_embeddings).
-
-    The paper relies on a joint cross-entropy/NTP term to prevent embedding
-    collapse. Since that term is intentionally not added here (the existing GRPO
-    objective already covers generative capability), SIGReg (LeJEPA,
-    arXiv:2511.08544) is reused as the anti-collapse regularizer, exactly as in
-    `lejepa_loss`.
-    """
-    # L_align: 1 - cosine_similarity(pred_text, enc_code), averaged over pairs
-    cos_sim = (pred_text * enc_code).sum(dim=-1)        # (B_joint,)
-    align = (1.0 - cos_sim).mean()
-
-    # L_SIGReg: on the full pool (both views, all correct)
-    sig = sigreg_loss(all_embeddings, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
-
-    loss = (1.0 - lambda_) * align + lambda_ * sig
-
-    return loss, {
-        "jepa/llm_jepa_align_loss": float(align.detach().cpu()),
-        "jepa/llm_jepa_cos_sim_mean": float(cos_sim.detach().mean().cpu()),
-        "jepa/llm_jepa_sigreg_loss": float(sig.detach().cpu()),
-        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
-        "jepa/llm_jepa_lambda": float(lambda_),
-        "jepa/n_pairs": int(pred_text.shape[0]),
-        "jepa/pool_size": int(all_embeddings.shape[0]),
-    }
-
-
-# ---------------------------------------------------------------------------
-# LLM-JEPA hard-negative triplet loss: LLM-JEPA align + triplet hinge + SIGReg
-# ---------------------------------------------------------------------------
-
-def llm_jepa_triplet_loss(
-    pred_text: torch.Tensor,          # (B, d) p^c = Pred(Enc(CoT)), L2-normalized
-    enc_code_correct: torch.Tensor,   # (B, d) e^c = Enc(Code_correct), L2-normalized
-    enc_code_wrong: torch.Tensor,     # (T, d) e^w = Enc(Code_wrong), L2-normalized, T <= B
-    all_pool: torch.Tensor,           # (2B, d) [p^c, e^c] pool for SIGReg; e^w excluded
-    margin: float = 0.1,
-    w_tri: float = 0.3,
-    lambda_: float = 0.05,
-    M: int = 1024,
-    n_freq: int = 17,
-    t_min: float = -5.0,
-    t_max: float = 5.0,
-    s: float = 1.0,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """LLM-JEPA prediction loss + hard-negative triplet term + SIGReg.
-
-    L = (1-λ)·(L_align + w_tri·L_tri) + λ·L_SIGReg
-
-    L_align (over all B pairs): cosine distance, identical to ``llm_jepa_loss``.
-
-    L_tri (over the T <= B triplet-eligible prompts):
-        (1/T) * Σ max(0, margin - <p^c_i, e^c_i> + <p^c_i, e^w_i>)
-    ``enc_code_wrong``'s rows are assumed to be a prefix-aligned subset: row i
-    of ``enc_code_wrong`` corresponds to row i of ``pred_text``/
-    ``enc_code_correct`` (the caller/data-pipeline is responsible for this
-    ordering invariant). When T == 0 (no triplet-eligible prompts in the
-    batch), L_tri is set to exactly 0 — never 0/0.
-
-    ``enc_code_wrong`` is always stop-gradiented (detached) before use: this
-    kills gradient into the wrong-code encoder (the "trash-pole" failure
-    mode) while still letting gradient flow into ``p^c`` (repulsion, via the
-    +<p^c, e^w> term) and ``e^c`` (unaffected, via L_align). This is a mode
-    invariant, not a configurable knob.
-
-    SIGReg is computed on ``all_pool`` = [p^c, e^c] only; e^w is deliberately
-    excluded since it is displaced by the triplet term and would change what
-    "isotropic" means for the target distribution.
-    """
-    B = pred_text.shape[0]
-    T = enc_code_wrong.shape[0]
-    device, dtype = pred_text.device, pred_text.dtype
-
-    cos_sim = (pred_text * enc_code_correct).sum(dim=-1)   # (B,)
-    align = (1.0 - cos_sim).mean()
-
-    if T > 0:
-        pos_scores_tri = cos_sim[:T]
-        neg_scores_tri = (pred_text[:T] * enc_code_wrong.detach()).sum(dim=-1)
-        tri = F.relu(margin - pos_scores_tri + neg_scores_tri)
-        align_tri = tri.mean()
-    else:
-        align_tri = torch.zeros((), device=device, dtype=dtype)
-
-    sig = sigreg_loss(all_pool, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
-
-    loss = (1.0 - lambda_) * (align + w_tri * align_tri) + lambda_ * sig
-
-    metrics = {
-        "jepa/llm_jepa_align_loss": float(align.detach().cpu()),
-        "jepa/llm_jepa_triplet_loss": float(align_tri.detach().cpu()) if T > 0 else 0.0,
-        "jepa/llm_jepa_sigreg_loss": float(sig.detach().cpu()),
-        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
-        "jepa/llm_jepa_lambda": float(lambda_),
-        "jepa/n_pairs": int(B),
-        "jepa/n_triplets": int(T),
-        "jepa/triplet_frac": float(T / B) if B > 0 else 0.0,
-        "jepa/pool_size": int(all_pool.shape[0]),
-    }
-    if T > 0:
-        with torch.no_grad():
-            violated = (tri > 0).float().mean()
-        metrics["jepa/triplet_pos_score_mean"] = float(pos_scores_tri.detach().mean().cpu())
-        metrics["jepa/triplet_neg_score_mean"] = float(neg_scores_tri.detach().mean().cpu())
-        metrics["jepa/llm_jepa_triplet_violated_frac"] = float(violated.cpu())
-        metrics["jepa/llm_jepa_triplet_margin"] = float(
-            (pos_scores_tri - neg_scores_tri).detach().mean().cpu()
-        )
-        # unbiased=False: population variance, well-defined even for T == 1
-        # (the unbiased N-1 estimator is NaN there).
-        metrics["jepa/hard_neg_ew_variance"] = float(
-            enc_code_wrong.detach().var(dim=0, unbiased=False).mean().cpu()
-        )
-    else:
-        metrics["jepa/triplet_pos_score_mean"] = 0.0
-        metrics["jepa/triplet_neg_score_mean"] = 0.0
-        metrics["jepa/llm_jepa_triplet_violated_frac"] = 0.0
-        metrics["jepa/llm_jepa_triplet_margin"] = 0.0
-        metrics["jepa/hard_neg_ew_variance"] = 0.0
-
-    return loss, metrics
-
-
 def llm_jepa_separation_loss(
     pred_text: torch.Tensor,          # (B, d) p^c = Pred(Enc(CoT)), L2-normalized
-    enc_code_correct: torch.Tensor,   # (B, d) e^c = Enc(Code_correct), L2-normalized
-    enc_code_wrong: torch.Tensor,     # (T, d) e^w = Enc(Code_wrong), L2-normalized, T <= B
+    enc_code_correct: torch.Tensor,   # (B, d) e^c = Enc(correct code rollout), L2-normalized
+    enc_code_wrong: torch.Tensor,     # (T, d) e^w = Enc(clean-wrong code rollout: wrong CoT + wrong code), L2-normalized, T <= B
     all_pool: torch.Tensor,           # (2B+T, d) [p^c, e^c, e^w] pool for SIGReg; e^w INCLUDED
     sep_margin: float = 0.1,
     sep_w: float = 1.0,
@@ -393,29 +248,26 @@ def llm_jepa_separation_loss(
 
     L = (1-λ)·(L_align + sep_w·L_sep) + λ·L_SIGReg
 
-    This is an alternative negative-side objective to ``llm_jepa_triplet_loss``.
-    The motivation: the triplet term's separating gradient w.r.t. p^c is
-    ∝ (e^c - e^w), which vanishes at the degenerate point e^c ≈ e^w that the
-    encoder actually sits at (hard_neg_ew_variance → 0, pos ≈ neg). The triplet
-    can only *exploit* a pre-existing gap between correct and wrong code; it
-    cannot *create* one.
+    This is a predictor-space triplet: the SAME predictor output
+    p^c = Pred(Enc(correct CoT)) is pulled toward the frozen correct-code
+    target e^c (align) and pushed away from the frozen wrong-code target e^w
+    (separation). Both code poles are stop-gradiented, so the predictor/CoT
+    side is the only mover in both terms.
 
-    L_sep creates the gap directly with a hinge on the correct/wrong PAIR:
+    L_align = (1/B) Σ (1 - <p^c_i, sg(e^c_i)>)
+    L_sep   = (1/T) Σ relu(sep_margin - (1 - <p^c_i, sg(e^w_i)>)).
 
-        L_sep = (1/T) Σ relu(sep_margin - (1 - <e^c_i, e^w_i>)).
+    L_sep is active only while p^c sits within sep_margin (cosine distance) of
+    the wrong-code target; it is a bounded hinge (no softmax), so once p^c is
+    pushed past the margin the gradient is zero — no runaway repulsion.
 
-    Because e^c - e^w cancels the shared-prompt component exactly
-    (e^c = u + δ_c, e^w = u + δ_w ⇒ e^c - e^w = δ_c - δ_w), this margin acts
-    only on the correctness differential — no shared-prompt confound. Its
-    gradient (∂/∂e^c = e^w, ∂/∂e^w = e^c) is unit-magnitude and NON-vanishing
-    even at e^c ≈ e^w, which is exactly the signal the triplet lacked. It is a
-    bounded hinge (no softmax) so there is no runaway repulsion.
-
-    Differences from ``llm_jepa_triplet_loss`` by design:
-      * No weighted negative triplet term (no ``w_tri``); the negative signal
-        is the unweighted L_sep (``sep_w`` defaults to 1.0).
-      * NO stop-gradient: both e^c and e^w move apart (safe — bounded + prompt-
-        canceled).
+    Design notes:
+      * The negative signal is the unweighted L_sep (``sep_w`` defaults to 1.0),
+        not a down-weighted triplet term.
+      * Stop-gradient on BOTH code TARGETS: e^c is detached in align and e^w is
+        detached in the separation hinge. The predictor/CoT side p^c is the
+        only mover in both terms (standard JEPA predictor stopgrad on both
+        poles).
       * e^w is INCLUDED in ``all_pool`` for SIGReg, so it cannot collapse to a
         low-variance pole; each wrong code keeps its own location and the
         separation is per-prompt rather than a global shift.
@@ -424,13 +276,16 @@ def llm_jepa_separation_loss(
     T = enc_code_wrong.shape[0]
     device, dtype = pred_text.device, pred_text.dtype
 
-    cos_sim = (pred_text * enc_code_correct).sum(dim=-1)   # (B,)
+    cos_sim = (pred_text * enc_code_correct.detach()).sum(dim=-1)   # (B,)
     align = (1.0 - cos_sim).mean()
 
     if T > 0:
-        # <e^c, e^w> with gradient on BOTH (no detach): push the pair apart.
-        cw_sim = (enc_code_correct[:T] * enc_code_wrong).sum(dim=-1)   # (T,)
-        sep = F.relu(sep_margin - (1.0 - cw_sim))   # active when (1 - <e^c,e^w>) < sep_margin
+        # <p^c, e^w>: same predictor output as align (p^c = Pred(Enc(correct CoT)))
+        # is pushed AWAY from the frozen wrong-code target e^w. Both code poles
+        # (e^c in align, e^w here) are stop-gradiented, so the predictor/CoT side
+        # is the only mover in BOTH terms -- a predictor-space triplet.
+        cw_sim = (pred_text[:T] * enc_code_wrong.detach()).sum(dim=-1)   # (T,)
+        sep = F.relu(sep_margin - (1.0 - cw_sim))   # active when (1 - <p^c,e^w>) < sep_margin
         sep_loss = sep.mean()
     else:
         sep_loss = torch.zeros((), device=device, dtype=dtype)
@@ -452,9 +307,9 @@ def llm_jepa_separation_loss(
     }
     if T > 0:
         with torch.no_grad():
-            cw = cw_sim.detach()
-            neg_scores = (pred_text[:T] * enc_code_wrong.detach()).sum(dim=-1)
-        # sep_gap = 1 - <e^c,e^w>; should RISE toward sep_margin as the pair separates.
+            cw = cw_sim.detach()   # <p^c, e^w>
+            neg_scores = cw
+        # sep_gap = 1 - <p^c,e^w>; should RISE toward sep_margin as p^c is pushed off e^w.
         metrics["jepa/sep_gap_mean"] = float((1.0 - cw).mean().cpu())
         metrics["jepa/sep_cw_sim_mean"] = float(cw.mean().cpu())
         metrics["jepa/sep_active_frac"] = float((sep > 0).float().mean().cpu())
@@ -470,6 +325,114 @@ def llm_jepa_separation_loss(
         metrics["jepa/sep_active_frac"] = 0.0
         metrics["jepa/triplet_pos_score_mean"] = 0.0
         metrics["jepa/triplet_neg_score_mean"] = 0.0
+        metrics["jepa/hard_neg_ew_variance"] = 0.0
+
+    return loss, metrics
+
+
+# ---------------------------------------------------------------------------
+# CLReg (v3) loss: matched-pair contrastive separation + SIGReg
+# ---------------------------------------------------------------------------
+
+def llm_jepa_clreg_loss(
+    pred_text: torch.Tensor,          # (A, d) p_i = Pred(Enc(correct CoT_i)), L2-normalized, A anchors
+    enc_code_correct: torch.Tensor,   # (A, d) e^c_i = Enc(correct Code) paired with anchor i, L2-normalized
+    enc_code_wrong: torch.Tensor,     # (W, d) e^w_i = Enc(wrong CoT⊕Code joint) MATCHED to the W anchors with a wrong
+    wrong_mask: torch.Tensor,         # (A,) bool — True for anchors that have a matched wrong (sum == W)
+    all_pool: torch.Tensor,           # (2A+W, d) [p^c, e^c, e^w] pool for SIGReg (option a)
+    tau: float = 0.5,
+    mode: str = "dpo",
+    sep_w: float = 1.0,
+    lambda_: float = 0.5,
+    M: int = 1024,
+    n_freq: int = 17,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    s: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """CLReg separation loss (jepa_separation_loss.md), LLM-JEPA style.
+
+    L = (1-λ)·(L_align + sep_w·L_s) + λ·L_SIGReg
+
+    L_align = (1/A) Σ_i (1 - <p_i, e^c_i>)
+
+    L_s uses MATCHED 1:1 PAIRS (not a per-group cross product): each correct
+    anchor p_i is paired with a single wrong joint embedding e^w_i drawn (cycled)
+    from the same GRPO group at batch-build time. ``enc_code_wrong`` holds those
+    W matched negatives, aligned to the W anchors selected by ``wrong_mask`` (in
+    order). With s(·,·) = cosine similarity on L2-normalized vectors, over the W
+    anchors that have a matched wrong:
+
+      mode="dpo":
+        L_s = mean_i  -2·τ·logσ( (s(p_i, e^c_i) - s(p_i, e^w_i)) / τ )
+      mode="info":   (single negative -> binary softmax)
+        L_s = mean_i  -log[ exp(s/τ_pos) / (exp(s/τ_pos) + exp(s/τ_neg)) ]
+            = mean_i  softplus( (s(p_i, e^w_i) - s(p_i, e^c_i)) / τ )
+
+    Anchors with no matched wrong contribute 0 (when W == 0, L_s == 0).
+
+    NO stop-gradient (LLM-JEPA, arXiv:2509.14252): Pred, Enc(Text) and Enc(Code)
+    are the same LLM encoder in a single forward pass; there is no frozen target
+    network, so e^c and e^w receive gradient just like p_i does (the paper never
+    detaches). SIGReg pool is code-only/decoupled (option a in the doc): it reuses
+    the already-computed [p^c, e^c, e^w] embeddings, not a second representation.
+    """
+    A = pred_text.shape[0]
+    W = enc_code_wrong.shape[0]
+    device, dtype = pred_text.device, pred_text.dtype
+
+    # L_align: cosine distance between each anchor and its positive code. No
+    # stop-gradient — gradient flows through e^c too (LLM-JEPA shared encoder).
+    pos_sim = (pred_text * enc_code_correct).sum(dim=-1)   # (A,)
+    align = (1.0 - pos_sim).mean()
+
+    if W > 0:
+        wrong_mask = wrong_mask.bool()
+        pos_w = pos_sim[wrong_mask]                                  # (W,) s(p_i, e^c_i)
+        # s(p_i, e^w_i) for each matched pair. No stop-gradient — e^w receives
+        # gradient too (same shared encoder; the negative is pushed away as p is).
+        neg_sim = (pred_text[wrong_mask] * enc_code_wrong).sum(dim=-1)   # (W,)
+        margin = (pos_w - neg_sim) / tau                            # (W,)
+        if mode == "info":
+            # Binary softmax with a single negative == softplus(-margin).
+            per_pair = F.softplus(-margin)
+        else:
+            # DPO: log-sigmoid of the (pos - neg) margin.
+            per_pair = -2.0 * tau * F.logsigmoid(margin)
+        sep_loss = per_pair.mean()
+        active = margin < 0                                          # positive not yet dominant
+    else:
+        sep_loss = torch.zeros((), device=device, dtype=dtype)
+        active = torch.zeros((0,), dtype=torch.bool, device=device)
+
+    sig = sigreg_loss(all_pool, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
+
+    loss = (1.0 - lambda_) * (align + sep_w * sep_loss) + lambda_ * sig
+
+    metrics = {
+        "jepa/clreg_align_loss": float(align.detach().cpu()),
+        "jepa/separation_loss": float(sep_loss.detach().cpu()) if W > 0 else 0.0,
+        "jepa/clreg_sigreg_loss": float(sig.detach().cpu()),
+        "jepa/clreg_loss": float(loss.detach().cpu()),
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),   # alias read back by worker
+        "jepa/clreg_lambda": float(lambda_),
+        "jepa/clreg_tau": float(tau),
+        "jepa/n_pairs": int(A),
+        "jepa/n_wrong": int(W),
+        "jepa/pool_size": int(all_pool.shape[0]),
+    }
+    metrics["jepa/triplet_pos_score_mean"] = float(pos_sim.detach().mean().cpu()) if A > 0 else 0.0
+    if W > 0:
+        metrics["jepa/sep_active_frac"] = float(active.float().mean().cpu())
+        metrics["jepa/triplet_neg_score_mean"] = float(neg_sim.detach().mean().cpu())
+        metrics["jepa/sep_gap_mean"] = float((pos_w.detach() - neg_sim.detach()).mean().cpu())
+        metrics["jepa/hard_neg_ew_variance"] = float(
+            enc_code_wrong.detach().var(dim=0, unbiased=False).mean().cpu()
+        )
+    else:
+        metrics["jepa/sep_active_frac"] = 0.0
+        metrics["jepa/triplet_neg_score_mean"] = 0.0
+        metrics["jepa/sep_gap_mean"] = 0.0
         metrics["jepa/hard_neg_ew_variance"] = 0.0
 
     return loss, metrics

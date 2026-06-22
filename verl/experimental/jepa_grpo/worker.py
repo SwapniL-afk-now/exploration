@@ -35,10 +35,8 @@ from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
 from verl.experimental.jepa_grpo.core_algos import (
-    lejepa_loss,
-    llm_jepa_loss,
+    llm_jepa_clreg_loss,
     llm_jepa_separation_loss,
-    llm_jepa_triplet_loss,
 )
 
 
@@ -499,15 +497,13 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
     def jepa_update(self, data: TensorDict) -> TensorDict:
         """Run a JEPA-only forward+backward+optimizer step.
 
-        Two mutually-exclusive objectives, selected by ``self.jepa_cfg.loss_type``:
-          - "lejepa" (default): squared-Euclidean align between a live CoT
-            encoder and an EMA target Code encoder, + SIGReg (unchanged).
-          - "llm-jepa-loss": the LLM-JEPA paper's (arXiv:2509.14252) literal
-            symmetric architecture — ONE live encoder for both CoT and Code
-            (no EMA/target network, no stop-gradient), cosine-distance
-            prediction loss between Pred(Enc(CoT)) and Enc(Code), combined
-            with SIGReg for anti-collapse since no NTP term is added here
-            (see core_algos.llm_jepa_loss).
+        Objective: ``jepa-separation-loss`` (the only supported loss_type) —
+        ONE live encoder for all views (no EMA/target network on the loss path),
+        predictor tokens on the CoT rows only so p^c = Pred(Enc(correct CoT)).
+        p^c is pulled toward the stop-gradiented correct-code target e^c (align)
+        and pushed off the stop-gradiented clean-wrong target e^w (separation
+        hinge), with SIGReg over [p^c, e^c, e^w] for anti-collapse
+        (see core_algos.llm_jepa_separation_loss).
 
         Args:
             data: TensorDict with keys:
@@ -524,7 +520,11 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
-        if self.jepa_cfg.loss_type in ("llm-jepa-loss", "jepa-triplet-loss", "jepa-separation-loss") and self.jepa_cfg.predictor_k > 0:
+        assert self.jepa_cfg.loss_type in ("jepa-separation-loss", "jepa-clreg-loss"), (
+            f"worker.jepa_update only supports loss_type in "
+            f"{{'jepa-separation-loss', 'jepa-clreg-loss'}}, got {self.jepa_cfg.loss_type!r}"
+        )
+        if self.jepa_cfg.predictor_k > 0:
             assert self.jepa_cfg.predictor_token_id >= 0, (
                 "predictor_k > 0 requires a resolved predictor_token_id; "
                 "JEPARayPPOTrainer.init_workers() should have set this before jepa_init()"
@@ -540,11 +540,6 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
 
         engine = self.actor.engine
         cfg = self.jepa_cfg
-        use_llm_jepa = cfg.loss_type == "llm-jepa-loss"
-        use_separation = cfg.loss_type == "jepa-separation-loss"
-        # Both triplet and separation share the same 3-view (cot/code/wrong)
-        # joint-forward path; they differ only in the loss fn + SIGReg pool.
-        use_triplet = cfg.loss_type in ("jepa-triplet-loss", "jepa-separation-loss")
 
         # Bounds peak activation memory during the joint forward+backward to
         # roughly `micro_bs` rows instead of the full joint batch (which can be
@@ -567,20 +562,69 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         with engine.train_mode():
             engine.optimizer_zero_grad()
 
-            if use_triplet:
-                # -- jepa-triplet-loss: llm-jepa-loss's architecture (one live
-                # encoder, predictor tokens on CoT rows only) plus a hard-negative
-                # triplet term against a "clean wrong" code rollout. The wrong-code
-                # view is data["wrong_*"], padded to the same B rows as cot/code
-                # with `wrong_lengths == 0` marking non-triplet-eligible prompts
-                # (see ray_trainer._build_jepa_batch_triplet) — filter those out
-                # before the joint forward so only the real T <= B wrong rows are
-                # encoded.
+            # ONE live encoder for all views, predictor tokens on the CoT rows
+            # only so p^c = Pred(Enc(correct CoT)). The cot/code/wrong blocks of
+            # the input TensorDict are each padded to a common row count with
+            # `*_lengths == 0` marking padding rows (see ray_trainer builders) —
+            # filter those out before the joint forward so only real rows are
+            # encoded. The joint forward + loss differ per loss_type below.
+            wrong_lengths_full = data["wrong_lengths"]
+            wrong_mask = wrong_lengths_full > 0
+            n_wrong = int(wrong_mask.sum().item())
+
+            if cfg.loss_type == "jepa-separation-loss":
+                # 1:1 margin-hinge triplet (cot/code already exactly B real rows).
                 n_cot = data["cot_input_ids"].shape[0]
                 n_code = data["code_input_ids"].shape[0]
-                wrong_lengths_full = data["wrong_lengths"]
-                wrong_mask = wrong_lengths_full > 0
-                n_wrong = int(wrong_mask.sum().item())
+                groups = [
+                    (data["cot_input_ids"], data["cot_attn_mask"]),
+                    (data["code_input_ids"], data["code_attn_mask"]),
+                ]
+                lengths = [data["cot_lengths"], data["code_lengths"]]
+                joint_predictor_k = [cfg.predictor_k] * n_cot + [0] * n_code
+                if n_wrong > 0:
+                    groups.append((data["wrong_input_ids"][wrong_mask], data["wrong_attn_mask"][wrong_mask]))
+                    lengths.append(wrong_lengths_full[wrong_mask])
+                    joint_predictor_k += [0] * n_wrong
+
+                joint_ids, joint_mask = self._pad_concat_batches(groups)
+                joint_lengths = torch.cat(lengths, dim=0)
+
+                def _loss_fn(joint_emb, _n_cot=n_cot, _n_code=n_code, _n_wrong=n_wrong):
+                    enc_q_cot = joint_emb[:_n_cot]
+                    enc_a_code = joint_emb[_n_cot:_n_cot + _n_code]
+                    if _n_wrong > 0:
+                        enc_code_wrong = joint_emb[_n_cot + _n_code:]
+                    else:
+                        enc_code_wrong = joint_emb.new_zeros((0, joint_emb.shape[-1]))
+                    # e^w is INCLUDED in the SIGReg pool (it must not collapse); the
+                    # negative signal is the unweighted correctness-separation hinge
+                    # L_sep — see core_algos.llm_jepa_separation_loss.
+                    all_pool = torch.cat([enc_q_cot, enc_a_code, enc_code_wrong], dim=0)
+                    return llm_jepa_separation_loss(
+                        pred_text=enc_q_cot,
+                        enc_code_correct=enc_a_code,
+                        enc_code_wrong=enc_code_wrong,
+                        all_pool=all_pool,
+                        sep_margin=cfg.separation_margin,
+                        sep_w=cfg.separation_w,
+                        lambda_=cfg.triplet_sigreg_lambda,
+                        M=cfg.n_projections,
+                        t_min=cfg.t_min,
+                        t_max=cfg.t_max,
+                        s=cfg.epps_pulley_s,
+                    )
+            else:
+                # jepa-clreg-loss: MATCHED-PAIR separation. cot/code each carry A
+                # real anchor/positive rows (paired); the wrong block is ALSO A rows,
+                # aligned 1:1 to anchors, with `wrong_lengths == 0` for anchors whose
+                # group had no clean-wrong rollout (see _build_jepa_batch_clreg).
+                # `wrong_mask` (A,) selects the W anchors with a matched wrong; only
+                # those W wrong rows are encoded, in anchor order, so they line up
+                # with pred_text[wrong_mask] inside the loss.
+                n_cot = data["cot_input_ids"].shape[0]
+                n_code = data["code_input_ids"].shape[0]
+                clreg_wrong_mask = wrong_mask   # (A,) bool, True where a wrong exists
 
                 groups = [
                     (data["cot_input_ids"], data["cot_attn_mask"]),
@@ -596,42 +640,28 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 joint_ids, joint_mask = self._pad_concat_batches(groups)
                 joint_lengths = torch.cat(lengths, dim=0)
 
-                def _triplet_loss_fn(joint_emb, _n_cot=n_cot, _n_code=n_code, _n_wrong=n_wrong):
+                def _loss_fn(joint_emb, _n_cot=n_cot, _n_code=n_code, _n_wrong=n_wrong,
+                             _wrong_mask=clreg_wrong_mask):
                     enc_q_cot = joint_emb[:_n_cot]
                     enc_a_code = joint_emb[_n_cot:_n_cot + _n_code]
                     if _n_wrong > 0:
                         enc_code_wrong = joint_emb[_n_cot + _n_code:]
                     else:
                         enc_code_wrong = joint_emb.new_zeros((0, joint_emb.shape[-1]))
-                    if use_separation:
-                        # jepa-separation-loss: e^w is INCLUDED in the SIGReg pool
-                        # (it must not collapse), and the negative signal is the
-                        # unweighted correctness-separation hinge L_sep, not a
-                        # weighted triplet — see core_algos.llm_jepa_separation_loss.
-                        all_pool = torch.cat([enc_q_cot, enc_a_code, enc_code_wrong], dim=0)
-                        return llm_jepa_separation_loss(
-                            pred_text=enc_q_cot,
-                            enc_code_correct=enc_a_code,
-                            enc_code_wrong=enc_code_wrong,
-                            all_pool=all_pool,
-                            sep_margin=cfg.separation_margin,
-                            sep_w=cfg.separation_w,
-                            lambda_=cfg.triplet_sigreg_lambda,
-                            M=cfg.n_projections,
-                            t_min=cfg.t_min,
-                            t_max=cfg.t_max,
-                            s=cfg.epps_pulley_s,
-                        )
-                    # SIGReg pool excludes e^w (it's deliberately displaced by the
-                    # triplet term — see core_algos.llm_jepa_triplet_loss docstring).
-                    all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
-                    return llm_jepa_triplet_loss(
+                    # SIGReg pool = [p^c, e^c, e^w] (option a, code-only/decoupled):
+                    # reuse the already-computed embeddings, no second representation.
+                    # NOTE: no stop-gradient on any view (LLM-JEPA shared encoder) —
+                    # gradient flows through e^c and e^w as well as p^c.
+                    all_pool = torch.cat([enc_q_cot, enc_a_code, enc_code_wrong], dim=0)
+                    return llm_jepa_clreg_loss(
                         pred_text=enc_q_cot,
                         enc_code_correct=enc_a_code,
                         enc_code_wrong=enc_code_wrong,
+                        wrong_mask=_wrong_mask,
                         all_pool=all_pool,
-                        margin=cfg.triplet_margin,
-                        w_tri=cfg.triplet_w,
+                        tau=cfg.separation_tau,
+                        mode=cfg.separation_mode,
+                        sep_w=cfg.separation_w,
                         lambda_=cfg.triplet_sigreg_lambda,
                         M=cfg.n_projections,
                         t_min=cfg.t_min,
@@ -639,73 +669,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                         s=cfg.epps_pulley_s,
                     )
 
-                jepa_metrics = self._embed_chunked_with_backward(
-                    joint_ids, joint_mask, joint_lengths, joint_predictor_k, _triplet_loss_fn, micro_bs, alpha,
-                )
-            elif use_llm_jepa:
-                # -- LLM-JEPA (arXiv:2509.14252), literal symmetric architecture:
-                # ONE live encoder for both views, no EMA/target network, no
-                # stop-gradient — gradient flows through both Enc(Text)=
-                # Pred(...) and Enc(Code). CoT and Code rows are packed into a
-                # SINGLE joint batch; only the CoT rows get `predictor_k`
-                # tied-weight predictor tokens appended (k=0 -> Pred(x) = x,
-                # per the paper §3.1).
-                n_cot = data["cot_input_ids"].shape[0]
-                n_code = data["code_input_ids"].shape[0]
-                joint_ids, joint_mask = self._pad_concat_batch(
-                    data["cot_input_ids"], data["cot_attn_mask"],
-                    data["code_input_ids"], data["code_attn_mask"],
-                )
-                joint_lengths = torch.cat([data["cot_lengths"], data["code_lengths"]], dim=0)
-                joint_predictor_k = [cfg.predictor_k] * n_cot + [0] * n_code
-
-                def _llm_jepa_loss_fn(joint_emb, _n_cot=n_cot):
-                    enc_q_cot = joint_emb[:_n_cot]
-                    enc_a_code = joint_emb[_n_cot:]
-                    # No .detach() on either view — both contribute gradient,
-                    # matching the paper's no-stop-gradient design.
-                    all_pool = torch.cat([enc_q_cot, enc_a_code], dim=0)
-                    return llm_jepa_loss(
-                        pred_text=enc_q_cot,
-                        enc_code=enc_a_code,
-                        all_embeddings=all_pool,
-                        lambda_=cfg.sigreg_lambda,
-                        M=cfg.n_projections,
-                        t_min=cfg.t_min,
-                        t_max=cfg.t_max,
-                        s=cfg.epps_pulley_s,
-                    )
-
-                jepa_metrics = self._embed_chunked_with_backward(
-                    joint_ids, joint_mask, joint_lengths, joint_predictor_k, _llm_jepa_loss_fn, micro_bs, alpha,
-                )
-            else:
-                # -- LeJEPA (default, unchanged): live CoT encoder + EMA Code
-                # target encoder, two separate forwards (Code pass is
-                # no_grad so it never enters the autograd/FSDP1 hook graph).
-                n_cot = data["cot_input_ids"].shape[0]
-                enc_a_code = self._embed_chunked_no_grad(
-                    data["code_input_ids"], data["code_attn_mask"], data["code_lengths"],
-                    use_ema=True, micro_bs=micro_bs,
-                )
-
-                def _lejepa_loss_fn(enc_q_cot, _enc_a_code=enc_a_code):
-                    all_pool = torch.cat([enc_q_cot, _enc_a_code.detach()], dim=0)
-                    return lejepa_loss(
-                        enc_q_cot=enc_q_cot,
-                        enc_a_code=_enc_a_code.detach(),
-                        all_embeddings=all_pool,
-                        lambda_=cfg.sigreg_lambda,
-                        M=cfg.n_projections,
-                        t_min=cfg.t_min,
-                        t_max=cfg.t_max,
-                        s=cfg.epps_pulley_s,
-                    )
-
-                jepa_metrics = self._embed_chunked_with_backward(
-                    data["cot_input_ids"], data["cot_attn_mask"], data["cot_lengths"],
-                    [0] * n_cot, _lejepa_loss_fn, micro_bs, alpha,
-                )
+            jepa_metrics = self._embed_chunked_with_backward(
+                joint_ids, joint_mask, joint_lengths, joint_predictor_k, _loss_fn, micro_bs, alpha,
+            )
 
             grad_norm = engine.optimizer_step(clip_grad_override=self.jepa_cfg.max_grad_norm)
 
@@ -722,16 +688,12 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         # OOM even though the actual *allocated* memory would fit. Release it now.
         aggressive_empty_cache(force_sync=True)
 
-        # jepa_metrics already carries the per-mode total under its own key
-        # ("jepa/lejepa_loss" for lejepa, "jepa/llm_jepa_loss" for both
-        # llm-jepa-loss and jepa-triplet-loss) — read it back instead of
-        # keeping a `loss` tensor reference, since the actual loss tensor now
-        # lives inside the (possibly micro-batched) loss_fn closures above.
-        _total_loss_value = jepa_metrics.get("jepa/lejepa_loss", jepa_metrics.get("jepa/llm_jepa_loss", 0.0))
+        # jepa_metrics already carries the separation-loss total under
+        # "jepa/llm_jepa_loss" — read it back instead of keeping a `loss` tensor
+        # reference, since the actual loss tensor now lives inside the (possibly
+        # micro-batched) loss_fn closure above.
+        _total_loss_value = jepa_metrics.get("jepa/llm_jepa_loss", 0.0)
         out = {
-            # Generic key valid for either loss_type; mode-specific totals
-            # ("jepa/lejepa_loss" / "jepa/llm_jepa_loss") are also present via
-            # jepa_metrics below.
             "jepa/total_loss": torch.tensor(float(_total_loss_value)),
             "jepa/n_valid_pairs": torch.tensor(float(n_pairs)),
             "jepa/skipped": torch.tensor(0.0),

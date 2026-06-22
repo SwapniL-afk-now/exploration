@@ -67,7 +67,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         if self.jepa_cfg.enable:
             import dataclasses
 
-            if self.jepa_cfg.loss_type in ("llm-jepa-loss", "jepa-triplet-loss", "jepa-separation-loss") and self.jepa_cfg.predictor_k > 0:
+            if self.jepa_cfg.predictor_k > 0:
                 self.jepa_cfg.predictor_token_id = self._resolve_predictor_token_id()
 
             cfg_dict = dataclasses.asdict(self.jepa_cfg)
@@ -295,7 +295,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         reward_tensor: torch.Tensor,
         view_tags: np.ndarray,
     ) -> DataProto | None:
-        """Build the jepa-triplet-loss batch: full correct-CoT response, first
+        """Build the jepa-separation-loss batch: full correct-CoT response, first
         correct code response, and (when available) a "clean wrong" code
         response per prompt.
 
@@ -449,6 +449,137 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         })
         jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
         jepa_batch.meta_info["n_triplets"] = T
+        return jepa_batch
+
+    # ------------------------------------ JEPA CLReg batch construction (v3) -
+    def _build_jepa_batch_clreg(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> DataProto | None:
+        """Build the jepa-clreg-loss batch: per GRPO group, ALL correct CoT
+        anchors, a per-anchor correct-code positive, and a per-anchor MATCHED
+        clean-wrong negative (cycled from that group's clean-wrong rollouts).
+
+        Layout (all three blocks have exactly A rows, aligned 1:1 by anchor):
+          - cot block: every CORRECT CoT rollout of every valid group is an anchor
+            (not just the first), so A >= number of groups.
+          - code block: anchor i paired with that group's correct code rollout
+            `correct_code[i mod n_correct_code]` (a genuine e^c_i per anchor).
+          - wrong block: anchor i paired with that group's clean-wrong code rollout
+            `group_wrongs[i mod n_group_wrongs]`; if the group has NO clean-wrong
+            rollout, that anchor's wrong row is empty (`wrong_lengths == 0`) and it
+            contributes no separation term. This is a MATCHED 1:1 pairing, not a
+            per-group cross product — the loss pairs anchor i only with wrong i.
+        worker.jepa_update filters wrong rows by `wrong_lengths > 0`; those W real
+        rows stay in anchor order, so they line up with `pred_text[wrong_mask]`.
+
+        Returns None if fewer than min_valid_pairs valid groups exist.
+        """
+        uids = batch.non_tensor_batch["uid"]
+        rew = reward_tensor.sum(dim=-1)
+
+        cot_by_uid, code_by_uid, valid_uids = self._group_rows_by_uid(uids, view_tags, rew)
+
+        if len(valid_uids) < self.jepa_cfg.min_valid_pairs:
+            return None
+
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        code_response_mask = batch.batch.get("response_mask", None)
+        reward_models = batch.non_tensor_batch.get("reward_model", [{}] * len(batch))
+        data_sources = batch.non_tensor_batch.get("data_source", [None] * len(batch))
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        def _real_tokens(flat_idx):
+            ids = all_input_ids[flat_idx]
+            attn = all_attn_mask[flat_idx]
+            return ids[attn.bool()], int(attn.sum())
+
+        cot_ids_list, cot_lengths = [], []
+        code_ids_list, code_lengths = [], []
+        wrong_ids_list, wrong_lengths = [], []
+        n_correct_cot_list = []
+        for u in valid_uids:
+            correct_cot = [i for i in cot_by_uid[u] if rew[i] > 0]
+            correct_code = [i for i in code_by_uid[u] if rew[i] > 0]
+            if not correct_cot or not correct_code:
+                continue   # _group_rows_by_uid already guarantees both non-empty
+            n_correct_cot_list.append(len(correct_cot))
+
+            ground_truth = reward_models[correct_code[0]].get("ground_truth") if isinstance(
+                reward_models[correct_code[0]], dict
+            ) else None
+            dataset_kind = data_sources[correct_code[0]]
+
+            # This group's clean-wrong code rollouts (parseable answer, but wrong).
+            group_wrongs = []
+            for cand_idx in code_by_uid[u]:
+                if rew[cand_idx] > 0:
+                    continue
+                if code_response_mask is not None:
+                    response_length = code_response_mask.shape[-1]
+                    resp_ids_full = all_input_ids[cand_idx][-response_length:]
+                    resp_ids = resp_ids_full[code_response_mask[cand_idx].bool()]
+                else:
+                    resp_ids = all_input_ids[cand_idx][all_attn_mask[cand_idx].bool()]
+                if resp_ids.numel() == 0:
+                    continue
+                resp_text = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
+                result = compute_math_reward(resp_text, ground_truth, dataset_kind=dataset_kind)
+                if result.has_parseable_answer:
+                    group_wrongs.append(cand_idx)
+
+            # One row per anchor; code + wrong cycled within the group (matched pair).
+            for j, cot_idx in enumerate(correct_cot):
+                ids, length = _real_tokens(cot_idx)
+                cot_ids_list.append(ids)
+                cot_lengths.append(length)
+                ids, length = _real_tokens(correct_code[j % len(correct_code)])
+                code_ids_list.append(ids)
+                code_lengths.append(length)
+                if group_wrongs:
+                    ids, length = _real_tokens(group_wrongs[j % len(group_wrongs)])
+                else:
+                    ids, length = all_input_ids.new_zeros((1,)), 0
+                wrong_ids_list.append(ids)
+                wrong_lengths.append(length)
+
+        A = len(cot_ids_list)
+        W = int(sum(1 for length in wrong_lengths if length > 0))
+        if A < self.jepa_cfg.min_valid_pairs:
+            return None
+
+        def _pad_stack(seqs, lengths_list):
+            max_len = max(s.shape[0] for s in seqs)
+            rows = torch.stack([
+                torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in seqs
+            ])
+            masks = torch.stack([
+                torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, max_len - length))
+                for length in lengths_list
+            ])
+            return rows, masks
+
+        cot_padded_ids, cot_padded_mask = _pad_stack(cot_ids_list, cot_lengths)
+        code_padded_ids, code_padded_mask = _pad_stack(code_ids_list, code_lengths)
+        wrong_padded_ids, wrong_padded_mask = _pad_stack(wrong_ids_list, wrong_lengths)
+
+        jepa_batch = DataProto.from_single_dict({
+            "cot_input_ids": cot_padded_ids,
+            "cot_attn_mask": cot_padded_mask,
+            "cot_lengths": torch.tensor(cot_lengths, dtype=torch.long),
+            "code_input_ids": code_padded_ids,
+            "code_attn_mask": code_padded_mask,
+            "code_lengths": torch.tensor(code_lengths, dtype=torch.long),
+            "wrong_input_ids": wrong_padded_ids,
+            "wrong_attn_mask": wrong_padded_mask,
+            "wrong_lengths": torch.tensor(wrong_lengths, dtype=torch.long),
+        })
+        jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
+        jepa_batch.meta_info["n_anchors"] = A
+        jepa_batch.meta_info["n_wrong"] = W
         return jepa_batch
 
     # ---------------------------------------------------- training loop -----
@@ -647,16 +778,21 @@ class JEPARayPPOTrainer(RayPPOTrainer):
 
                     # Build JEPA pairs
                     with simple_timer("jepa_build_batch", timing_raw):
-                        build_fn = (
-                            self._build_jepa_batch_triplet
-                            if self.jepa_cfg.loss_type in ("jepa-triplet-loss", "jepa-separation-loss")
-                            else self._build_jepa_batch
-                        )
-                        jepa_batch = build_fn(
-                            batch=batch,
-                            reward_tensor=reward_tensor,
-                            view_tags=view_tags,
-                        )
+                        # Both supported loss_types use a 3-view (cot/code/clean-wrong)
+                        # builder; clreg (v3) collects ALL anchors/wrongs per group
+                        # with group ids, the hinge mode one matched triplet per group.
+                        if self.jepa_cfg.loss_type == "jepa-clreg-loss":
+                            jepa_batch = self._build_jepa_batch_clreg(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
+                        else:
+                            jepa_batch = self._build_jepa_batch_triplet(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
 
                     if jepa_batch is not None:
                         # JEPA update on worker (embedding extract + backward + EMA sync)

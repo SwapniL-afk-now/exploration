@@ -54,7 +54,7 @@ export WANDB_SILENT=${WANDB_SILENT:-true}
 
 ########################### user-adjustable ###########################
 MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
-TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/deepscaler_preview_train.parquet}
+TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
 
@@ -124,11 +124,11 @@ LORA_RANK=${LORA_RANK:-512}
 LORA_ALPHA=${LORA_ALPHA:-1024}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 
-ACTOR_LR=${ACTOR_LR:-1e-6}
+ACTOR_LR=${ACTOR_LR:-5e-7}
 ENTROPY_COEFF=${ENTROPY_COEFF:-0}
 CLIP_RATIO=${CLIP_RATIO:-0.2}
-USE_KL_LOSS=${USE_KL_LOSS:-false}   # false -> drop KL entirely; set true to re-enable
-KL_LOSS_COEF=${KL_LOSS_COEF:-0.0}
+USE_KL_LOSS=${USE_KL_LOSS:-true}   # false -> drop KL entirely; set true to re-enable
+KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
 
 ROLLOUT_TP=${ROLLOUT_TP:-1}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.55}   # 0.75 left vLLM holding too much memory for the log_prob/backward passes alongside it
@@ -142,7 +142,7 @@ VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
-MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-629}   # 1 epoch: floor(40309 train rows / 64 batch size), drop_last=True
+MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}   # fixed-length run on dapo-math-17k
 SAVE_FREQ=${SAVE_FREQ:-20}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}   # catches val-path bugs/crashes immediately instead of after test_freq steps
