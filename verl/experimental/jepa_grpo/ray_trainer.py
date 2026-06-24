@@ -25,6 +25,7 @@ on the actor worker itself so gradients are never shipped over Ray.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from collections import defaultdict
 from typing import Any
@@ -68,7 +69,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # dataset row index (extra_info["index"]); each value is a (n_i, d) tensor
         # of L2-normalized teacher-correct target embeddings in student space.
         self.teacher_targets: dict[int, torch.Tensor] | None = None
-        if self.jepa_cfg.enable and self.jepa_cfg.loss_type == "jepa-tcr-loss":
+        if self.jepa_cfg.enable and self.jepa_cfg.loss_type in (
+            "jepa-tcr-loss", "jepa-tcr-reward", "jepa-tcr-hybrid"
+        ):
             raw = torch.load(self.jepa_cfg.teacher_cache_path, map_location="cpu")
             self.teacher_targets = {
                 int(k): v.float() for k, v in raw.items() if v is not None and v.numel() > 0
@@ -601,14 +604,18 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         reward_tensor: torch.Tensor,
         view_tags: np.ndarray,
     ) -> DataProto | None:
-        """Build the jepa-tcr-loss batch: CoT-only correct student anchors, each
-        paired with a PRECOMPUTED teacher-correct target embedding.
+        """Build the jepa-tcr-loss batch: correct student anchors from BOTH the
+        CoT and Code views, each paired with a PRECOMPUTED teacher-correct target
+        embedding.
 
         Unlike the clreg/separation builders this has a single block:
-          - cot block: every CORRECT CoT rollout (rew>0) of every prompt whose
-            dataset index has cached teacher targets is an anchor. Code/wrong
-            rollouts are ignored entirely (the teacher target replaces e^c, and
-            there is no separation term).
+          - anchor block: every CORRECT rollout (rew>0), CoT *or* Code, of every
+            prompt whose dataset index has cached teacher targets is an anchor.
+            Both views are pulled toward the SAME teacher target under the single
+            TCR alpha, so they are drawn toward each other transitively — cross-view
+            consistency falls out without a separate term or a second weight. Wrong
+            rollouts are ignored unless jepa_anchor_set says otherwise (the teacher
+            target replaces e^c, and there is no separation term).
           - teacher_target block: a (A, d) float tensor aligned 1:1 to the anchor
             rows, drawn from this prompt's cached targets `Z_u` (n_u, d) by either
             cycle (`j % n_u`) or random matching (jepa.tcr_match).
@@ -626,21 +633,35 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         all_attn_mask = batch.batch["attention_mask"]
         pad_id = self.tokenizer.pad_token_id or 0
 
-        # Group correct CoT rows by uid, preserving first-seen order. Record each
-        # uid's dataset index so we can look its teacher targets up in the cache.
-        cot_by_uid: dict = defaultdict(list)
+        # Group anchor-eligible rows by uid AND view, preserving first-seen order.
+        # Record each uid's dataset index for the teacher-target cache lookup.
+        rows_by_uid: dict = defaultdict(lambda: {"cot": [], "code": []})
         idx_by_uid: dict = {}
         for i, (u, v) in enumerate(zip(uids, view_tags)):
-            if v != "cot":
+            if v not in ("cot", "code"):
                 continue
-            cot_by_uid[u].append(i)
+            rows_by_uid[u][v].append(i)
             if u not in idx_by_uid:
                 info = extra_infos[i]
                 idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
 
         anchor_set = self.jepa_cfg.jepa_anchor_set
+
+        def _select(idxs):
+            # Select anchors by reward according to jepa_anchor_set, then drop
+            # degenerate zero-length rows (they would yield a zero embedding and
+            # pollute the stratified means; normal rollouts always carry the prompt).
+            if anchor_set == "correct":
+                sel = [i for i in idxs if rew[i] > 0]
+            elif anchor_set == "wrong":
+                sel = [i for i in idxs if rew[i] <= 0]
+            else:  # "all"
+                sel = list(idxs)
+            return [i for i in sel if int(all_attn_mask[i].sum()) > 0]
+
         cot_ids_list, cot_lengths, target_list = [], [], []
         group_id_list, is_correct_list = [], []
+        crossview_pairs: list = []
         n_correct_cot_list = []
         group_counter = 0
         for u in dict.fromkeys(uids):  # dedup, preserves first-seen order
@@ -648,36 +669,42 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             targets = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
             if targets is None or targets.numel() == 0:
                 continue
-            # Select anchors by reward according to jepa_anchor_set. All anchors share the
-            # identical [x, y_S, [PRED]] format and predict the teacher-correct target.
-            cot_idxs = cot_by_uid.get(u, [])
-            if anchor_set == "correct":
-                selected = [i for i in cot_idxs if rew[i] > 0]
-            elif anchor_set == "wrong":
-                selected = [i for i in cot_idxs if rew[i] <= 0]
-            else:  # "all"
-                selected = list(cot_idxs)
-            # Defensive: drop degenerate zero-length rows (would yield a zero embedding
-            # in the encoder and pollute the stratified means). Normal rollouts always
-            # carry the prompt, so this is just a safety net.
-            selected = [i for i in selected if int(all_attn_mask[i].sum()) > 0]
-            if not selected:
+            cot_sel = _select(rows_by_uid[u]["cot"])
+            code_sel = _select(rows_by_uid[u]["code"])
+            if not cot_sel and not code_sel:
                 continue
             n_u = targets.shape[0]
-            n_correct_cot_list.append(sum(1 for i in selected if rew[i] > 0))
+            n_correct_cot_list.append(sum(1 for i in cot_sel + code_sel if rew[i] > 0))
             gid = group_counter
             group_counter += 1
-            for j, cot_idx in enumerate(selected):
-                ids = all_input_ids[cot_idx][all_attn_mask[cot_idx].bool()]
-                cot_ids_list.append(ids)
-                cot_lengths.append(int(all_attn_mask[cot_idx].sum()))
+            # Pair the k-th correct CoT with the k-th correct Code and give the PAIR
+            # one SHARED teacher target. Minimizing both views' alignment to the same
+            # point pulls CoT and Code of this prompt together AND toward the teacher.
+            # When a slot has BOTH views present we also record the (CoT-row, Code-row)
+            # anchor positions in `crossview_pairs` so the worker can add the CoT<->Code
+            # alignment as another term in the TCR align slot. Unequal counts:
+            # leftover unpaired anchors still align to their slot's target but form no
+            # cross-view pair. All anchors share the [x, y_S, [PRED]] format.
+            n_slots = max(len(cot_sel), len(code_sel))
+            for k in range(n_slots):
                 if self.jepa_cfg.tcr_match == "random":
                     t_row = int(torch.randint(n_u, (1,)).item())
                 else:  # cycle
-                    t_row = j % n_u
-                target_list.append(targets[t_row])
-                group_id_list.append(gid)
-                is_correct_list.append(bool(rew[cot_idx] > 0))
+                    t_row = k % n_u
+                slot_pos = {}
+                for view, sel in (("cot", cot_sel), ("code", code_sel)):
+                    if k >= len(sel):
+                        continue
+                    idx = sel[k]
+                    ids = all_input_ids[idx][all_attn_mask[idx].bool()]
+                    slot_pos[view] = len(cot_ids_list)  # anchor-row position
+                    cot_ids_list.append(ids)
+                    cot_lengths.append(int(all_attn_mask[idx].sum()))
+                    target_list.append(targets[t_row])
+                    group_id_list.append(gid)
+                    is_correct_list.append(bool(rew[idx] > 0))
+                if "cot" in slot_pos and "code" in slot_pos:
+                    crossview_pairs.append((slot_pos["cot"], slot_pos["code"]))
 
         A = len(cot_ids_list)
         if A < self.jepa_cfg.min_valid_pairs:
@@ -693,6 +720,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         ])
         teacher_target = torch.nn.functional.normalize(torch.stack(target_list, dim=0).float(), dim=-1)
 
+        # Per-anchor cross-view partner row (or -1). Shape (A,) so it batches with the
+        # anchor rows; the worker reconstructs unordered (CoT,Code) pairs from it.
+        crossview_partner = torch.full((A,), -1, dtype=torch.long)
+        for a, b in crossview_pairs:
+            crossview_partner[a] = b
+            crossview_partner[b] = a
+
         jepa_batch = DataProto.from_single_dict({
             "cot_input_ids": cot_padded_ids,
             "cot_attn_mask": cot_padded_mask,
@@ -700,10 +734,162 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             "teacher_target": teacher_target,
             "anchor_group_id": torch.tensor(group_id_list, dtype=torch.long),
             "anchor_is_correct": torch.tensor(is_correct_list, dtype=torch.bool),
+            "crossview_partner": crossview_partner,
         })
         jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
         jepa_batch.meta_info["n_anchors"] = A
+        jepa_batch.meta_info["n_crossview_pairs"] = len(crossview_pairs)
         return jepa_batch
+
+    # ------------------------------------------- TCR reward shaping (idea #2) -
+    @staticmethod
+    def _stratified_shaping(
+        s: torch.Tensor,
+        group_ids: list,
+        is_correct: torch.Tensor,
+        beta: float,
+        sigma_floor: float,
+    ) -> tuple[torch.Tensor, int]:
+        """Within-(group, is_correct)-stratum standardized shaping term β·ŝ.
+
+        For each (group_id, correctness) stratum with >=2 members, standardize the
+        scores `s` (mean 0, std clamped at `sigma_floor`) and scale by β. Singleton
+        or degenerate strata contribute 0. Returns (shaped (n,), n_strata_shaped).
+
+        Pure function of its tensors (no model/state) so it is unit-testable. Key
+        invariants it guarantees: (a) a constant added to all of one stratum's
+        scores leaves ŝ unchanged (global-shift invariance); (b) shaping is computed
+        independently per correctness stratum, so it never moves mass across the
+        correct/wrong boundary.
+        """
+        n = s.shape[0]
+        shaped = torch.zeros(n, dtype=torch.float32)
+        strata: dict = defaultdict(list)
+        for j in range(n):
+            strata[(group_ids[j], bool(is_correct[j]))].append(j)
+        n_shaped = 0
+        for members in strata.values():
+            if len(members) < 2:
+                continue
+            idx = torch.tensor(members)
+            sv = s[idx].float()
+            shat = (sv - sv.mean()) / max(float(sv.std(unbiased=False)), sigma_floor)
+            for m, val in zip(members, shat):
+                shaped[m] = beta * float(val)
+            n_shaped += 1
+        return shaped, n_shaped
+
+    def _compute_tcr_reward_shaping(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> tuple[torch.Tensor, dict]:
+        """jepa-tcr-reward: teacher-alignment reward shaping (NO differentiable loss).
+
+        Scores every CoT *and* Code rollout's [PRED] latent against its question's
+        cached teacher-correct targets, standardizes the score WITHIN its
+        (uid, view, is_correct) reward stratum, and returns a per-row additive
+        advantage term β·ŝ_i. Both views are shaped symmetrically with the dual-view
+        JEPA loss arm.
+
+        Within-stratum centering makes the term (a) invariant to a global latent
+        shift (defeating the cos_correct≈cos_wrong shortcut) and (b) unable to flip
+        a correct-vs-wrong ordering (ground truth always dominates). Rows whose
+        prompt has no cached target, or singleton/degenerate strata, get 0.
+
+        Returns:
+            (shape_per_row, metrics): shape_per_row is a (B,) CPU float tensor
+            aligned 1:1 with `batch` rows (0 for non-cot / unshaped rows).
+        """
+        assert self.teacher_targets is not None, "teacher target cache not loaded"
+        B = len(batch)
+        shape_per_row = torch.zeros(B, dtype=torch.float32)
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        # Collect all CoT *and* Code rows whose prompt has cached targets. Both views
+        # are scored against the teacher and shaped, mirroring the dual-view JEPA arm
+        # (a code rollout that lands near the teacher should earn the same advantage
+        # bonus a CoT one does). View is tracked so each view is standardized within
+        # its own (uid, view, is_correct) stratum below.
+        scored_rows: list[int] = []
+        scored_views: list[str] = []
+        for i, v in enumerate(view_tags):
+            if v not in ("cot", "code") or int(all_attn_mask[i].sum()) == 0:
+                continue
+            info = extra_infos[i]
+            ds_idx = int(info["index"]) if isinstance(info, dict) else None
+            if ds_idx is None or self.teacher_targets.get(ds_idx) is None:
+                continue
+            scored_rows.append(i)
+            scored_views.append(v)
+        if len(scored_rows) < self.jepa_cfg.min_valid_pairs:
+            return shape_per_row, {"shaping/frac_groups_shaped": 0.0, "shaping/n_rows_scored": 0.0}
+
+        # Forward-only [PRED] embeddings for the scored rows (worker RPC, no backward).
+        ids_list = [all_input_ids[i][all_attn_mask[i].bool()] for i in scored_rows]
+        lengths = [int(all_attn_mask[i].sum()) for i in scored_rows]
+        max_len = max(s.shape[0] for s in ids_list)
+        padded_ids = torch.stack([
+            torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in ids_list
+        ])
+        padded_mask = torch.stack([
+            torch.nn.functional.pad(torch.ones(L, dtype=torch.long), (0, max_len - L)) for L in lengths
+        ])
+        score_td = DataProto.from_single_dict({
+            "cot_input_ids": padded_ids,
+            "cot_attn_mask": padded_mask,
+            "cot_lengths": torch.tensor(lengths, dtype=torch.long),
+        }).to_tensordict()
+        out = self.actor_rollout_wg.score_cot_embeddings(score_td)
+        if isinstance(out, list):
+            out = out[0] if out else None
+        emb = out["cot_emb"].float()  # (n_rows, d), L2-normalized
+
+        # s_i = max_k <p_i, z_k> over the question's cached targets.
+        s = torch.empty(len(scored_rows), dtype=torch.float32)
+        is_correct = torch.empty(len(scored_rows), dtype=torch.bool)
+        gids = []
+        for j, i in enumerate(scored_rows):
+            ds_idx = int(extra_infos[i]["index"])
+            Z = self.teacher_targets[ds_idx].to(emb.dtype)  # (n_i, d)
+            s[j] = (emb[j].unsqueeze(0) * Z).sum(dim=-1).max()
+            is_correct[j] = bool(rew[i] > 0)
+            # Stratum key includes the view so CoT and Code are standardized against
+            # their own kind (their similarity-to-teacher scales differ).
+            gids.append((uids[i], scored_views[j]))
+
+        # Standardize within each (uid, view, is_correct) stratum, then scale by β.
+        beta = float(self.jepa_cfg.tcr_reward_beta)
+        sigma_floor = float(self.jepa_cfg.tcr_reward_sigma_floor)
+        shaped, n_shaped_groups = self._stratified_shaping(
+            s, gids, is_correct, beta=beta, sigma_floor=sigma_floor,
+        )
+        for j in range(len(scored_rows)):
+            shape_per_row[scored_rows[j]] = float(shaped[j])
+
+        # Monitors (do not affect the optimized objective).
+        s_np = s.numpy()
+        corr = 0.0
+        if is_correct.any() and (~is_correct).any():
+            corr = float(np.corrcoef(s_np, is_correct.numpy().astype(np.float32))[0, 1])
+        metrics = {
+            "shaping/corr_s_correct": corr,
+            "shaping/s_mean_correct": float(s[is_correct].mean()) if is_correct.any() else 0.0,
+            "shaping/s_mean_wrong": float(s[~is_correct].mean()) if (~is_correct).any() else 0.0,
+            "shaping/adv_std": float(shape_per_row[shape_per_row != 0].std(unbiased=False)) if (shape_per_row != 0).any() else 0.0,
+            "shaping/n_rows_scored": float(len(scored_rows)),
+            "shaping/n_rows_scored_cot": float(scored_views.count("cot")),
+            "shaping/n_rows_scored_code": float(scored_views.count("code")),
+            "shaping/n_strata_shaped": float(n_shaped_groups),
+            "shaping/frac_rows_shaped": float((shape_per_row != 0).sum()) / max(1, len(scored_rows)),
+        }
+        return shape_per_row, metrics
 
     # ------------------------------------------------ memory diagnostics -----
     @staticmethod
@@ -923,6 +1109,27 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         batch = batch.union(ref_log_prob)
                 self._log_gpu_mem("after_old_log_prob")
 
+                # ── Step 3.5: TCR reward shaping (idea #2) ───────────────
+                # Fold teacher-alignment into the advantage BEFORE the actor update,
+                # so the signal rides the policy gradient (generation channel) rather
+                # than a separate latent-pull backward. vLLM is asleep and the actor
+                # FSDP is warm here, so the forward-only embedding pass is memory-safe.
+                if self.jepa_cfg.enable and self.jepa_cfg.loss_type in (
+                    "jepa-tcr-reward", "jepa-tcr-hybrid"
+                ):
+                    with simple_timer("tcr_reward_shaping", timing_raw):
+                        view_tags_s = batch.non_tensor_batch["view"]
+                        shape_per_row, shaping_metrics = self._compute_tcr_reward_shaping(
+                            batch=batch, reward_tensor=reward_tensor, view_tags=view_tags_s,
+                        )
+                        rmask = batch.batch["response_mask"]
+                        shape_term = shape_per_row.to(
+                            device=batch.batch["advantages"].device,
+                            dtype=batch.batch["advantages"].dtype,
+                        ).unsqueeze(-1) * rmask
+                        batch.batch["advantages"] = batch.batch["advantages"] + shape_term
+                        metrics.update(shaping_metrics)
+
                 # ── Step 4: GRPO actor update ────────────────────────────
                 with simple_timer("update_actor", timing_raw):
                     actor_output = self._update_actor(batch)
@@ -939,7 +1146,10 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 cot_mask_rows = (view_tags == "cot")
                 code_mask_rows = (view_tags == "code")
 
-                if self.jepa_cfg.enable:
+                # jepa-tcr-reward applies its signal as advantage shaping in Step 3.5
+                # (no auxiliary loss / backward), so skip the JEPA loss block entirely.
+                # jepa-tcr-hybrid keeps BOTH: the Step-3.5 shaping AND this loss arm.
+                if self.jepa_cfg.enable and self.jepa_cfg.loss_type != "jepa-tcr-reward":
                     metrics["jepa/n_cot"] = float(n_cot)
                     metrics["jepa/n_code"] = float(n_code)
 
@@ -948,7 +1158,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         # Both supported loss_types use a 3-view (cot/code/clean-wrong)
                         # builder; clreg (v3) collects ALL anchors/wrongs per group
                         # with group ids, the hinge mode one matched triplet per group.
-                        if self.jepa_cfg.loss_type == "jepa-tcr-loss":
+                        if self.jepa_cfg.loss_type in ("jepa-tcr-loss", "jepa-tcr-hybrid"):
                             jepa_batch = self._build_jepa_batch_tcr(
                                 batch=batch,
                                 reward_tensor=reward_tensor,
@@ -1046,7 +1256,19 @@ class JEPARayPPOTrainer(RayPPOTrainer):
 
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
-                progress_bar.set_postfix(metrics)
+                # The full metrics dict (~150 keys) on the tqdm postfix floods the
+                # console and slows the terminal. Only show it when explicitly opted in
+                # via VERL_CONSOLE_FULL_METRICS=1; otherwise a tiny curated subset.
+                if os.environ.get("VERL_CONSOLE_FULL_METRICS", "0") == "1":
+                    progress_bar.set_postfix(metrics)
+                else:
+                    _short = {
+                        k: round(metrics[k], 4)
+                        for k in ("actor/loss", "actor/grad_norm", "jepa/tcr_loss",
+                                  "jepa/grad_norm", "train/accuracy", "timing_s/step_total")
+                        if k in metrics
+                    }
+                    progress_bar.set_postfix(_short)
 
                 if is_last_step:
                     return

@@ -929,9 +929,27 @@ class DataProto:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
-        for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+        # Align non_tensor_batch columns across shards before concatenating. Different
+        # reward functions (e.g. math vs. code benchmarks mixed into one validation
+        # batch) can attach different reward_extra_info columns (code adds "pass_rate",
+        # math does not), so shards may not share an identical key set. Take the union
+        # of keys and pad columns missing from a shard with None for that shard's rows.
+        all_keys = []
+        for d in data:
+            for k in d.non_tensor_batch.keys():
+                if k not in all_keys:
+                    all_keys.append(k)
+        non_tensor_batch = {}
+        for key in all_keys:
+            arrays = []
+            for d in data:
+                if key in d.non_tensor_batch:
+                    arrays.append(d.non_tensor_batch[key])
+                else:
+                    filler = np.empty(len(d), dtype=object)
+                    filler[:] = None
+                    arrays.append(filler)
+            non_tensor_batch[key] = np.concatenate(arrays, axis=0)
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}
@@ -946,6 +964,12 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "reward_extra_keys":
+                        # Set of reward_extra_info column names; differs across shards
+                        # when math and code benchmarks are mixed. Union rather than
+                        # require equality (columns are aligned via union above).
+                        merged = merged_meta_info.get(k, set())
+                        merged_meta_info[k] = set(merged) | set(v)
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys

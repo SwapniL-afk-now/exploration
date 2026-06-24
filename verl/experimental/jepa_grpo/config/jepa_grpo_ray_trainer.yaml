@@ -29,6 +29,14 @@ jepa:
   separation_w: 1.0
   separation_tau: 0.5          # contrastive temperature (jepa-clreg-loss only)
   separation_mode: dpo         # jepa-clreg-loss negative form: dpo | info
+  # -- jepa-tcr-loss only --
+  teacher_cache_path: ""       # .pt of {dataset_index: (n_i,d)} teacher-correct targets
+  n_targets_per_q: 4           # cap of cached targets used per question
+  tcr_match: cycle             # anchor->target pairing: cycle | random
+  jepa_anchor_set: correct     # anchors: correct | all | wrong (reward-stratified)
+  # -- jepa-tcr-reward only (teacher-alignment reward shaping; no aux loss) --
+  tcr_reward_beta: 0.5         # advantage-shaping strength (standardized score scale)
+  tcr_reward_sigma_floor: 0.1  # min within-stratum std (noise guard)
 
 # ── Algorithm (GRPO, no KL) ─────────────────────────────────────────────────
 algorithm:

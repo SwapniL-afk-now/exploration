@@ -189,11 +189,16 @@ MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
 #                          TRIPLET_SIGREG_LAMBDA (SEPARATION_* are ignored).
 JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-clreg-loss}
 case "${JEPA_LOSS_TYPE}" in
-    lejepa|llm-jepa-loss|jepa-triplet-loss|jepa-separation-loss|jepa-clreg-loss|jepa-tcr-loss) ;;
+    lejepa|llm-jepa-loss|jepa-triplet-loss|jepa-separation-loss|jepa-clreg-loss|jepa-tcr-loss|jepa-tcr-reward|jepa-tcr-hybrid) ;;
     *) echo "ERROR: JEPA_LOSS_TYPE='${JEPA_LOSS_TYPE}' is invalid. Must be one of:" \
-            "lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss | jepa-clreg-loss | jepa-tcr-loss" >&2
+            "lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss | jepa-clreg-loss | jepa-tcr-loss | jepa-tcr-reward | jepa-tcr-hybrid" >&2
        exit 1 ;;
 esac
+# jepa-tcr-reward only: teacher-alignment REWARD SHAPING (no aux loss). Reuses
+# TEACHER_CACHE; JEPA_REWARD_BETA is the shaping strength, JEPA_SIGMA_FLOOR the
+# within-stratum std floor.
+JEPA_REWARD_BETA=${JEPA_REWARD_BETA:-0.5}
+JEPA_SIGMA_FLOOR=${JEPA_SIGMA_FLOOR:-0.1}
 # jepa-tcr-loss only: offline teacher-target cache + per-question target controls.
 # TEACHER_CACHE is the .pt written by precompute_teacher_targets.py (keyed by dataset
 # index). TCR_MATCH is "cycle" (deterministic anchor->target) or "random".
@@ -353,6 +358,8 @@ JEPA=(
     jepa.n_targets_per_q=${N_TARGETS_PER_Q}
     jepa.tcr_match=${TCR_MATCH}
     jepa.jepa_anchor_set=${JEPA_ANCHOR_SET}
+    jepa.tcr_reward_beta=${JEPA_REWARD_BETA}
+    jepa.tcr_reward_sigma_floor=${JEPA_SIGMA_FLOOR}
 )
 
 TRAINER=(

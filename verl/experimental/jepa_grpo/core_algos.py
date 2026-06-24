@@ -448,6 +448,7 @@ def llm_jepa_tcr_loss(
     all_pool: torch.Tensor,           # (A, d) SIGReg pool — STUDENT preds only (the only thing that moves)
     group_id: torch.Tensor | None = None,    # (A,) long: per-prompt id (0..G-1) for each anchor
     is_correct: torch.Tensor | None = None,  # (A,) bool: True for rew>0 anchors
+    crossview_partner: torch.Tensor | None = None,  # (A,) long: cross-view partner row, or -1
     lambda_: float = 0.5,
     M: int = 1024,
     n_freq: int = 17,
@@ -544,7 +545,25 @@ def llm_jepa_tcr_loss(
 
     sig = sigreg_loss(all_pool, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
 
-    loss = (1.0 - lambda_) * align + lambda_ * sig
+    # CoT<->Code cross-view alignment, treated as ANOTHER alignment term (same footing
+    # as the teacher pull, inside the same (1-λ) slot — no separate weight). Pulls each
+    # prompt's paired views' preds toward each other (both move — no stop-grad), on top
+    # of each one's pull to the teacher. Self-gating: zero pairs (e.g. n_code=0) => 0.
+    cv_align = torch.zeros((), device=device, dtype=dtype)
+    n_cv = 0
+    if crossview_partner is not None:
+        partner = crossview_partner.to(device=device, dtype=torch.long)
+        rows = torch.arange(A, device=device)
+        # Each unordered pair once: keep rows whose partner exists and has a higher index.
+        keep = (partner >= 0) & (partner > rows)
+        if keep.any():
+            a_idx = rows[keep]
+            b_idx = partner[keep]
+            cv_sim = (pred_text[a_idx] * pred_text[b_idx]).sum(dim=-1)  # both have grad
+            cv_align = (1.0 - cv_sim).mean()
+            n_cv = int(keep.sum().item())
+
+    loss = (1.0 - lambda_) * (align + cv_align) + lambda_ * sig
 
     # ---- monitor-only stats (do NOT affect the optimized loss) ----
     pos_sim_d = pos_sim.detach()
@@ -586,5 +605,9 @@ def llm_jepa_tcr_loss(
         "jepa/cos_total": pos_mean_v,
         "jepa/cos_correct": cos_correct,
         "jepa/cos_wrong": cos_wrong,
+        # cross-view (CoT<->Code) alignment monitors
+        "jepa/crossview_align_loss": float(cv_align.detach().cpu()),
+        "jepa/cos_cot_code": float((1.0 - cv_align).detach().cpu()) if n_cv > 0 else 0.0,
+        "jepa/n_crossview_pairs": int(n_cv),
     }
     return loss, metrics

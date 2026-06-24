@@ -118,6 +118,14 @@ class JEPARayConfig:
     #   "all"     — every rollout (correct + wrong)
     #   "wrong"   — only rew<=0 rollouts (analysis ablation)
     jepa_anchor_set: str = "correct"
+    # -- jepa-tcr-reward only (idea #2: teacher-alignment reward shaping) --
+    # Uses the SAME teacher_cache_path / n_targets_per_q as jepa-tcr-loss, but applies
+    # the alignment as an additive advantage term β·ŝ_i (NO differentiable loss / no
+    # backward). ŝ_i is the per-rollout score s_i = max_k <p_i, z_k> standardized within
+    # its (uid, is_correct) reward stratum, so the term is global-shift invariant and
+    # never flips a correct-vs-wrong ordering. See JEPA_TCR_LOSS.md / the plan.
+    tcr_reward_beta: float = 0.5          # shaping strength (standardized score scale)
+    tcr_reward_sigma_floor: float = 0.1   # min within-stratum std (noise guard)
     # Number of tied-weight predictor tokens (paper §3.1). k=0 -> Pred(x) = x
     # (identity), so for a real predictive separation set predictor_k > 0.
     predictor_k: int = 0
@@ -160,21 +168,37 @@ class JEPARayConfig:
         spin up, instead of surfacing as a shape mismatch deep inside fit().
         """
         if self.enable and self.loss_type not in (
-            "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss"
+            "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss",
+            "jepa-tcr-reward", "jepa-tcr-hybrid"
         ):
             raise ValueError(
-                f"jepa.loss_type must be 'jepa-separation-loss', 'jepa-clreg-loss' or "
-                f"'jepa-tcr-loss' (the supported ray/worker objectives); got {self.loss_type!r}"
+                f"jepa.loss_type must be one of 'jepa-separation-loss', 'jepa-clreg-loss', "
+                f"'jepa-tcr-loss', 'jepa-tcr-reward', 'jepa-tcr-hybrid' (the supported "
+                f"ray/worker objectives); got {self.loss_type!r}"
             )
         if self.enable and self.loss_type == "jepa-clreg-loss" and self.separation_mode not in ("dpo", "info"):
             raise ValueError(
                 f"jepa.separation_mode must be 'dpo' or 'info' for jepa-clreg-loss; "
                 f"got {self.separation_mode!r}"
             )
-        if self.enable and self.loss_type == "jepa-tcr-loss":
+        # Reward-shaping arm (jepa-tcr-reward and the hybrid).
+        if self.enable and self.loss_type in ("jepa-tcr-reward", "jepa-tcr-hybrid"):
             if not self.teacher_cache_path:
                 raise ValueError(
-                    "jepa.loss_type='jepa-tcr-loss' requires jepa.teacher_cache_path "
+                    f"jepa.loss_type={self.loss_type!r} requires jepa.teacher_cache_path "
+                    "(the offline teacher-target cache from precompute_teacher_targets.py)"
+                )
+            if self.tcr_reward_beta < 0:
+                raise ValueError(f"jepa.tcr_reward_beta must be >= 0; got {self.tcr_reward_beta}")
+            if self.tcr_reward_sigma_floor <= 0:
+                raise ValueError(
+                    f"jepa.tcr_reward_sigma_floor must be > 0; got {self.tcr_reward_sigma_floor}"
+                )
+        # Differentiable TCR loss arm (jepa-tcr-loss and the hybrid).
+        if self.enable and self.loss_type in ("jepa-tcr-loss", "jepa-tcr-hybrid"):
+            if not self.teacher_cache_path:
+                raise ValueError(
+                    f"jepa.loss_type={self.loss_type!r} requires jepa.teacher_cache_path "
                     "(the offline teacher-target cache from precompute_teacher_targets.py)"
                 )
             if self.tcr_match not in ("cycle", "random"):
@@ -196,7 +220,9 @@ class JEPARayConfig:
         # tcr mode aligns CoT anchors only — it does not need correct CODE rollouts,
         # so n_code==0 (all rollout budget on CoT) is allowed there. The other modes
         # build their positive/negative from code rollouts and still require n_code>0.
-        if self.enable and self.n_code == 0 and self.loss_type != "jepa-tcr-loss":
+        if self.enable and self.n_code == 0 and self.loss_type not in (
+            "jepa-tcr-loss", "jepa-tcr-reward", "jepa-tcr-hybrid"
+        ):
             raise ValueError(
                 "jepa.enable=True requires jepa.n_code > 0 (no code-framed rollouts to build JEPA pairs from)"
             )

@@ -379,25 +379,71 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         lengths: torch.Tensor,
         use_ema: bool,
         micro_bs: int,
+        predictor_k: "int | list[int]" = 0,
+        predictor_token_id: int | None = None,
     ) -> torch.Tensor:
         """No-grad embedding extraction, chunked to bound forward activation memory.
 
         No backward is needed here (used for the EMA Code target encoder in
-        "lejepa" mode), so this is just a plain loop + concat — no GradCache
-        machinery required.
+        "lejepa" mode, and for the jepa-tcr-reward forward-only scoring pass), so
+        this is just a plain loop + concat — no GradCache machinery required.
+
+        `predictor_k`/`predictor_token_id` mirror `_extract_embeddings`: pass
+        cfg.predictor_k to read the Pred(Enc(text)) [PRED]-token embedding instead
+        of the last real token. A per-row list is sliced per chunk.
         """
         N = ids.shape[0]
+        per_row_k = isinstance(predictor_k, (list, tuple))
+
+        def _k(start, end):
+            return list(predictor_k[start:end]) if per_row_k else predictor_k
+
         if N <= micro_bs:
-            emb, _ = self._extract_embeddings(ids, mask, lengths, use_ema=use_ema, requires_grad=False)
+            emb, _ = self._extract_embeddings(
+                ids, mask, lengths, use_ema=use_ema, requires_grad=False,
+                predictor_k=_k(0, N), predictor_token_id=predictor_token_id,
+            )
             return emb
         chunks = []
         for start in range(0, N, micro_bs):
             end = min(start + micro_bs, N)
             emb, _ = self._extract_embeddings(
                 ids[start:end], mask[start:end], lengths[start:end], use_ema=use_ema, requires_grad=False,
+                predictor_k=_k(start, end), predictor_token_id=predictor_token_id,
             )
             chunks.append(emb)
         return torch.cat(chunks, dim=0)
+
+    # ------------------------------------------------ TCR reward scoring ---
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def score_cot_embeddings(self, data: TensorDict) -> TensorDict:
+        """Forward-only [PRED]-token embeddings for jepa-tcr-reward shaping.
+
+        Unlike jepa_update this runs NO backward, NO EMA, and NO optimizer step:
+        it just returns p_i = Pred(Enc([x, y_S,i, [PRED]])) for every passed CoT
+        rollout row, L2-normalized, so the trainer can score them against the
+        cached teacher-correct targets and fold the result into the advantage.
+
+        Args:
+            data: TensorDict with cot_input_ids (N, L), cot_attn_mask (N, L),
+                cot_lengths (N,).
+        Returns:
+            TensorDict with key "cot_emb" (N, d) float32 unit embeddings.
+        """
+        assert self.jepa_cfg is not None, "Call jepa_init() before score_cot_embeddings()"
+        engine = self.actor.engine
+        cfg = self.jepa_cfg
+        micro_bs = max(1, cfg.embed_micro_batch_size)
+        N = data["cot_input_ids"].shape[0]
+        with engine.eval_mode():
+            emb = self._embed_chunked_no_grad(
+                data["cot_input_ids"], data["cot_attn_mask"], data["cot_lengths"],
+                use_ema=False, micro_bs=micro_bs,
+                predictor_k=[cfg.predictor_k] * N,
+                predictor_token_id=cfg.predictor_token_id,
+            )
+        aggressive_empty_cache(force_sync=True)
+        return TensorDict({"cot_emb": emb.float().cpu()}, batch_size=[])
 
     def _embed_chunked_with_backward(
         self,
@@ -522,10 +568,10 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
         assert self.jepa_cfg.loss_type in (
-            "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss"
+            "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss", "jepa-tcr-hybrid"
         ), (
             f"worker.jepa_update only supports loss_type in "
-            f"{{'jepa-separation-loss', 'jepa-clreg-loss', 'jepa-tcr-loss'}}, "
+            f"{{'jepa-separation-loss', 'jepa-clreg-loss', 'jepa-tcr-loss', 'jepa-tcr-hybrid'}}, "
             f"got {self.jepa_cfg.loss_type!r}"
         )
         if self.jepa_cfg.predictor_k > 0:
@@ -572,10 +618,12 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             # `*_lengths == 0` marking padding rows (see ray_trainer builders) —
             # filter those out before the joint forward so only real rows are
             # encoded. The joint forward + loss differ per loss_type below.
-            if cfg.loss_type == "jepa-tcr-loss":
+            if cfg.loss_type in ("jepa-tcr-loss", "jepa-tcr-hybrid"):
                 # CoT-only: encode the A correct student anchors (predictor tokens
                 # on every row); the teacher targets are precomputed constants that
                 # bypass the encoder entirely. SIGReg pool = student preds alone.
+                # (jepa-tcr-hybrid runs this SAME loss arm in addition to the
+                # reward-shaping term applied trainer-side; see ray_trainer Step 3.5.)
                 n_cot = data["cot_input_ids"].shape[0]
                 groups = [(data["cot_input_ids"], data["cot_attn_mask"])]
                 lengths = [data["cot_lengths"]]
@@ -585,12 +633,14 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 # CoT anchor rows; correct & wrong anchors share the identical [PRED] path).
                 anchor_group_id = data.get("anchor_group_id", None)
                 anchor_is_correct = data.get("anchor_is_correct", None)
+                crossview_partner = data.get("crossview_partner", None)
 
                 joint_ids, joint_mask = self._pad_concat_batches(groups)
                 joint_lengths = torch.cat(lengths, dim=0)
 
                 def _loss_fn(joint_emb, _teacher_target=teacher_target,
-                             _group_id=anchor_group_id, _is_correct=anchor_is_correct):
+                             _group_id=anchor_group_id, _is_correct=anchor_is_correct,
+                             _crossview_partner=crossview_partner):
                     pred_text = joint_emb
                     return llm_jepa_tcr_loss(
                         pred_text=pred_text,
@@ -600,6 +650,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                         all_pool=pred_text,   # SIGReg over student preds only
                         group_id=_group_id,
                         is_correct=_is_correct,
+                        crossview_partner=_crossview_partner,
                         lambda_=cfg.triplet_sigreg_lambda,
                         M=cfg.n_projections,
                         t_min=cfg.t_min,
