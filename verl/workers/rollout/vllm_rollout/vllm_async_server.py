@@ -610,16 +610,16 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return []
         sequence_ids = normalize_token_ids(sequence_ids)
-        tafr_vllm_adapter_spec(adapter)
-        if VLLM_LORA_INT_ID not in await self.engine.list_loras():
-            raise RuntimeError(f"TAFR vLLM scoring adapter {adapter!r} is not loaded.")
+        spec = tafr_vllm_adapter_spec(adapter)
+        if spec.int_id not in await self.engine.list_loras():
+            raise RuntimeError(f"TAFR vLLM scoring adapter {adapter!r} (int_id={spec.int_id}) is not loaded.")
         if len(sequence_ids) > self.config.max_model_len:
             raise ValueError(
                 f"Sequence length ({len(sequence_ids)}) exceeds max_model_len ({self.config.max_model_len})."
             )
 
         prompt = {"prompt_token_ids": sequence_ids, "multi_modal_data": {}}
-        lora_request = LoRARequest(lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH)
+        lora_request = LoRARequest(lora_name=spec.name, lora_int_id=spec.int_id, lora_path=spec.path)
         sampling_kwargs = {
             "max_tokens": 0,
             "prompt_logprobs": 0,

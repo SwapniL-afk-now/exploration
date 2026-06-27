@@ -142,8 +142,22 @@ custom_tafr_grpo:
   # Batch size for failure-SFT updates
   failure_sft_batch_size: 8
 
+  # Token budget for failure-SFT micro-batching. >0 packs records greedily so each
+  # step's padded tokens (rows*max_len) stay under this budget (higher GPU util);
+  # 0 falls back to the fixed failure_sft_batch_size.
+  failure_sft_max_token_len_per_gpu: 0
+
   # Maximum failure-SFT optimizer updates at each SFT interval
   failure_sft_max_updates_per_interval: 1
+
+  # Throttle heavy TAFR disk writes. 0 = write on every EMA refresh. When > 0, the
+  # EMA refresh + vLLM adapter export still run every checkpoint_interval, but the
+  # failure model / optimizer / tafr_state.pt are only written when
+  # global_step % this == 0 (old dirs rotate, so the latest replaces the previous).
+  save_to_disk_interval_grpo_steps: 0
+
+  # Whether to persist the failure-SFT optimizer state (largest TAFR file).
+  save_failure_sft_optimizer: true
 
   # Maximum number of wrong-response examples retained in the failure stream
   failure_data_max_size: null

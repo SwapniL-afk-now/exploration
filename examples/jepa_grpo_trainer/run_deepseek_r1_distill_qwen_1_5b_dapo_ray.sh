@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
-# JEPA-GRPO | DeepSeek-R1-Distill-Qwen-1.5B | Ray + FSDP + hybrid-engine vLLM
+# JEPA-DAPO | DeepSeek-R1-Distill-Qwen-1.5B | Ray + FSDP + hybrid-engine vLLM
 # Trained on agentica-org/DeepScaleR-Preview-Dataset (~40k AIME/AMC/Omni-MATH/Still problems).
+#
+# Same as run_deepseek_r1_distill_qwen_1_5b_ray.sh but the RL core is swapped from
+# Dr.GRPO to DAPO (arXiv:2503.14476). All JEPA machinery is unchanged. The two
+# DAPO ingredients the JEPA Ray trainer can honour via flags are applied below:
+#   - Clip-Higher: decoupled clip epsilons (clip_ratio_low=0.2, clip_ratio_high=0.28)
+#     plus the dual-clip constant clip_ratio_c=10.0
+#   - GRPO advantage WITH std normalization (norm_adv_by_std_in_grpo=True), vs
+#     Dr.GRPO's unnormalized advantage in the baseline script
+#   (token-level loss_agg_mode=token-mean and KL-off are already the baseline here)
+#
+# NOTE: DAPO's overlong reward shaping and dynamic sampling are NOT wired here. This
+# trainer computes reward inline (verl.experimental.fepo.math_parser.compute_math_reward),
+# not through the pluggable `dapo` reward manager, and RayPPOTrainer here has no
+# group-filtering/resample loop. Those two DAPO features would need code changes.
 #
 # Uses verl's full production stack:
 #   - Ray for distribution
@@ -9,7 +23,7 @@
 #   - ActorRolloutRefWorker extended with EMA target encoder + JEPA update
 #   - RayPPOTrainer extended with Code-view rollout and LeJEPA loss step
 #
-# L_total = L_DrGRPO(CoT) + alpha * L_JEPA(...), where L_JEPA is selected by
+# L_total = L_DAPO(CoT) + alpha * L_JEPA(...), where L_JEPA is selected by
 # JEPA_LOSS_TYPE below: lejepa | llm-jepa-loss | jepa-triplet-loss
 #
 # Before first run:
@@ -109,7 +123,7 @@ fi
 
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
 PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_deepscaler}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-deepseek_r1_distill_qwen_1_5b_jepa_grpo_ray_nosep_nokl-${RUN_TIMESTAMP}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-deepseek_r1_distill_qwen_1_5b_jepa_dapo_ray_nosep_nokl-${RUN_TIMESTAMP}}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 
@@ -138,7 +152,11 @@ export JEPA_VLLM_DRAIN_S
 
 # Actor optimiser
 ACTOR_LR=${ACTOR_LR:-5e-7}   # matched to the dr_grpo baseline (examples/drgrpo_trainer)
-CLIP_RATIO=${CLIP_RATIO:-0.2}
+# DAPO Clip-Higher: decoupled lower/upper PPO clip epsilons + dual-clip constant.
+CLIP_RATIO=${CLIP_RATIO:-0.2}             # legacy symmetric clip (kept for the base config key)
+CLIP_RATIO_LOW=${CLIP_RATIO_LOW:-0.2}
+CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH:-0.28}
+CLIP_RATIO_C=${CLIP_RATIO_C:-10.0}
 ENTROPY_COEFF=${ENTROPY_COEFF:-0.00}   # small entropy bonus; previously 0 let the policy drift unconstrained (length blow-up)
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
 USE_LORA=${USE_LORA:-true}   # false -> full fine-tuning; set false to disable LoRA
@@ -323,8 +341,9 @@ ACTOR=(
     actor_rollout_ref.actor.loss_agg_mode=token-mean
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
     actor_rollout_ref.actor.clip_ratio=${CLIP_RATIO}
-    actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO}
-    actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO}
+    actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW}
+    actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH}
+    actor_rollout_ref.actor.clip_ratio_c=${CLIP_RATIO_C}
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}
@@ -388,7 +407,7 @@ TRAINER=(
 
 ALGORITHM=(
     algorithm.adv_estimator=grpo
-    algorithm.norm_adv_by_std_in_grpo=False
+    algorithm.norm_adv_by_std_in_grpo=True
     algorithm.use_kl_in_reward=False
     actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS}
     actor_rollout_ref.actor.kl_loss_type=low_var_kl

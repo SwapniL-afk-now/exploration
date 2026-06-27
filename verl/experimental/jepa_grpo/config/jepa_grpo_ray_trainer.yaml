@@ -37,6 +37,15 @@ jepa:
   # -- jepa-tcr-reward only (teacher-alignment reward shaping; no aux loss) --
   tcr_reward_beta: 0.5         # advantage-shaping strength (standardized score scale)
   tcr_reward_sigma_floor: 0.1  # min within-stratum std (noise guard)
+  # -- jepa-tcr-dual / jepa-tcr-reward-dual (CoT + Code dual-target) --
+  code_teacher_cache_path: ""  # .pt of {dataset_index: (n_i,d)} code-view teacher targets
+  self_consist_w: 1.0          # weight of the self-consistency align term (dual differentiable)
+  # -- auto-off on alignment plateau (gates both reward shaping and differentiable jepa) --
+  auto_off_enable: false
+  auto_off_metric: ""          # "" = auto-pick by mode (shaping/s_mean_correct or jepa/cos_cot)
+  auto_off_patience: 10
+  auto_off_min_delta: 0.002
+  auto_off_warmup_steps: 20
 
 # ── Algorithm (GRPO, no KL) ─────────────────────────────────────────────────
 algorithm:

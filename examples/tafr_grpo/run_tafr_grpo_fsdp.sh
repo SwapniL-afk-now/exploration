@@ -7,9 +7,12 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 WORKSPACE_ROOT=$(cd -- "${REPO_ROOT}/.." && pwd)
-PYTHON_BIN=${PYTHON_BIN:-"${REPO_ROOT}/.venv/bin/python"}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 
 cd "$REPO_ROOT"
+
+# Reduce CUDA fragmentation on the colocated (vLLM + FSDP) single GPU.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 if [[ -f "${REPO_ROOT}/.env" ]]; then
     _XTRACE_WAS_ON=0
@@ -26,14 +29,19 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
     unset _XTRACE_WAS_ON
 fi
 
-PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_dapo_math}
+PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_deepscaler}
 export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
 export WANDB_SILENT=${WANDB_SILENT:-true}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_tafr_grpo_fsdp}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
+# Default model/data/benchmark settings mirror
+# examples/jepa_grpo_trainer/run_deepseek_r1_distill_qwen_1_5b_ray.sh so TAFR-GRPO
+# is an apples-to-apples comparison against the JEPA-GRPO runs.
+TAFR_VARIANT=${TAFR_VARIANT:-full}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-tafr_grpo_${TAFR_VARIANT}_qwen25math_1_5b-${RUN_TIMESTAMP}}
+MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
-DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
+DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-2}
 ROLLOUT_AGENT_NUM_WORKERS=${ROLLOUT_AGENT_NUM_WORKERS:-1}
 
 # Match the wesserstein trainer's exact training and testing datasets.
@@ -41,14 +49,14 @@ TRAIN_DATASET=${TRAIN_DATASET:-zhuzilin/dapo-math-17k}
 TRAIN_DATASET_CONFIG=${TRAIN_DATASET_CONFIG:-default}
 TRAIN_SPLIT=${TRAIN_SPLIT:-train}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:--1}
-TRAIN_FILE=${TRAIN_FILE:-"${WORKSPACE_ROOT}/failure-escape-runs/data/dapo_math_17k_train_full.parquet"}
-PREPARE_TRAIN_DATA=${PREPARE_TRAIN_DATA:-true}
+TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
+PREPARE_TRAIN_DATA=${PREPARE_TRAIN_DATA:-false}
 
-EVAL_DATA_DIR=${EVAL_DATA_DIR:-"${WORKSPACE_ROOT}/failure-escape-runs/data/wesserstein_eval"}
-PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-true}
+EVAL_DATA_DIR=${EVAL_DATA_DIR:-/workspace/jepa-grpo-cache/eval_data}
+PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-false}
 if [[ -z "${VAL_FILES:-}" ]]; then
-    # Same eval set as examples/wesserstein_trainer/run_qwen25_1_5b_fsdp.sh.
-    VAL_FILES="[${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet]"
+    # Same in-training core-math subset as the JEPA-GRPO run.
+    VAL_FILES="[${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet,${EVAL_DATA_DIR}/aime26.parquet,${EVAL_DATA_DIR}/amc23.parquet]"
 fi
 
 if [[ "${PREPARE_TRAIN_DATA}" == "true" && ! -f "${TRAIN_FILE}" ]]; then
@@ -75,8 +83,8 @@ if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
 fi
 
 # ── TAFR-GRPO hyperparameters ────────────────────────────────────────────────
-TAFR_VARIANT=${TAFR_VARIANT:-full}               # full | anchor_only | replay_only
-TAFR_LOGPROB_BACKEND=${TAFR_LOGPROB_BACKEND:-vllm} # hf | vllm
+# TAFR_VARIANT defaulted near the top (used in EXPERIMENT_NAME): full | anchor_only | replay_only
+TAFR_LOGPROB_BACKEND=${TAFR_LOGPROB_BACKEND:-vllm} # hf | vllm  (vllm=fast multi-LoRA prefill scored in the awake-after-gen window, then sleep; falls back to hf on error)
 TAFR_VLLM_SCORE_MICRO_BATCH_SIZE=${TAFR_VLLM_SCORE_MICRO_BATCH_SIZE:-16}
 TAFR_BETA=${TAFR_BETA:-0.1}                      # KL coefficient for both anchor and replay terms
 TAFR_ANCHOR_BETA=${TAFR_ANCHOR_BETA:-0.0}        # anchor KL coefficient (overrides beta; 0 = off)
@@ -92,7 +100,22 @@ TAFR_SFT_LR=${TAFR_SFT_LR:-5.0e-7}                           # failure-SFT learn
 # Chunk size when iterating over the interval's buffered failures.
 # The buffer is cleared after every SFT update, so this controls
 # how many examples go into each optimizer step within the interval.
-TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-4}
+TAFR_SFT_BATCH_SIZE=${TAFR_SFT_BATCH_SIZE:-8}
+# Token-budgeted failure-SFT micro-batching. >0 packs records greedily so each
+# step's padded tokens (rows*max_len) stay under this budget => higher GPU util
+# than the fixed batch size. Defaults to PPO_MAX_TOKEN_LEN_PER_GPU below (mirrors the
+# actor-update budget); set 0 to disable and fall back to TAFR_SFT_BATCH_SIZE.
+# (Real default applied after PPO_MAX_TOKEN_LEN_PER_GPU is defined; only a user
+# override is honored here.)
+TAFR_SFT_MAX_TOKEN_LEN_PER_GPU=${TAFR_SFT_MAX_TOKEN_LEN_PER_GPU:-}
+
+# TAFR disk-save throttling (disk shortage): the EMA refresh + vLLM adapter export
+# still run every checkpoint interval, but the failure model / optimizer / tafr_state
+# are only written when global_step % this == 0 (0 = every refresh). Old dirs rotate,
+# so the latest save replaces the previous. Set the optimizer flag false to drop the
+# largest file (loses failure-SFT momentum across a resume).
+TAFR_SAVE_TO_DISK_INTERVAL=${TAFR_SAVE_TO_DISK_INTERVAL:-0}
+TAFR_SAVE_FAILURE_OPTIMIZER=${TAFR_SAVE_FAILURE_OPTIMIZER:-true}
 # Hard cap on optimizer steps per interval (9999 = effectively unlimited).
 TAFR_SFT_MAX_UPDATES=${TAFR_SFT_MAX_UPDATES:-9999}
 
@@ -104,14 +127,16 @@ TAFR_FAILURE_DATA_SAMPLING=${TAFR_FAILURE_DATA_SAMPLING:-recent} # recent | unif
 TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}
 NUM_GENERATIONS=${NUM_GENERATIONS:-8}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
+# Failure-SFT token budget mirrors the actor-update budget unless overridden above.
+TAFR_SFT_MAX_TOKEN_LEN_PER_GPU=${TAFR_SFT_MAX_TOKEN_LEN_PER_GPU:-${PPO_MAX_TOKEN_LEN_PER_GPU}}
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
 DRGRPO_USE_LORA=${DRGRPO_USE_LORA:-true}
-LORA_RANK=${LORA_RANK:-128}
-LORA_ALPHA=${LORA_ALPHA:-256}
+LORA_RANK=${LORA_RANK:-512}
+LORA_ALPHA=${LORA_ALPHA:-1024}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 
 ACTOR_LR=${ACTOR_LR:-5e-7}
@@ -120,7 +145,7 @@ PPO_LOSS_COEF=${PPO_LOSS_COEF:-1}
 CLIP_RATIO=${CLIP_RATIO:-0.2}
 
 ROLLOUT_TP=${ROLLOUT_TP:-1}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.7}
 ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
 VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}
@@ -128,9 +153,9 @@ ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
 ROLLOUT_MAX_LORAS=${ROLLOUT_MAX_LORAS:-3}
 ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-True}
 VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-128}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
-VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
 # Wasserstein guidance
@@ -140,10 +165,12 @@ WG_ALPHA=${WG_ALPHA:-0.2}
 WG_EMBED_MODEL=${WG_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
 WG_DECODE_MODEL=${WG_DECODE_MODEL:-${MODEL_PATH}}  # use actor tokenizer to decode response token IDs
 
-MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
-SAVE_FREQ=${SAVE_FREQ:--30}
+MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-250}
+SAVE_FREQ=${SAVE_FREQ:-10}
 TEST_FREQ=${TEST_FREQ:-10}
-VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}
+# best-checkpoint selection sources (matches the JEPA-GRPO run)
+BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["aime24","aime25","aime26","amc23"]'}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-${MAX_OPTIMIZER_STEPS}}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
@@ -241,6 +268,7 @@ TRAINER=(
     trainer.log_val_generations=${LOG_VAL_GENERATIONS}
     trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}
     trainer.validation_data_dir=${VALIDATION_DATA_DIR}
+    +trainer.best_ckpt_sources=${BEST_CKPT_SOURCES}
 )
 
 TAFR=(
@@ -261,7 +289,11 @@ TAFR=(
     # Failure-SFT optimizer
     custom_tafr_grpo.failure_sft_lr="${TAFR_SFT_LR}"
     custom_tafr_grpo.failure_sft_batch_size="${TAFR_SFT_BATCH_SIZE}"
+    custom_tafr_grpo.failure_sft_max_token_len_per_gpu="${TAFR_SFT_MAX_TOKEN_LEN_PER_GPU}"
     custom_tafr_grpo.failure_sft_max_updates_per_interval="${TAFR_SFT_MAX_UPDATES}"
+    # Disk-save throttling
+    custom_tafr_grpo.save_to_disk_interval_grpo_steps="${TAFR_SAVE_TO_DISK_INTERVAL}"
+    custom_tafr_grpo.save_failure_sft_optimizer="${TAFR_SAVE_FAILURE_OPTIMIZER}"
     # Failure data collector
     custom_tafr_grpo.failure_data_max_size="${TAFR_FAILURE_DATA_MAX_SIZE}"
     custom_tafr_grpo.failure_data_sampling="${TAFR_FAILURE_DATA_SAMPLING}"

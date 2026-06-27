@@ -266,18 +266,25 @@ class vLLMColocateWorkerExtension:
         import pickle
         if lora_tensors_pkl is not None:
             lora_tensors = pickle.loads(lora_tensors_pkl)
-        for lora_int_id in list(self.list_loras()):
-            self.remove_lora(lora_int_id)
+        # Register each TAFR adapter under its own dedicated int_id (anchor=124,
+        # replay=125) so multiple adapters can stay resident and be co-batched in a
+        # single prefill sweep. Only evict this adapter's own slot on reload — leave
+        # the actor LoRA (VLLM_LORA_INT_ID) and the sibling TAFR adapter untouched.
+        spec = tafr_vllm_adapter_spec(adapter)
+        if spec.int_id in list(self.list_loras()):
+            self.remove_lora(spec.int_id)
         self.add_lora(
             TensorLoRARequest(
-                lora_name=VLLM_LORA_NAME,
-                lora_int_id=VLLM_LORA_INT_ID,
-                lora_path=VLLM_LORA_PATH,
+                lora_name=spec.name,
+                lora_int_id=spec.int_id,
+                lora_path=spec.path,
                 peft_config=peft_config,
                 lora_tensors=lora_tensors,
             )
         )
-        logger.info(f"vLLM loaded TAFR {adapter} adapter into scoring slot, tensors={len(lora_tensors)}")
+        logger.info(
+            f"vLLM loaded TAFR {adapter} adapter into slot int_id={spec.int_id}, tensors={len(lora_tensors)}"
+        )
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.

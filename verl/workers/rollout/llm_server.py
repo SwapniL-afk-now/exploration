@@ -249,6 +249,53 @@ class LLMServerClient:
             for server_id, _ in acquired:
                 self._release_server(server_id)
 
+    @auto_await
+    async def score_tafr_logprobs_multi(
+        self,
+        *,
+        sequences: list[list[int]],
+        prompt_lens: list[int],
+        response_lens: list[int],
+        adapters: tuple[str, ...],
+    ) -> dict[str, list[list[float]]]:
+        """Score the same sequences under multiple TAFR adapters in one batched sweep.
+
+        Emits one request per (sequence, adapter) and awaits them all in a single
+        ``asyncio.gather`` so vLLM's continuous batcher interleaves the distinct
+        adapters (each request carries its own LoRA int_id) instead of running one
+        full prefill pass per adapter. Returns a mapping adapter -> per-sequence rows.
+        """
+        if not (len(sequences) == len(prompt_lens) == len(response_lens)):
+            raise ValueError("sequences, prompt_lens, and response_lens must have the same length.")
+        if not adapters:
+            return {}
+        tasks = []
+        index: list[str] = []
+        acquired: list[tuple[str, ray.actor.ActorHandle]] = []
+        for adapter in adapters:
+            for sequence_ids, prompt_len, response_len in zip(sequences, prompt_lens, response_lens, strict=True):
+                server_id, server = await self._acquire_server(uuid4().hex)
+                acquired.append((server_id, server))
+                index.append(adapter)
+                tasks.append(
+                    server.score_tafr_logprobs.remote(
+                        sequence_ids=sequence_ids,
+                        prompt_len=prompt_len,
+                        response_len=response_len,
+                        adapter=adapter,
+                        request_id=uuid4().hex,
+                    )
+                )
+        try:
+            results = await asyncio.gather(*tasks)
+        finally:
+            for server_id, _ in acquired:
+                self._release_server(server_id)
+        out: dict[str, list[list[float]]] = {adapter: [] for adapter in adapters}
+        for adapter, row in zip(index, results, strict=True):
+            out[adapter].append(row)
+        return out
+
 
 class LLMServerManager:
     """LLMServerManager is responsible for:

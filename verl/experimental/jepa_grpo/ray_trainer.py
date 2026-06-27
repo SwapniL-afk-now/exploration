@@ -70,11 +70,34 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # of L2-normalized teacher-correct target embeddings in student space.
         self.teacher_targets: dict[int, torch.Tensor] | None = None
         if self.jepa_cfg.enable and self.jepa_cfg.loss_type in (
-            "jepa-tcr-loss", "jepa-tcr-reward", "jepa-tcr-hybrid"
+            "jepa-tcr-loss", "jepa-tcr-reward", "jepa-tcr-hybrid", "jepa-tcr-dual",
+            "jepa-tcr-reward-dual"
         ):
             raw = torch.load(self.jepa_cfg.teacher_cache_path, map_location="cpu")
             self.teacher_targets = {
                 int(k): v.float() for k, v in raw.items() if v is not None and v.numel() > 0
+            }
+
+        # Dual modes: a SECOND cache of Code-view teacher targets (coder model
+        # solutions encoded by the same frozen reference), same {index: (n_i, d)}
+        # format and shared 1536-d student space. Used by both the differentiable
+        # jepa-tcr-dual and the reward-shaping jepa-tcr-reward-dual.
+        # Plateau-latch state for jepa.auto_off_enable (see _maybe_disable_jepa_signal).
+        # Per-arm plateau latches. Each tracked signal (cot/code/self for jepa-tcr-dual,
+        # or a single shaping/global signal for the reward modes) plateaus and latches
+        # INDEPENDENTLY, disabling only its own loss arm (and matching-view shaping).
+        # `_jepa_signal_off` (global) latches True only once EVERY tracked signal is off,
+        # at which point the whole JEPA block is skipped to save the forward.
+        self._jepa_signal_off = False
+        self._off_arm: dict[str, bool] = {k: False for k in ("cot", "code", "self", "shaping", "global")}
+        self._align_best: dict[str, float] = {k: float("-inf") for k in self._off_arm}
+        self._align_stall: dict[str, int] = {k: 0 for k in self._off_arm}
+
+        self.code_teacher_targets: dict[int, torch.Tensor] | None = None
+        if self.jepa_cfg.enable and self.jepa_cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-reward-dual"):
+            raw_code = torch.load(self.jepa_cfg.code_teacher_cache_path, map_location="cpu")
+            self.code_teacher_targets = {
+                int(k): v.float() for k, v in raw_code.items() if v is not None and v.numel() > 0
             }
 
     # ------------------------------------------------------ worker setup ----
@@ -741,6 +764,151 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         jepa_batch.meta_info["n_crossview_pairs"] = len(crossview_pairs)
         return jepa_batch
 
+    def _build_jepa_batch_tcr_dual(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> DataProto | None:
+        """Build the jepa-tcr-dual batch: SEPARATE CoT and Code student anchor
+        blocks, each with its OWN precomputed teacher-correct target cache, plus a
+        per-CoT-row self-consistency partner pointing at the paired Code row.
+
+        Layout:
+          - cot block (A_c rows): correct CoT rollouts of prompts with a cached CoT
+            target; `teacher_target` (A_c, d) from `self.teacher_targets`.
+          - code block (A_k rows): correct Code rollouts of prompts with a cached
+            Code target; `code_teacher_target` (A_k, d) from
+            `self.code_teacher_targets`.
+          - `self_partner` (A_c,) long: for each CoT row, the row index INTO THE CODE
+            BLOCK of its paired (same-prompt, same-slot) code rollout, or -1. The
+            worker reads that code row's BOUNDARY embedding as the stop-grad
+            self-consistency target z_self.
+
+        Group ids are shared per prompt across both views so the stratified,
+        prompt-averaged aggregation lines up. A prompt missing one view's cache
+        still contributes the other view's anchors (with no self-consistency pair).
+        Returns None if fewer than min_valid_pairs CoT anchors exist.
+        """
+        assert self.teacher_targets is not None, "CoT teacher target cache not loaded"
+        assert self.code_teacher_targets is not None, "Code teacher target cache not loaded"
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        rows_by_uid: dict = defaultdict(lambda: {"cot": [], "code": []})
+        idx_by_uid: dict = {}
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v not in ("cot", "code"):
+                continue
+            rows_by_uid[u][v].append(i)
+            if u not in idx_by_uid:
+                info = extra_infos[i]
+                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
+
+        anchor_set = self.jepa_cfg.jepa_anchor_set
+
+        def _select(idxs):
+            if anchor_set == "correct":
+                sel = [i for i in idxs if rew[i] > 0]
+            elif anchor_set == "wrong":
+                sel = [i for i in idxs if rew[i] <= 0]
+            else:  # "all"
+                sel = list(idxs)
+            return [i for i in sel if int(all_attn_mask[i].sum()) > 0]
+
+        def _match_row(k, n_u):
+            return int(torch.randint(n_u, (1,)).item()) if self.jepa_cfg.tcr_match == "random" else k % n_u
+
+        # Single combined anchor block (CoT rows FIRST, then Code rows) so the
+        # DataProto keeps one uniform batch dim even when the two views have
+        # different anchor counts. `is_code` recovers the split; `self_partner`
+        # (only set on CoT rows) indexes into the CODE sub-block (0..A_k-1).
+        cot_ids_list, cot_lengths, cot_target_list, cot_gid, cot_ic = [], [], [], [], []
+        code_ids_list, code_lengths, code_target_list, code_gid, code_ic = [], [], [], [], []
+        self_pairs: list = []   # (cot_row_pos, code_row_pos) — positions within each sub-block
+        n_correct_list = []
+        group_counter = 0
+        for u in dict.fromkeys(uids):
+            ds_idx = idx_by_uid.get(u)
+            Z_cot = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
+            Z_code = self.code_teacher_targets.get(ds_idx) if ds_idx is not None else None
+            cot_sel = _select(rows_by_uid[u]["cot"]) if (Z_cot is not None and Z_cot.numel() > 0) else []
+            code_sel = _select(rows_by_uid[u]["code"]) if (Z_code is not None and Z_code.numel() > 0) else []
+            if not cot_sel and not code_sel:
+                continue
+            gid = group_counter
+            group_counter += 1
+            n_correct_list.append(sum(1 for i in cot_sel + code_sel if rew[i] > 0))
+            n_slots = max(len(cot_sel), len(code_sel))
+            for k in range(n_slots):
+                cot_pos = code_pos = None
+                if k < len(cot_sel):
+                    idx = cot_sel[k]
+                    cot_pos = len(cot_ids_list)
+                    cot_ids_list.append(all_input_ids[idx][all_attn_mask[idx].bool()])
+                    cot_lengths.append(int(all_attn_mask[idx].sum()))
+                    cot_target_list.append(Z_cot[_match_row(k, Z_cot.shape[0])])
+                    cot_gid.append(gid)
+                    cot_ic.append(bool(rew[idx] > 0))
+                if k < len(code_sel):
+                    idx = code_sel[k]
+                    code_pos = len(code_ids_list)
+                    code_ids_list.append(all_input_ids[idx][all_attn_mask[idx].bool()])
+                    code_lengths.append(int(all_attn_mask[idx].sum()))
+                    code_target_list.append(Z_code[_match_row(k, Z_code.shape[0])])
+                    code_gid.append(gid)
+                    code_ic.append(bool(rew[idx] > 0))
+                if cot_pos is not None and code_pos is not None:
+                    self_pairs.append((cot_pos, code_pos))
+
+        A_c = len(cot_ids_list)
+        A_k = len(code_ids_list)
+        if A_c < self.jepa_cfg.min_valid_pairs or A_k == 0:
+            return None
+
+        # Concatenate the two sub-blocks (CoT first) into one padded block.
+        all_ids_list = cot_ids_list + code_ids_list
+        all_lengths = cot_lengths + code_lengths
+        max_len = max(s.shape[0] for s in all_ids_list)
+        anchor_ids = torch.stack([
+            torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in all_ids_list
+        ])
+        anchor_mask = torch.stack([
+            torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, max_len - length))
+            for length in all_lengths
+        ])
+        target = torch.nn.functional.normalize(
+            torch.stack(cot_target_list + code_target_list, dim=0).float(), dim=-1
+        )
+        is_code = torch.tensor([False] * A_c + [True] * A_k, dtype=torch.bool)
+        group_id = torch.tensor(cot_gid + code_gid, dtype=torch.long)
+        is_correct = torch.tensor(cot_ic + code_ic, dtype=torch.bool)
+        # self_partner aligned to the FULL block (length A_c + A_k); set on CoT rows only.
+        self_partner = torch.full((A_c + A_k,), -1, dtype=torch.long)
+        for c_pos, k_pos in self_pairs:
+            self_partner[c_pos] = k_pos   # k_pos is the position within the CODE sub-block
+
+        jepa_batch = DataProto.from_single_dict({
+            "anchor_input_ids": anchor_ids,
+            "anchor_attn_mask": anchor_mask,
+            "anchor_lengths": torch.tensor(all_lengths, dtype=torch.long),
+            "teacher_target": target,
+            "is_code": is_code,
+            "anchor_group_id": group_id,
+            "anchor_is_correct": is_correct,
+            "self_partner": self_partner,
+        })
+        jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_list)) if n_correct_list else 0.0
+        jepa_batch.meta_info["n_anchors"] = A_c
+        jepa_batch.meta_info["n_anchors_code"] = A_k
+        jepa_batch.meta_info["n_self_pairs"] = len(self_pairs)
+        return jepa_batch
+
     # ------------------------------------------- TCR reward shaping (idea #2) -
     @staticmethod
     def _stratified_shaping(
@@ -812,6 +980,15 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         all_attn_mask = batch.batch["attention_mask"]
         pad_id = self.tokenizer.pad_token_id or 0
 
+        # Per-view target cache: in jepa-tcr-reward-dual, CODE rows are scored against
+        # the CODE teacher cache and COT rows against the COT cache (each rollout aligned
+        # to its own view's teacher). Other reward modes have no code cache and score
+        # both views against the single CoT cache (back-compat).
+        code_cache = self.code_teacher_targets
+
+        def _cache_for(view: str):
+            return code_cache if (view == "code" and code_cache is not None) else self.teacher_targets
+
         # Collect all CoT *and* Code rows whose prompt has cached targets. Both views
         # are scored against the teacher and shaped, mirroring the dual-view JEPA arm
         # (a code rollout that lands near the teacher should earn the same advantage
@@ -824,7 +1001,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 continue
             info = extra_infos[i]
             ds_idx = int(info["index"]) if isinstance(info, dict) else None
-            if ds_idx is None or self.teacher_targets.get(ds_idx) is None:
+            if ds_idx is None or _cache_for(v).get(ds_idx) is None:
                 continue
             scored_rows.append(i)
             scored_views.append(v)
@@ -857,7 +1034,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         gids = []
         for j, i in enumerate(scored_rows):
             ds_idx = int(extra_infos[i]["index"])
-            Z = self.teacher_targets[ds_idx].to(emb.dtype)  # (n_i, d)
+            Z = _cache_for(scored_views[j])[ds_idx].to(emb.dtype)  # (n_i, d), per-view cache
             s[j] = (emb[j].unsqueeze(0) * Z).sum(dim=-1).max()
             is_correct[j] = bool(rew[i] > 0)
             # Stratum key includes the view so CoT and Code are standardized against
@@ -890,6 +1067,74 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             "shaping/frac_rows_shaped": float((shape_per_row != 0).sum()) / max(1, len(scored_rows)),
         }
         return shape_per_row, metrics
+
+    # --------------------------------------- auto-disable on alignment plateau -
+    def _tracked_signals(self) -> list[tuple[str, str]]:
+        """(arm_name, metric_key) pairs to track for the plateau latch (higher=better).
+
+        jepa-tcr-dual tracks its three arms independently; the reward-shaping modes
+        track a single shaping signal; other differentiable modes track CoT alignment.
+        An explicit `auto_off_metric` override collapses to one global signal (legacy).
+        """
+        if self.jepa_cfg.auto_off_metric:
+            return [("global", self.jepa_cfg.auto_off_metric)]
+        lt = self.jepa_cfg.loss_type
+        if lt == "jepa-tcr-dual":
+            return [("cot", "jepa/cos_cot"), ("code", "jepa/cos_code"), ("self", "jepa/cos_self")]
+        if lt in ("jepa-tcr-reward", "jepa-tcr-reward-dual", "jepa-tcr-hybrid"):
+            return [("shaping", "shaping/s_mean_correct")]
+        return [("cot", "jepa/cos_cot")]
+
+    def _maybe_disable_jepa_signal(self, metrics: dict) -> None:
+        """Latch each tracked JEPA signal OFF independently once it plateaus.
+
+        For each tracked (arm, metric): after warmup, a step that fails to beat that
+        arm's running best by `auto_off_min_delta` increments its own stall counter;
+        once it reaches `auto_off_patience`, only THAT arm latches off for the rest of
+        training (its loss term + matching-view shaping go to zero). The global
+        `_jepa_signal_off` latches True only once EVERY tracked arm is off, skipping the
+        whole JEPA block. Steps where a metric is absent/zero (no anchors of that view)
+        are ignored so they neither advance nor reset that arm's counter.
+        """
+        cfg = self.jepa_cfg
+        if not cfg.enable or not cfg.auto_off_enable:
+            return
+        metrics["jepa/signal_off"] = float(self._jepa_signal_off)
+        if self._jepa_signal_off:
+            return
+        signals = self._tracked_signals()
+        warm = self.global_steps >= cfg.auto_off_warmup_steps
+        for arm, key in signals:
+            metrics[f"jepa/off_{arm}"] = float(self._off_arm[arm])
+            if not warm or self._off_arm[arm]:
+                continue
+            val = metrics.get(key)
+            if val is None:
+                continue
+            val = float(val)
+            if val == 0.0:   # no anchors of this view this step -> not a real measurement
+                continue
+            if val > self._align_best[arm] + cfg.auto_off_min_delta:
+                self._align_best[arm] = val
+                self._align_stall[arm] = 0
+            else:
+                self._align_stall[arm] += 1
+                if self._align_stall[arm] >= cfg.auto_off_patience:
+                    self._off_arm[arm] = True
+                    logger.info(
+                        "[jepa] arm '%s' plateaued on %s (val=%.4f best=%.4f, stalled %d>=%d steps) "
+                        "-> disabling this arm (loss term + matching-view shaping)",
+                        arm, key, val, self._align_best[arm], self._align_stall[arm], cfg.auto_off_patience,
+                    )
+            metrics[f"jepa/off_{arm}"] = float(self._off_arm[arm])
+            metrics[f"jepa/align_best_{arm}"] = self._align_best[arm]
+            metrics[f"jepa/align_stall_{arm}"] = float(self._align_stall[arm])
+        # Fully off only when every tracked arm has individually latched.
+        if signals and all(self._off_arm[arm] for arm, _ in signals):
+            if not self._jepa_signal_off:
+                logger.info("[jepa] all tracked arms disabled -> JEPA signal fully off for the rest of training")
+            self._jepa_signal_off = True
+        metrics["jepa/signal_off"] = float(self._jepa_signal_off)
 
     # ------------------------------------------------ memory diagnostics -----
     @staticmethod
@@ -1031,7 +1276,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         # drain without restructuring the data flow (see git history for two
                         # real bugs introduced by data-flow changes in this same unification).
                         import time as _time
-                        _time.sleep(5)
+                        _time.sleep(float(os.environ.get("JEPA_VLLM_DRAIN_S", "5")))
 
                     if n_code > 0:
                         code_gen_batch = self._tokenize_code_prompts(batch)  # batch is still un-repeated here
@@ -1091,7 +1336,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 # short drain before the sleep RPC.
                 self._log_gpu_mem("after_gen_before_sleep")
                 import time as _time
-                _time.sleep(5)
+                _time.sleep(float(os.environ.get("JEPA_VLLM_DRAIN_S", "5")))
                 with simple_timer("sleep_replicas_1", timing_raw):
                     self.checkpoint_manager.sleep_replicas()
                 self._log_gpu_mem("after_sleep")
@@ -1114,14 +1359,22 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 # so the signal rides the policy gradient (generation channel) rather
                 # than a separate latent-pull backward. vLLM is asleep and the actor
                 # FSDP is warm here, so the forward-only embedding pass is memory-safe.
-                if self.jepa_cfg.enable and self.jepa_cfg.loss_type in (
-                    "jepa-tcr-reward", "jepa-tcr-hybrid"
+                if self.jepa_cfg.enable and not self._jepa_signal_off and self.jepa_cfg.loss_type in (
+                    "jepa-tcr-reward", "jepa-tcr-hybrid", "jepa-tcr-reward-dual", "jepa-tcr-dual"
                 ):
                     with simple_timer("tcr_reward_shaping", timing_raw):
                         view_tags_s = batch.non_tensor_batch["view"]
                         shape_per_row, shaping_metrics = self._compute_tcr_reward_shaping(
                             batch=batch, reward_tensor=reward_tensor, view_tags=view_tags_s,
                         )
+                        # Per-view plateau latch: zero shaping for a view whose arm is off.
+                        # (jepa-tcr-dual only; reward modes use the single 'shaping' arm and
+                        # are gated wholesale by `_jepa_signal_off` at the block entry.)
+                        if self.jepa_cfg.loss_type == "jepa-tcr-dual":
+                            if self._off_arm["cot"]:
+                                shape_per_row[torch.from_numpy(view_tags_s == "cot")] = 0.0
+                            if self._off_arm["code"]:
+                                shape_per_row[torch.from_numpy(view_tags_s == "code")] = 0.0
                         rmask = batch.batch["response_mask"]
                         shape_term = shape_per_row.to(
                             device=batch.batch["advantages"].device,
@@ -1146,10 +1399,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 cot_mask_rows = (view_tags == "cot")
                 code_mask_rows = (view_tags == "code")
 
-                # jepa-tcr-reward applies its signal as advantage shaping in Step 3.5
-                # (no auxiliary loss / backward), so skip the JEPA loss block entirely.
-                # jepa-tcr-hybrid keeps BOTH: the Step-3.5 shaping AND this loss arm.
-                if self.jepa_cfg.enable and self.jepa_cfg.loss_type != "jepa-tcr-reward":
+                # jepa-tcr-reward AND jepa-tcr-reward-dual apply their signal purely as
+                # advantage shaping in Step 3.5 (no auxiliary loss / backward), so skip the
+                # JEPA loss block entirely. jepa-tcr-hybrid AND jepa-tcr-dual keep BOTH: the
+                # Step-3.5 shaping (beta) AND this differentiable loss arm.
+                if self.jepa_cfg.enable and not self._jepa_signal_off and self.jepa_cfg.loss_type not in (
+                    "jepa-tcr-reward", "jepa-tcr-reward-dual"
+                ):
                     metrics["jepa/n_cot"] = float(n_cot)
                     metrics["jepa/n_code"] = float(n_code)
 
@@ -1158,7 +1414,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         # Both supported loss_types use a 3-view (cot/code/clean-wrong)
                         # builder; clreg (v3) collects ALL anchors/wrongs per group
                         # with group ids, the hinge mode one matched triplet per group.
-                        if self.jepa_cfg.loss_type in ("jepa-tcr-loss", "jepa-tcr-hybrid"):
+                        if self.jepa_cfg.loss_type == "jepa-tcr-dual":
+                            jepa_batch = self._build_jepa_batch_tcr_dual(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
+                        elif self.jepa_cfg.loss_type in ("jepa-tcr-loss", "jepa-tcr-hybrid"):
                             jepa_batch = self._build_jepa_batch_tcr(
                                 batch=batch,
                                 reward_tensor=reward_tensor,
@@ -1186,6 +1448,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                             jepa_td["global_step"] = torch.full(
                                 (jepa_td.batch_size[0],), float(self.global_steps)
                             )
+                            # Per-arm plateau latches -> worker zeroes the disabled align
+                            # term's gradient (preds still feed SIGReg). dual mode only.
+                            if self.jepa_cfg.loss_type == "jepa-tcr-dual":
+                                _bs = jepa_td.batch_size[0]
+                                jepa_td["align_cot_on"] = torch.full((_bs,), float(not self._off_arm["cot"]))
+                                jepa_td["align_code_on"] = torch.full((_bs,), float(not self._off_arm["code"]))
+                                jepa_td["self_on"] = torch.full((_bs,), float(not self._off_arm["self"]))
                             jepa_output = self.actor_rollout_wg.jepa_update(jepa_td)
                             # ONE_TO_ALL dispatch returns a list; take rank-0 output
                             if isinstance(jepa_output, list):
@@ -1234,6 +1503,11 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 metrics.update(self._compute_train_comparison_metrics(batch))
                 metrics["train/global_step"] = self.global_steps
 
+                # Auto-disable the JEPA aux signal (shaping/differentiable) once the
+                # teacher-alignment metric this step has plateaued. Evaluated AFTER the
+                # step's shaping/jepa metrics are in `metrics`; latches for all later steps.
+                self._maybe_disable_jepa_signal(metrics)
+
                 # ── Validation ───────────────────────────────────────────
                 is_last_step = self.global_steps >= self.total_training_steps
                 if self.config.trainer.test_freq > 0 and (
@@ -1252,7 +1526,14 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         self._save_checkpoint()
 
                 metrics.update({f"timing_s/{k}": v for k, v in timing_raw.items()})
-                metrics["timing_s/step_total"] = sum(timing_raw.values())
+                # Sum only top-level segments. The per-call generate_sequences
+                # diagnostics merged in above as "cot_gen/*" / "code_gen/*" are
+                # sub-timings ALREADY contained in the top-level "cot_gen" /
+                # "code_gen" timers — including them double-counts and inflated
+                # step_total to ~minutes (3625s observed). Drop any key with "/".
+                metrics["timing_s/step_total"] = sum(
+                    v for k, v in timing_raw.items() if "/" not in k
+                )
 
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)

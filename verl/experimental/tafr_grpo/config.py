@@ -36,7 +36,22 @@ class TAFRGRPOConfig:
     disable_builtin_kl: bool = True
     failure_sft_lr: float = 1e-6
     failure_sft_batch_size: int = 8
+    # Token-budgeted micro-batching for failure-SFT. When > 0, records are packed
+    # greedily so each micro-batch's padded token count (n_rows * max_len) stays
+    # under this budget, raising GPU utilization vs the fixed failure_sft_batch_size
+    # (which is used as a fallback / row cap when this is 0).
+    failure_sft_max_token_len_per_gpu: int = 0
     failure_sft_max_updates_per_interval: int = 1
+    # Throttle heavy TAFR disk writes independently of the EMA refresh cadence.
+    # 0 = write on every refresh (legacy). When > 0, the EMA refresh + vLLM adapter
+    # export still run every checkpoint_interval, but the failure model / optimizer /
+    # tafr_state.pt are only written when global_step % this == 0. Old dirs are still
+    # rotated away, so the latest saved state replaces the previous one.
+    save_to_disk_interval_grpo_steps: int = 0
+    # Skip persisting the failure-SFT Adam optimizer state (the largest TAFR file).
+    # Set False to halve TAFR checkpoint size at the cost of losing failure-SFT
+    # optimizer momentum across a resume.
+    save_failure_sft_optimizer: bool = True
     failure_data_max_size: Optional[int] = None
     failure_data_sampling: str = "recent"
     anchor_checkpoint_dir: Optional[str] = None
@@ -99,6 +114,10 @@ def validate_tafr_config(config: DictConfig | dict) -> TAFRGRPOConfig:
         raise ValueError("custom_tafr_grpo.checkpoint_interval_grpo_steps must be positive.")
     if custom.failure_sft_batch_size <= 0:
         raise ValueError("custom_tafr_grpo.failure_sft_batch_size must be positive.")
+    if custom.failure_sft_max_token_len_per_gpu < 0:
+        raise ValueError("custom_tafr_grpo.failure_sft_max_token_len_per_gpu must be >= 0 (0 disables token batching).")
+    if custom.save_to_disk_interval_grpo_steps < 0:
+        raise ValueError("custom_tafr_grpo.save_to_disk_interval_grpo_steps must be >= 0 (0 saves every refresh).")
     if custom.failure_sft_max_updates_per_interval <= 0:
         raise ValueError("custom_tafr_grpo.failure_sft_max_updates_per_interval must be positive (use 9999 for unlimited).")
     if custom.failure_data_max_size is not None and custom.failure_data_max_size <= 0:

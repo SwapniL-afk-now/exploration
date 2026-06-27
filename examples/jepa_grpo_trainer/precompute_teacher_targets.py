@@ -16,8 +16,16 @@
 
 Phase 1 of the two-phase TCR workflow (run this to completion BEFORE training):
 
-  1. A stronger TEACHER model (e.g. Qwen2.5-Math-3B) generates K solutions per
-     training question.
+Supports two views via --view (run once per view to build both caches):
+  - cot  (default): a stronger math TEACHER generates step-by-step solutions.
+  - code:           a CODER model generates executable Python under the code
+                    system prompt (mirrors JEPARayConfig.code_system_prompt);
+                    used by jepa-tcr-dual as the Code-view target cache.
+Both views verify with the SAME parse-based checker training uses
+(compute_math_reward) and encode with the SAME frozen student-size reference, so
+both caches live in one shared 1536-d student space.
+
+  1. A stronger TEACHER / CODER model generates K solutions per training question.
   2. Each is VERIFIED with the same checker used in training
      (verl.experimental.fepo.math_parser.compute_math_reward); only correct ones
      are kept (up to --n-targets per question).
@@ -44,11 +52,34 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from verl.experimental.fepo.math_parser import compute_math_reward
 
+# Default Code-view system prompt. Mirrors JEPARayConfig.code_system_prompt so the
+# code-view targets are generated under the SAME framing the train-time code
+# rollouts use (keep these two in sync).
+CODE_SYSTEM_PROMPT = (
+    "You are a Python programming expert. "
+    "Solve the following math problem by writing a complete, executable Python program "
+    "that prints the answer. Do not include any natural language explanation outside comments."
+)
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--train-file", required=True, help="Adapted train parquet (prompt/extra_info/reward_model columns)")
-    p.add_argument("--teacher-model", required=True, help="HF path of the stronger teacher (e.g. Qwen2.5-Math-3B)")
+    p.add_argument(
+        "--view", choices=("cot", "code"), default="cot",
+        help="Target view to build. 'cot' (default): generate step-by-step CoT solutions "
+             "with the dataset's own prompt (current behavior). 'code': prepend the code "
+             "system prompt so a CODER model emits executable Python; produces a code-view "
+             "target cache. Run once per view to build both caches.",
+    )
+    p.add_argument(
+        "--system-prompt", default="",
+        help="Override the system prompt prepended to every question. Empty (default) uses "
+             "no override for --view cot, and CODE_SYSTEM_PROMPT for --view code.",
+    )
+    p.add_argument("--teacher-model", "--gen-model", dest="teacher_model", required=True,
+                   help="HF path of the generator: stronger math teacher for --view cot, "
+                        "or a coder model (e.g. Qwen2.5-Coder-*) for --view code")
     p.add_argument("--ref-model", required=True, help="HF path of the frozen student-size reference encoder")
     p.add_argument("--out", required=True, help="Output .pt path for the {index: (n_i,d)} target cache")
     p.add_argument("--n-samples", type=int, default=8, help="Teacher samples generated per question")
@@ -65,14 +96,20 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _row_messages(prompt) -> list[dict]:
+def _row_messages(prompt, system_prompt: str = "") -> list[dict]:
     # Adapted rows store `prompt` as a list of {role, content} dicts (data.make_messages).
-    return [{"role": m["role"], "content": m["content"]} for m in prompt]
+    msgs = [{"role": m["role"], "content": m["content"]} for m in prompt]
+    if system_prompt:
+        # Prepend the view's system prompt as a leading system turn (code view). If the
+        # row already carries a system turn, this stacks before it so the code framing
+        # takes precedence without dropping the dataset's own instructions.
+        msgs = [{"role": "system", "content": system_prompt}] + msgs
+    return msgs
 
 
 @torch.no_grad()
 def encode_targets(
-    ref_model, ref_tok, prompt_text: str, responses: list[str], device, batch_size: int
+    ref_model, ref_tok, prompt_text: str, responses: list[str], device, batch_size: int = 16
 ) -> torch.Tensor:
     """Encode [x, y_T+] with the frozen ref model; last-token final hidden, L2-normalized.
 
@@ -106,6 +143,12 @@ def main() -> None:
     if args.max_rows > 0:
         df = df.iloc[: args.max_rows]
 
+    # System prompt prepended to every question. For --view code this is the code
+    # framing (mirrors JEPARayConfig.code_system_prompt) so the generator emits
+    # executable Python; for --view cot it stays empty (dataset prompt untouched).
+    system_prompt = args.system_prompt or (CODE_SYSTEM_PROMPT if args.view == "code" else "")
+    print(f"[precompute] view={args.view!r}; system_prompt={'<custom>' if args.system_prompt else ('code' if system_prompt else 'none')}", flush=True)
+
     # ---- Phase 1a: teacher generation (vLLM) ----
     from vllm import LLM, SamplingParams
 
@@ -124,10 +167,13 @@ def main() -> None:
     )
 
     rows = df.to_dict("records")
-    # CoT-only: each row's `prompt` already carries the step-by-step \boxed{} system
-    # prompt (fepo.data.make_messages), so no code/tool view is generated here.
+    # Each row's `prompt` carries the dataset's step-by-step \boxed{} framing
+    # (fepo.data.make_messages). For --view code we additionally prepend the code
+    # system prompt so the coder model emits an executable Python program.
     prompt_texts = [
-        teacher_tok.apply_chat_template(_row_messages(r["prompt"]), tokenize=False, add_generation_prompt=True)
+        teacher_tok.apply_chat_template(
+            _row_messages(r["prompt"], system_prompt), tokenize=False, add_generation_prompt=True
+        )
         for r in rows
     ]
     # Generate in fixed prompt batches (mirrors the train-time batching of 64).
@@ -177,7 +223,7 @@ def main() -> None:
     responses_by_idx: dict[int, list[str]] = {}
     for idx, prompt, responses in kept:
         prompt_text = ref_tok.apply_chat_template(
-            _row_messages(prompt), tokenize=False, add_generation_prompt=True
+            _row_messages(prompt, system_prompt), tokenize=False, add_generation_prompt=True
         )
         targets = encode_targets(
             ref_model, ref_tok, prompt_text, responses, device, args.encode_batch_size

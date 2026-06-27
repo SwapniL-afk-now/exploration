@@ -79,7 +79,10 @@ def test_tafr_replay_loss_full_for_all_wrong_group():
         variant="replay_only",
         replay_log_prob=replay_log_prob,
     )
-    expected_kl = ((replay_log_prob - log_prob).mean()).detach()
+    # k3 estimator of D_KL(pi_replay || pi_theta): (r - 1) - log_ratio, clamped, then masked-mean.
+    log_ratio = (replay_log_prob - log_prob).clamp(min=-20, max=20)
+    r = torch.exp(log_ratio)
+    expected_kl = (((r - 1) - log_ratio).clamp(min=-10, max=10).mean()).detach()
     assert torch.allclose(out.loss, -0.5 * expected_kl)
 
 

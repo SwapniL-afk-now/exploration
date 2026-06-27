@@ -100,6 +100,15 @@ class JEPARayConfig:
     # {dataset_index (int): float16 tensor (n_i, d)} of L2-normalized teacher-correct
     # target embeddings in student space. Empty => tcr mode cannot run.
     teacher_cache_path: str = ""
+    # -- jepa-tcr-dual only --
+    # Second offline cache (same {index: (n_i,d)} format) of CODE-view teacher targets
+    # produced by precompute_teacher_targets.py --view code (a coder model's verified
+    # Python solutions encoded by the SAME frozen student-size reference, so both caches
+    # share the 1536-d student space). Empty => jepa-tcr-dual cannot run.
+    code_teacher_cache_path: str = ""
+    # Weight of the self-consistency align term (pred_CoT -> stop-grad Code_S boundary
+    # read) inside the (1-lambda) slot, alongside the two teacher pulls. No new lambda.
+    self_consist_w: float = 1.0
     # Max teacher targets kept/used per question (the offline pass caps at this; the
     # builder cycles anchors over whatever is cached).
     n_targets_per_q: int = 4
@@ -126,6 +135,20 @@ class JEPARayConfig:
     # never flips a correct-vs-wrong ordering. See JEPA_TCR_LOSS.md / the plan.
     tcr_reward_beta: float = 0.5          # shaping strength (standardized score scale)
     tcr_reward_sigma_floor: float = 0.1   # min within-stratum std (noise guard)
+    # -- auto-disable the JEPA auxiliary signal once teacher-alignment plateaus --
+    # When the tracked alignment metric stops improving by `auto_off_min_delta` for
+    # `auto_off_patience` consecutive steps (after `auto_off_warmup_steps`), the JEPA
+    # signal is LATCHED OFF for the rest of training: the differentiable jepa_update
+    # backward AND the reward-shaping advantage term are both skipped (whichever the
+    # loss_type uses). GRPO is unaffected. Frees the JEPA forward/shaping cost once the
+    # representation objective has converged. Off by default (opt-in).
+    auto_off_enable: bool = False
+    # Metric key to watch (higher = better alignment). Empty => auto by loss_type:
+    # reward-shaping modes use "shaping/s_mean_correct", differentiable modes "jepa/cos_cot".
+    auto_off_metric: str = ""
+    auto_off_patience: int = 10           # consecutive non-improving steps before turning off
+    auto_off_min_delta: float = 0.002     # min metric increase counted as an improvement
+    auto_off_warmup_steps: int = 20       # do not evaluate the plateau before this many steps
     # Number of tied-weight predictor tokens (paper §3.1). k=0 -> Pred(x) = x
     # (identity), so for a real predictive separation set predictor_k > 0.
     predictor_k: int = 0
@@ -169,20 +192,20 @@ class JEPARayConfig:
         """
         if self.enable and self.loss_type not in (
             "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss",
-            "jepa-tcr-reward", "jepa-tcr-hybrid"
+            "jepa-tcr-reward", "jepa-tcr-hybrid", "jepa-tcr-dual", "jepa-tcr-reward-dual"
         ):
             raise ValueError(
                 f"jepa.loss_type must be one of 'jepa-separation-loss', 'jepa-clreg-loss', "
-                f"'jepa-tcr-loss', 'jepa-tcr-reward', 'jepa-tcr-hybrid' (the supported "
-                f"ray/worker objectives); got {self.loss_type!r}"
+                f"'jepa-tcr-loss', 'jepa-tcr-reward', 'jepa-tcr-hybrid', 'jepa-tcr-dual', "
+                f"'jepa-tcr-reward-dual' (the supported ray/worker objectives); got {self.loss_type!r}"
             )
         if self.enable and self.loss_type == "jepa-clreg-loss" and self.separation_mode not in ("dpo", "info"):
             raise ValueError(
                 f"jepa.separation_mode must be 'dpo' or 'info' for jepa-clreg-loss; "
                 f"got {self.separation_mode!r}"
             )
-        # Reward-shaping arm (jepa-tcr-reward and the hybrid).
-        if self.enable and self.loss_type in ("jepa-tcr-reward", "jepa-tcr-hybrid"):
+        # Reward-shaping arm (jepa-tcr-reward, the hybrid, and the dual reward-shaping).
+        if self.enable and self.loss_type in ("jepa-tcr-reward", "jepa-tcr-hybrid", "jepa-tcr-reward-dual"):
             if not self.teacher_cache_path:
                 raise ValueError(
                     f"jepa.loss_type={self.loss_type!r} requires jepa.teacher_cache_path "
@@ -194,8 +217,8 @@ class JEPARayConfig:
                 raise ValueError(
                     f"jepa.tcr_reward_sigma_floor must be > 0; got {self.tcr_reward_sigma_floor}"
                 )
-        # Differentiable TCR loss arm (jepa-tcr-loss and the hybrid).
-        if self.enable and self.loss_type in ("jepa-tcr-loss", "jepa-tcr-hybrid"):
+        # Differentiable TCR loss arm (jepa-tcr-loss, the hybrid, and the dual).
+        if self.enable and self.loss_type in ("jepa-tcr-loss", "jepa-tcr-hybrid", "jepa-tcr-dual"):
             if not self.teacher_cache_path:
                 raise ValueError(
                     f"jepa.loss_type={self.loss_type!r} requires jepa.teacher_cache_path "
@@ -209,6 +232,19 @@ class JEPARayConfig:
                 raise ValueError(
                     f"jepa.jepa_anchor_set must be 'correct', 'all' or 'wrong'; "
                     f"got {self.jepa_anchor_set!r}"
+                )
+        # Dual modes (differentiable jepa-tcr-dual AND reward-shaping jepa-tcr-reward-dual)
+        # additionally need the Code-view cache and real code rollouts.
+        if self.enable and self.loss_type in ("jepa-tcr-dual", "jepa-tcr-reward-dual"):
+            if not self.code_teacher_cache_path:
+                raise ValueError(
+                    f"jepa.loss_type={self.loss_type!r} requires jepa.code_teacher_cache_path "
+                    "(the Code-view cache from precompute_teacher_targets.py --view code)"
+                )
+            if self.n_code <= 0:
+                raise ValueError(
+                    f"jepa.loss_type={self.loss_type!r} requires jepa.n_code > 0 "
+                    "(the Code view needs code-framed rollouts)"
                 )
         if self.n_cot < 0 or self.n_code < 0:
             raise ValueError(f"jepa.n_cot ({self.n_cot}) and jepa.n_code ({self.n_code}) must be >= 0")

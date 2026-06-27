@@ -37,6 +37,7 @@ from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
 from verl.experimental.jepa_grpo.core_algos import (
     llm_jepa_clreg_loss,
     llm_jepa_separation_loss,
+    llm_jepa_tcr_dual_loss,
     llm_jepa_tcr_loss,
 )
 
@@ -250,6 +251,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         requires_grad: bool,
         predictor_k: "int | list[int]" = 0,
         predictor_token_id: int | None = None,
+        also_boundary: bool = False,
     ) -> torch.Tensor:
         """Run the policy model on the full batch and return last-token embeddings.
 
@@ -284,9 +286,18 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 "tied-weight predictor".
             predictor_token_id: token id to repeat for the predictor tokens.
                 Required (and otherwise ignored) when any row has predictor_k > 0.
+            also_boundary: if True, ALSO return the per-row BOUNDARY embedding —
+                the last REAL token (index rlen-1), i.e. the read taken BEFORE any
+                appended [PRED] tokens. This is a free second read of the same
+                packed forward (used for the jepa-tcr-dual self-consistency target
+                z_self = Enc(Code_S) boundary). No-op cost: the hidden states are
+                already materialized. Changes the return arity (see Returns).
 
         Returns:
-            (N, d) unit-normalised embeddings (float32)
+            also_boundary=False: ((N, d) [PRED]/last-token embeddings, logits_anchor)
+            also_boundary=True:  ((N, d) [PRED] embeddings, (N, d) boundary
+                                  embeddings, logits_anchor)
+            All embeddings are unit-normalised float32.
         """
         device = next(self.actor.engine.module.parameters()).device
         N = input_ids.shape[0]
@@ -359,9 +370,12 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         logits_anchor = outputs.logits[:, 0, 0].sum() * 0.0
 
         all_embs = []
+        boundary_embs = [] if also_boundary else None
         for b, rlen in enumerate(rlens):
             if rlen == 0:
                 all_embs.append(torch.zeros(last_h.shape[-1], device=device))
+                if also_boundary:
+                    boundary_embs.append(torch.zeros(last_h.shape[-1], device=device))
             else:
                 # With predictor_ks[b]=0 this is rlen-1 (last real token),
                 # matching prior behavior exactly. With predictor_ks[b]>0, this
@@ -369,7 +383,13 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 last_idx = rlen + predictor_ks[b] - 1
                 emb = torch.nn.functional.normalize(last_h[b, last_idx, :], dim=-1)
                 all_embs.append(emb)
+                if also_boundary:
+                    # Boundary = last REAL token (pre-[PRED]); equals `emb` when k=0.
+                    bnd = torch.nn.functional.normalize(last_h[b, rlen - 1, :], dim=-1)
+                    boundary_embs.append(bnd)
 
+        if also_boundary:
+            return torch.stack(all_embs, dim=0), torch.stack(boundary_embs, dim=0), logits_anchor
         return torch.stack(all_embs, dim=0), logits_anchor  # (N, d), scalar
 
     def _embed_chunked_no_grad(
@@ -451,9 +471,10 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         mask: torch.Tensor,
         lengths: torch.Tensor,
         predictor_k: "list[int]",
-        loss_fn: "Callable[[torch.Tensor], tuple[torch.Tensor, dict]]",
+        loss_fn: "Callable[..., tuple[torch.Tensor, dict]]",
         micro_bs: int,
         alpha: float,
+        also_boundary: bool = False,
     ) -> dict:
         """Embed the joint (N, L) batch, compute a loss over it, and run backward
         — splitting the forward+backward into micro-batches of size `micro_bs`
@@ -492,37 +513,67 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         memory bounded by `micro_bs` rows instead of N rows — exact, not an
         approximation, since the loss is computed once on the full pool.
 
+        When ``also_boundary`` is True, the per-row BOUNDARY embedding (last real
+        token, pre-[PRED]) is captured DETACHED from the SAME pass-1 forward (no
+        extra forward) and ``loss_fn`` is called as ``loss_fn(joint_emb, boundary)``
+        instead of ``loss_fn(joint_emb)``. Used by jepa-tcr-dual so the stop-grad
+        self-consistency target z_self rides for free on the encode that already
+        produces the [PRED] reads.
+
         Returns the metrics dict from `loss_fn`; backward is a side effect, the
         caller must still call `engine.optimizer_step()` afterward.
         """
         N = ids.shape[0]
         cfg = self.jepa_cfg
 
+        def _run_loss(emb, boundary):
+            return loss_fn(emb, boundary) if also_boundary else loss_fn(emb)
+
         if N <= micro_bs:
-            joint_emb, logits_anchor = self._extract_embeddings(
-                ids, mask, lengths, use_ema=False, requires_grad=True,
-                predictor_k=predictor_k, predictor_token_id=cfg.predictor_token_id,
-            )
-            loss, metrics = loss_fn(joint_emb)
+            if also_boundary:
+                joint_emb, boundary, logits_anchor = self._extract_embeddings(
+                    ids, mask, lengths, use_ema=False, requires_grad=True,
+                    predictor_k=predictor_k, predictor_token_id=cfg.predictor_token_id,
+                    also_boundary=True,
+                )
+                boundary = boundary.detach()
+            else:
+                joint_emb, logits_anchor = self._extract_embeddings(
+                    ids, mask, lengths, use_ema=False, requires_grad=True,
+                    predictor_k=predictor_k, predictor_token_id=cfg.predictor_token_id,
+                )
+                boundary = None
+            loss, metrics = _run_loss(joint_emb, boundary)
             (alpha * loss + logits_anchor).backward()
             return metrics
 
         bounds = [(s, min(s + micro_bs, N)) for s in range(0, N, micro_bs)]
 
         # Pass 1: cache detached per-chunk embeddings (each chunk's forward
-        # graph is freed once its embedding is detached and we move on).
+        # graph is freed once its embedding is detached and we move on). The
+        # boundary read (also detached) is captured here too when requested.
         cached = []
+        boundary_chunks = [] if also_boundary else None
         for start, end in bounds:
-            chunk_emb, _ = self._extract_embeddings(
-                ids[start:end], mask[start:end], lengths[start:end], use_ema=False, requires_grad=True,
-                predictor_k=predictor_k[start:end], predictor_token_id=cfg.predictor_token_id,
-            )
+            if also_boundary:
+                chunk_emb, chunk_bnd, _ = self._extract_embeddings(
+                    ids[start:end], mask[start:end], lengths[start:end], use_ema=False, requires_grad=True,
+                    predictor_k=predictor_k[start:end], predictor_token_id=cfg.predictor_token_id,
+                    also_boundary=True,
+                )
+                boundary_chunks.append(chunk_bnd.detach())
+            else:
+                chunk_emb, _ = self._extract_embeddings(
+                    ids[start:end], mask[start:end], lengths[start:end], use_ema=False, requires_grad=True,
+                    predictor_k=predictor_k[start:end], predictor_token_id=cfg.predictor_token_id,
+                )
             cached.append(chunk_emb.detach().clone().requires_grad_(True))
 
         # Pass 2: compute the real loss on the full assembled pool, backward
         # into the cached per-chunk leaves only (cheap — no transformer graph).
         joint_emb_cached = torch.cat(cached, dim=0)
-        loss, metrics = loss_fn(joint_emb_cached)
+        boundary_all = torch.cat(boundary_chunks, dim=0) if also_boundary else None
+        loss, metrics = _run_loss(joint_emb_cached, boundary_all)
         (alpha * loss).backward()
 
         # Pass 3: re-forward each chunk live and backprop the cached gradient
@@ -568,11 +619,11 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
         assert self.jepa_cfg.loss_type in (
-            "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss", "jepa-tcr-hybrid"
+            "jepa-separation-loss", "jepa-clreg-loss", "jepa-tcr-loss", "jepa-tcr-hybrid", "jepa-tcr-dual"
         ), (
             f"worker.jepa_update only supports loss_type in "
-            f"{{'jepa-separation-loss', 'jepa-clreg-loss', 'jepa-tcr-loss', 'jepa-tcr-hybrid'}}, "
-            f"got {self.jepa_cfg.loss_type!r}"
+            f"{{'jepa-separation-loss', 'jepa-clreg-loss', 'jepa-tcr-loss', 'jepa-tcr-hybrid', "
+            f"'jepa-tcr-dual'}}, got {self.jepa_cfg.loss_type!r}"
         )
         if self.jepa_cfg.predictor_k > 0:
             assert self.jepa_cfg.predictor_token_id >= 0, (
@@ -580,7 +631,8 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 "JEPARayPPOTrainer.init_workers() should have set this before jepa_init()"
             )
 
-        n_pairs = data["cot_input_ids"].shape[0]
+        n_pairs = (data["anchor_input_ids"].shape[0] if "anchor_input_ids" in data
+                   else data["cot_input_ids"].shape[0])
         if n_pairs < self.jepa_cfg.min_valid_pairs:
             return TensorDict(
                 {"jepa/skipped": torch.tensor(1.0),
@@ -673,6 +725,104 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 }
                 # Loss fns already namespace their keys with "jepa/"; do NOT re-prefix
                 # (that produced "jepa/jepa/..."). Keep the keys as returned.
+                out.update({k: torch.tensor(float(v)) for k, v in jepa_metrics.items()})
+                return TensorDict(out, batch_size=[])
+
+            if cfg.loss_type == "jepa-tcr-dual":
+                # Dual-target self-consistent TCR. One combined anchor block (CoT rows
+                # first, then Code rows; `is_code` recovers the split), each row with
+                # [PRED]. Each view's pred is pulled toward its OWN cached teacher
+                # target; each CoT pred is additionally pulled toward the stop-grad
+                # Code_S BOUNDARY read of its paired code rollout (self-consistency).
+                # SIGReg over both views' preds.
+                anchor_ids = data["anchor_input_ids"]
+                anchor_mask = data["anchor_attn_mask"]
+                anchor_lengths = data["anchor_lengths"]
+                is_code = data["is_code"].bool()
+                cot_sel = ~is_code
+                N = anchor_ids.shape[0]
+
+                # z_self (the Code_S boundary read, stop-grad) rides on the SAME forward
+                # that produces the [PRED] reads: `_embed_chunked_with_backward(..,
+                # also_boundary=True)` hands the loss_fn the per-row boundary embeddings
+                # (last real token, pre-[PRED]) for free — no separate forward. The
+                # loss_fn gathers each CoT row's partner (self_partner indexes the code
+                # sub-block) from the boundary of the corresponding ABSOLUTE code row.
+                joint_predictor_k = [cfg.predictor_k] * N
+                teacher_target = data["teacher_target"]
+                group_id = data.get("anchor_group_id", None)
+                is_correct = data.get("anchor_is_correct", None)
+                self_partner = data.get("self_partner", None)
+                # Per-arm plateau latches (broadcast scalars from the trainer). When an
+                # arm is off, its align term contributes 0 grad but preds stay in SIGReg.
+                def _arm_on(key):
+                    v = data.get(key, None)
+                    return True if v is None else bool(v.reshape(-1)[0].item())
+                align_cot_on = _arm_on("align_cot_on")
+                align_code_on = _arm_on("align_code_on")
+                self_on = _arm_on("self_on")
+                # Absolute row indices of the code sub-block (code rows are last, in order).
+                code_abs = is_code.nonzero(as_tuple=True)[0]
+                cot_rows = cot_sel.nonzero(as_tuple=True)[0]
+                n_cot = int(cot_rows.numel())
+                n_code = int(code_abs.numel())
+
+                def _loss_fn(joint_emb, boundary, _cot=cot_sel, _code=is_code,
+                             _tt=teacher_target, _gid=group_id, _ic=is_correct,
+                             _sp=self_partner, _code_abs=code_abs, _cot_rows=cot_rows,
+                             _n_cot=n_cot, _n_code=n_code,
+                             _cot_on=align_cot_on, _code_on=align_code_on, _self_on=self_on):
+                    dev, dt = joint_emb.device, joint_emb.dtype
+                    tt = _tt.to(device=dev, dtype=dt)
+                    gid = _gid.to(dev) if _gid is not None else None
+                    ic = _ic.to(dev) if _ic is not None else None
+                    # Build z_self from the boundary reads of the SAME forward. Boundary
+                    # is detached; partner index (into the code sub-block) -> absolute row.
+                    d = joint_emb.shape[-1]
+                    self_target = boundary.new_zeros((_n_cot, d))
+                    self_mask = torch.zeros(_n_cot, dtype=torch.bool, device=dev)
+                    if _sp is not None:
+                        sp_cot = _sp.to(device=dev, dtype=torch.long)[_cot_rows.to(dev)]
+                        has = (sp_cot >= 0) & (sp_cot < _n_code)
+                        if has.any():
+                            rows = torch.arange(_n_cot, device=dev)[has]
+                            abs_idx = _code_abs.to(dev)[sp_cot[has]]
+                            self_target[rows] = boundary[abs_idx]
+                            self_mask[rows] = True
+                    return llm_jepa_tcr_dual_loss(
+                        pred_cot=joint_emb[_cot],
+                        teacher_target_cot=tt[_cot],
+                        pred_code=joint_emb[_code],
+                        teacher_target_code=tt[_code],
+                        self_target=self_target,
+                        self_mask=self_mask,
+                        cot_group_id=gid[_cot] if gid is not None else None,
+                        cot_is_correct=ic[_cot] if ic is not None else None,
+                        code_group_id=gid[_code] if gid is not None else None,
+                        code_is_correct=ic[_code] if ic is not None else None,
+                        self_consist_w=cfg.self_consist_w,
+                        align_cot_on=_cot_on,
+                        align_code_on=_code_on,
+                        self_on=_self_on,
+                        lambda_=cfg.triplet_sigreg_lambda,
+                        M=cfg.n_projections,
+                        t_min=cfg.t_min, t_max=cfg.t_max, s=cfg.epps_pulley_s,
+                    )
+
+                jepa_metrics = self._embed_chunked_with_backward(
+                    anchor_ids, anchor_mask, anchor_lengths, joint_predictor_k, _loss_fn,
+                    micro_bs, alpha, also_boundary=True,
+                )
+                grad_norm = engine.optimizer_step(clip_grad_override=self.jepa_cfg.max_grad_norm)
+                self._sync_ema()
+                aggressive_empty_cache(force_sync=True)
+                _total_loss_value = jepa_metrics.get("jepa/llm_jepa_loss", 0.0)
+                out = {
+                    "jepa/total_loss": torch.tensor(float(_total_loss_value)),
+                    "jepa/n_valid_pairs": torch.tensor(float(n_pairs)),
+                    "jepa/skipped": torch.tensor(0.0),
+                    "jepa/grad_norm": torch.tensor(float(grad_norm) if grad_norm is not None else 0.0),
+                }
                 out.update({k: torch.tensor(float(v)) for k, v in jepa_metrics.items()})
                 return TensorDict(out, batch_size=[])
 

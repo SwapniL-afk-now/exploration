@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# JEPA-GRPO | Qwen2.5-1.5B-Instruct | Ray + FSDP + hybrid-engine vLLM
+# JEPA-GRPO (dual-cache) | Qwen2.5-1.5B-Instruct | Ray + FSDP + hybrid-engine vLLM
 #
-# Uses verl's full production stack:
-#   - Ray for distribution
-#   - FSDP (fsdp2) for actor training
-#   - Hybrid engine: zero-copy FSDP→vLLM weight sync (no checkpoint save/reload)
-#   - ActorRolloutRefWorker extended with EMA target encoder + JEPA update
-#   - RayPPOTrainer extended with Code-view rollout and LeJEPA loss step
+# Default JEPA_LOSS_TYPE=jepa-tcr-reward-dual: per-view TEACHER-ALIGNMENT REWARD SHAPING
+# (NO differentiable JEPA backward). Each rollout's [PRED] latent is scored against its
+# OWN view's teacher cache (CoT->CoT cache, code->code cache), standardized within its
+# (uid, view, is_correct) reward stratum, and added to the advantage as beta*s_hat. The
+# signal rides the GRPO policy gradient.
+#   L_total = L_DrGRPO(CoT+Code) over advantages shaped by beta*s_hat (per-view teacher align)
 #
-# L_total = L_DrGRPO(CoT) + alpha * L_LeJEPA(enc_q_cot, enc_a_code)
+# Set JEPA_LOSS_TYPE=jepa-tcr-dual instead for the DIFFERENTIABLE variant (align_cot +
+# align_code + self-consistency + SIGReg as a separate alpha-weighted backward).
+#
+# Prereqs (build once, offline):
+#   - CoT  cache: precompute_teacher_targets.py --view cot  -> TEACHER_CACHE
+#   - Code cache: precompute_teacher_targets.py --view code -> CODE_TEACHER_CACHE
+#     (the Qwen2.5-Coder-7B run produces CODE_TEACHER_CACHE)
 
 set -euo pipefail
 if [[ "${DEBUG_LAUNCH:-0}" == "1" ]]; then
@@ -46,7 +52,7 @@ export WANDB_MODE=${WANDB_MODE:-online}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
 
 ########################### user-adjustable ###########################
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
 TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
@@ -54,7 +60,7 @@ NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
 EVAL_DATA_DIR=${EVAL_DATA_DIR:-/workspace/jepa-grpo-cache/eval_data}
 PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-true}
 if [[ -z "${VAL_FILES:-}" ]]; then
-    VAL_FILES="[${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet]"
+    VAL_FILES="[${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet,${EVAL_DATA_DIR}/aime26.parquet]"
 fi
 if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
     mkdir -p "${EVAL_DATA_DIR}"
@@ -68,19 +74,16 @@ if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
 fi
 
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
-PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_dapo_math}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_1_5b_jepa_grpo_ray-${RUN_TIMESTAMP}}
+PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_deepscaler}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen25_math_1_5b_jepa_tcr_dual_ray-${RUN_TIMESTAMP}}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 
 # Training size
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 ROLLOUT_N=${ROLLOUT_N:-8}
-# Split of ROLLOUT_N completions/prompt between CoT-framed and Code-framed
-# system prompts (see jepa.n_cot/jepa.n_code below). Both views now
-# contribute to the GRPO policy-gradient update, not just CoT — the
-# code-framed subset is additionally used to build JEPA pairs. Must sum to
-# ROLLOUT_N.
+# 4 CoT-framed + 4 Code-framed completions per prompt (must sum to ROLLOUT_N).
+# Both views feed the GRPO policy gradient; the CORRECT ones become JEPA anchors.
 N_COT=${N_COT:-4}
 N_CODE=${N_CODE:-4}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
@@ -99,17 +102,42 @@ LORA_ALPHA=${LORA_ALPHA:-256}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.70}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-512}
 
-# JEPA
+# JEPA (jepa-tcr-dual)
 ALPHA=${ALPHA:-0.1}
 EMA_DECAY=${EMA_DECAY:-0.99}
-EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-8}
+# Raise so the per-step CORRECT-anchor block fits in ONE micro-batch: that keeps the
+# GradCache memory-saving path at a SINGLE encoder forward (it only does the 2x
+# cache+recompute when N_anchors > this). With <=64 correct anchors/step at the 1.5B
+# scale this avoids the double forward. Lower it if the JEPA forward OOMs.
+EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-64}
 MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
-# JEPA objective: "lejepa" (squared-Euclidean align + SIGReg) or
-# "llm-jepa-loss" (default; LLM-JEPA paper arXiv:2509.14252 cosine prediction loss + SIGReg).
-JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-llm-jepa-loss}
-# Number of LLM-JEPA tied-weight predictor tokens (paper §3.1). Only used when
-# JEPA_LOSS_TYPE=llm-jepa-loss; k=0 is the identity predictor, Pred(x) = x.
+# jepa-tcr-dual = differentiable dual loss (align_cot + align_code + self-consistency
+# + SIGReg) AND beta reward shaping (Step 3.5), both active.
+JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-tcr-dual}
+# Tied-weight predictor tokens (paper §3.1). MUST be >0 for a real predictor
+# (k=0 => Pred(x)=x identity; the shaping score would then be on the raw last token).
 LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
+# Reward-shaping knobs (jepa-tcr-reward-dual): advantage term = beta * standardized score.
+TCR_REWARD_BETA=${TCR_REWARD_BETA:-0.5}
+TCR_REWARD_SIGMA_FLOOR=${TCR_REWARD_SIGMA_FLOOR:-0.1}
+# Auto-disable the JEPA aux signal once teacher-alignment plateaus: after AUTO_OFF_WARMUP
+# steps, AUTO_OFF_PATIENCE consecutive steps without a >AUTO_OFF_MIN_DELTA improvement latch
+# it off for the rest of training. ON by default here. For jepa-tcr-dual this is now PER-ARM:
+# cos_cot, cos_code and cos_self each plateau and latch INDEPENDENTLY, disabling only their
+# own loss term (and matching-view shaping); the whole block stops only once all three are off.
+AUTO_OFF_ENABLE=${AUTO_OFF_ENABLE:-True}
+AUTO_OFF_PATIENCE=${AUTO_OFF_PATIENCE:-10}
+AUTO_OFF_MIN_DELTA=${AUTO_OFF_MIN_DELTA:-0.002}
+AUTO_OFF_WARMUP=${AUTO_OFF_WARMUP:-20}
+# (auto_off_metric left at config default "" => per-arm tracking above; SET it to a single
+#  key via the extra-args passthrough to collapse back to one global latch instead.)
+# Differentiable-variant knobs (only used when JEPA_LOSS_TYPE=jepa-tcr-dual).
+SELF_CONSIST_W=${SELF_CONSIST_W:-1.0}
+TCR_SIGREG_LAMBDA=${TCR_SIGREG_LAMBDA:-0.05}
+JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
+# Offline target caches (build with precompute_teacher_targets.py --view {cot,code}).
+TEACHER_CACHE=${TEACHER_CACHE:-/workspace/jepa-grpo-cache/teacher_targets.pt}
+CODE_TEACHER_CACHE=${CODE_TEACHER_CACHE:-/workspace/jepa-grpo-cache/code_teacher_targets.pt}
 
 SAVE_FREQ=${SAVE_FREQ:-20}
 TEST_FREQ=${TEST_FREQ:-10}
@@ -121,9 +149,17 @@ VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
-# KL penalty
-KL_COEF=${KL_COEF:-0.001}
+# KL penalty — TURNED OFF, per request.
+KL_COEF=${KL_COEF:-0.0}
 ########################### end user-adjustable ###########################
+
+for c in "${TEACHER_CACHE}" "${CODE_TEACHER_CACHE}"; do
+    if [[ ! -f "${c}" ]]; then
+        echo "ERROR: target cache not found: ${c}" >&2
+        echo "Build it with examples/jepa_grpo_trainer/precompute_teacher_targets.py" >&2
+        exit 1
+    fi
+done
 
 DATA=(
     data.train_files="$TRAIN_FILE"
@@ -166,6 +202,7 @@ ROLLOUT=(
 )
 
 JEPA=(
+    jepa.enable=True
     jepa.n_cot=${N_COT}
     jepa.n_code=${N_CODE}
     jepa.alpha=${ALPHA}
@@ -174,6 +211,17 @@ JEPA=(
     jepa.min_valid_pairs=${MIN_VALID_PAIRS}
     jepa.loss_type=${JEPA_LOSS_TYPE}
     jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
+    jepa.tcr_reward_beta=${TCR_REWARD_BETA}
+    jepa.tcr_reward_sigma_floor=${TCR_REWARD_SIGMA_FLOOR}
+    jepa.auto_off_enable=${AUTO_OFF_ENABLE}
+    jepa.auto_off_patience=${AUTO_OFF_PATIENCE}
+    jepa.auto_off_min_delta=${AUTO_OFF_MIN_DELTA}
+    jepa.auto_off_warmup_steps=${AUTO_OFF_WARMUP}
+    jepa.self_consist_w=${SELF_CONSIST_W}
+    jepa.triplet_sigreg_lambda=${TCR_SIGREG_LAMBDA}
+    jepa.jepa_anchor_set=${JEPA_ANCHOR_SET}
+    jepa.teacher_cache_path=${TEACHER_CACHE}
+    jepa.code_teacher_cache_path=${CODE_TEACHER_CACHE}
 )
 
 TRAINER=(
@@ -186,13 +234,15 @@ TRAINER=(
     trainer.experiment_name=${EXPERIMENT_NAME}
     trainer.default_local_dir=${CKPTS_DIR}
     trainer.logger=${LOGGER}
+    +trainer.best_ckpt_sources=${BEST_CKPT_SOURCES:-'[amc23,aime24,aime25,aime26]'}
+    +trainer.best_ckpt_metric=${BEST_CKPT_METRIC:-avg@8}
 )
 
 ALGORITHM=(
     algorithm.adv_estimator=grpo
     algorithm.norm_adv_by_std_in_grpo=False
     algorithm.use_kl_in_reward=False
-    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.use_kl_loss=False
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
     actor_rollout_ref.actor.kl_loss_coef=${KL_COEF}
 )

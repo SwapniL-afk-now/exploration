@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -84,6 +85,8 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+logger = logging.getLogger(__name__)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -1169,30 +1172,60 @@ class RayPPOTrainer:
                 avg_scores.append(avg_matches[0])
             if pass_matches:
                 pass_scores.append(pass_matches[0])
-        # Require BOTH metrics to be present so the combined score is comparable
-        # across steps (mixing a both-axes score with an avg-only score would let
-        # an inferior checkpoint win whenever pass@k happened to be missing).
-        if not avg_scores or not pass_scores:
-            return
-
-        avg_at_k = sum(avg_scores) / len(avg_scores)
-        pass_at_k = sum(pass_scores) / len(pass_scores)
-        combined = 0.5 * (avg_at_k + pass_at_k)
+        # Selection metric (trainer.best_ckpt_metric):
+        #   "combined" (default) = 0.5*(avg@k + pass@k)  — both axes, full k
+        #   "avg"                = mean avg@k across sources only (ignore pass@k)
+        #   "pass"               = mean pass@k across sources only (ignore avg@k)
+        #   "avg@N" / "pass@N"   = select on a SPECIFIC sub-budget N, read from the
+        #                          per-source `val/{source}/avg_at_N` / `pass_at_N`
+        #                          metrics (e.g. "avg@8" selects on avg accuracy over 8
+        #                          samples rather than the full @k).
+        metric = str(self.config.trainer.get("best_ckpt_metric", "combined")).lower()
+        avg_at_k = sum(avg_scores) / len(avg_scores) if avg_scores else None
+        pass_at_k = sum(pass_scores) / len(pass_scores) if pass_scores else None
+        if "@" in metric and metric.split("@", 1)[0] in ("avg", "pass"):
+            kind, _, budget = metric.partition("@")
+            field = f"{kind}_at_{budget}"  # avg_at_8 | pass_at_8
+            sub_scores = [
+                val_metrics[f"val/{source}/{field}"]
+                for source in best_ckpt_sources
+                if f"val/{source}/{field}" in val_metrics
+            ]
+            if not sub_scores:
+                return
+            combined = sum(sub_scores) / len(sub_scores)
+        elif metric == "avg":
+            if avg_at_k is None:
+                return
+            combined = avg_at_k
+        elif metric == "pass":
+            if pass_at_k is None:
+                return
+            combined = pass_at_k
+        else:
+            # Combined needs BOTH present so the score is comparable across steps.
+            if avg_at_k is None or pass_at_k is None:
+                return
+            combined = 0.5 * (avg_at_k + pass_at_k)
         if combined > getattr(self, "best_val_score", float("-inf")):
             self.best_val_score = combined
+            avg_s = f"{avg_at_k:.4f}" if avg_at_k is not None else "n/a"
+            pass_s = f"{pass_at_k:.4f}" if pass_at_k is not None else "n/a"
             print(
                 f"New best checkpoint at step {self.global_steps}: "
-                f"combined={combined:.4f} (avg@k={avg_at_k:.4f}, pass@k={pass_at_k:.4f}) "
+                f"metric={metric} score={combined:.4f} (avg@k={avg_s}, pass@k={pass_s}) "
                 f"over {best_ckpt_sources}"
             )
             best_local_path = os.path.join(self.config.trainer.default_local_dir, "best", "actor")
             self.actor_rollout_wg.save_checkpoint(
                 best_local_path, None, self.global_steps, max_ckpt_to_keep=1, tag="best"
             )
+            avg_w = f"{avg_at_k:.6f}" if avg_at_k is not None else "nan"
+            pass_w = f"{pass_at_k:.6f}" if pass_at_k is not None else "nan"
             with open(os.path.join(self.config.trainer.default_local_dir, "best", "best_val_acc.txt"), "w") as f:
                 f.write(
-                    f"step={self.global_steps} combined={combined:.6f} "
-                    f"avg_at_k={avg_at_k:.6f} pass_at_k={pass_at_k:.6f} sources={best_ckpt_sources}\n"
+                    f"step={self.global_steps} metric={metric} score={combined:.6f} "
+                    f"avg_at_k={avg_w} pass_at_k={pass_w} sources={best_ckpt_sources}\n"
                 )
 
     def _save_checkpoint(self):
@@ -1634,7 +1667,10 @@ class RayPPOTrainer:
             "checkpoint_interval_grpo_steps": int(self.tafr_config.checkpoint_interval_grpo_steps),
             "failure_sft_lr": float(self.tafr_config.failure_sft_lr),
             "failure_sft_batch_size": int(self.tafr_config.failure_sft_batch_size),
+            "failure_sft_max_token_len_per_gpu": int(self.tafr_config.failure_sft_max_token_len_per_gpu),
             "failure_sft_max_updates_per_interval": int(self.tafr_config.failure_sft_max_updates_per_interval),
+            "save_to_disk_interval_grpo_steps": int(self.tafr_config.save_to_disk_interval_grpo_steps),
+            "save_failure_sft_optimizer": bool(self.tafr_config.save_failure_sft_optimizer),
             "variant": str(self.tafr_config.variant),
             "logprob_backend": str(self.tafr_config.logprob_backend),
             "vllm_score_micro_batch_size": int(self.tafr_config.vllm_score_micro_batch_size),
@@ -1649,20 +1685,39 @@ class RayPPOTrainer:
 
     def _tafr_sync_vllm_adapters(self) -> bool:
         if not self.tafr_enabled or self.tafr_config.logprob_backend != "vllm":
+            logger.warning(
+                "TAFR vLLM sync skipped: enabled=%s logprob_backend=%s (not 'vllm')",
+                self.tafr_enabled, self.tafr_config.logprob_backend,
+            )
             return False
         if self.config.actor_rollout_ref.rollout.name != "vllm" or self.llm_server_manager is None:
+            logger.warning(
+                "TAFR vLLM sync skipped: rollout.name=%s llm_server_manager=%s",
+                self.config.actor_rollout_ref.rollout.name, self.llm_server_manager is not None,
+            )
             return False
         try:
             output = self.actor_rollout_wg.tafr_export_vllm_adapters(self._tafr_config_dict())
             payload = self._tafr_select_payload(output)
             if payload is None:
+                logger.warning(
+                    "TAFR vLLM adapters NOT ready: export returned no enabled payload "
+                    "(output=%s) -> anchor/replay will use the slow HF path.",
+                    output if not isinstance(output, list) else [
+                        {k: (v if k == "enabled" else "...") for k, v in (o or {}).items()} for o in output
+                    ],
+                )
                 self.tafr_vllm_adapters_ready = False
                 return False
             self.tafr_vllm_adapter_payload = payload
             self.tafr_vllm_adapters_ready = True
+            # New payload => invalidate the "already loaded into vLLM" token so the next
+            # scoring call reloads the refreshed adapters exactly once.
+            self._tafr_payload_token = getattr(self, "_tafr_payload_token", 0) + 1
+            logger.info("TAFR vLLM adapters ready: anchor/replay will score via vLLM prefill.")
             return True
-        except Exception as exc:
-            print(f"TAFR vLLM adapter sync failed; falling back to HF logprob scoring: {exc}")
+        except Exception:
+            logger.exception("TAFR vLLM adapter sync failed; falling back to HF logprob scoring")
             self.tafr_vllm_adapters_ready = False
             return False
 
@@ -1762,6 +1817,74 @@ class RayPPOTrainer:
             )
         return output
 
+    def _tafr_rows_to_tensor(self, rows: list[list[float]], shape_template: torch.Tensor) -> torch.Tensor:
+        output = torch.zeros_like(shape_template, dtype=torch.float32)
+        for i, row in enumerate(rows):
+            row_tensor = torch.tensor(row, dtype=torch.float32, device=output.device)
+            output[i, : row_tensor.numel()] = row_tensor
+        return output
+
+    def _tafr_compute_vllm_log_probs_multi(
+        self, batch: DataProto, adapters: tuple[str, ...]
+    ) -> dict[str, torch.Tensor]:
+        """Score the rollout sequences under several TAFR adapters in one batched sweep.
+
+        Loads all requested adapters once (each into its own int_id slot) and submits
+        anchor+replay requests in a single interleaved gather, so vLLM's continuous
+        batcher overlaps them rather than running one full prefill pass per adapter.
+        """
+        sequences, prompt_lens, response_lens = self._tafr_build_vllm_score_inputs(batch)
+        if not getattr(self, "tafr_vllm_adapter_payload", None):
+            raise RuntimeError("TAFR vLLM adapter payload is not ready.")
+
+        # Loading the rank-512 all-linear LoRA adapters into vLLM is expensive (~36s,
+        # pickle+RPC of the full tensors) and the adapters only change at the EMA refresh.
+        # Skip the reload when the payload token is unchanged AND the adapters are still
+        # resident; if vLLM evicted them (e.g. across a sleep), the score call raises and
+        # we reload once and retry. Best case: ~0s load on the 4/5 steps between refreshes.
+        token = getattr(self, "_tafr_payload_token", 0)
+
+        def _load():
+            self.llm_server_manager.load_tafr_lora_adapters(self.tafr_vllm_adapter_payload, adapters=adapters)
+            self._tafr_loaded_token = token
+
+        _t_load = time.time()
+        if getattr(self, "_tafr_loaded_token", None) != token:
+            _load()
+        load_s = time.time() - _t_load
+
+        def _score():
+            return self.tafr_llm_client.score_tafr_logprobs_multi(
+                sequences=sequences, prompt_lens=prompt_lens, response_lens=response_lens, adapters=adapters,
+            )
+
+        start_time = time.time()
+        try:
+            rows_by_adapter = _score()
+            reload_s = 0.0
+        except Exception:
+            # Adapters likely evicted (vLLM sleep); reload once and retry.
+            _r = time.time()
+            _load()
+            reload_s = time.time() - _r
+            rows_by_adapter = _score()
+        print(
+            f"TAFR vLLM score split: adapter_load={load_s:.1f}s reload={reload_s:.1f}s "
+            f"score={time.time() - start_time - reload_s:.1f}s (seqs={len(sequences)} adapters={len(adapters)})",
+            flush=True,
+        )
+
+        shape_template = batch.batch.get("old_log_probs", batch.batch["response_mask"])
+        outputs = {
+            adapter: self._tafr_rows_to_tensor(rows_by_adapter[adapter], shape_template) for adapter in adapters
+        }
+        if hasattr(self, "tafr_last_logprob_metrics") and self.tafr_last_logprob_metrics is not None:
+            self.tafr_last_logprob_metrics["tafr_grpo/vllm_multi_score_time"] = time.time() - start_time
+            self.tafr_last_logprob_metrics["tafr_grpo/vllm_score_tokens"] = self.tafr_last_logprob_metrics.get(
+                "tafr_grpo/vllm_score_tokens", 0.0
+            ) + float(sum(response_lens) * len(adapters))
+        return outputs
+
     def _tafr_compute_anchor_log_probs(self, batch: DataProto) -> None:
         if (
             not self.tafr_enabled
@@ -1775,8 +1898,8 @@ class RayPPOTrainer:
                     batch.batch["old_log_probs"].device
                 )
                 return
-            except Exception as exc:
-                print(f"TAFR vLLM anchor scoring failed; falling back to HF: {exc}")
+            except Exception:
+                logger.exception("TAFR vLLM anchor scoring failed; falling back to HF")
                 self.tafr_last_logprob_metrics["tafr_grpo/hf_fallback_used"] = 1.0
         batch_td = batch.to_tensordict()
         tu.assign_non_tensor(batch_td, custom_tafr_grpo=self._tafr_config_dict())
@@ -1805,8 +1928,8 @@ class RayPPOTrainer:
                     batch.batch["old_log_probs"].device
                 )
                 return
-            except Exception as exc:
-                print(f"TAFR vLLM replay scoring failed; falling back to HF: {exc}")
+            except Exception:
+                logger.exception("TAFR vLLM replay scoring failed; falling back to HF")
                 self.tafr_last_logprob_metrics["tafr_grpo/hf_fallback_used"] = 1.0
         batch_td = batch.to_tensordict()
         tu.assign_non_tensor(batch_td, custom_tafr_grpo=self._tafr_config_dict())
@@ -1832,17 +1955,17 @@ class RayPPOTrainer:
         target_device = batch.batch.get("old_log_probs", batch.batch["responses"]).device
         if self._tafr_can_score_with_vllm():
             try:
+                adapters = tuple(a for a, needed in (("anchor", need_anchor), ("replay", need_replay)) if needed)
+                # Score all needed adapters in a single interleaved prefill sweep
+                # (each request carries its own LoRA int_id) instead of one pass each.
+                outputs = self._tafr_compute_vllm_log_probs_multi(batch, adapters)
                 if need_anchor:
-                    batch.batch["tafr_anchor_log_probs"] = self._tafr_compute_vllm_log_probs(batch, "anchor").to(
-                        target_device
-                    )
+                    batch.batch["tafr_anchor_log_probs"] = outputs["anchor"].to(target_device)
                 if need_replay:
-                    batch.batch["tafr_replay_log_probs"] = self._tafr_compute_vllm_log_probs(batch, "replay").to(
-                        target_device
-                    )
+                    batch.batch["tafr_replay_log_probs"] = outputs["replay"].to(target_device)
                 return
-            except Exception as exc:
-                print(f"TAFR vLLM scoring failed; falling back to HF: {exc}")
+            except Exception:
+                logger.exception("TAFR vLLM scoring failed; falling back to HF")
                 if hasattr(self, "tafr_last_logprob_metrics") and self.tafr_last_logprob_metrics is not None:
                     self.tafr_last_logprob_metrics["tafr_grpo/hf_fallback_used"] = 1.0
         batch_td = batch.to_tensordict()
@@ -2155,16 +2278,6 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-                    # Issue anchor+replay scoring early to overlap with reward computation.
-                    # These only need rollout tokens (input_ids, attention_mask, response_mask)
-                    # and run on the actor worker group, disjoint from reward workers. The
-                    # call returns immediately; the actual scoring happens in a background
-                    # thread (see _tafr_issue_anchor_replay_async), and the result is
-                    # joined in `_tafr_join_anchor_replay` below — right before the actor
-                    # update. This hides the two frozen-model log-prob forward passes
-                    # behind reward + old_log_prob + ref_log_prob + advantage computation.
-                    if self.tafr_enabled and float(self.tafr_config.beta) > 0.0:
-                        self._tafr_issue_anchor_replay_async(batch)
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -2174,6 +2287,28 @@ class RayPPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
                         tafr_wrong_collected = self._tafr_collect_failures(batch, reward_tensor)
+
+                    # TAFR anchor/replay log-prob scoring, ordered around the vLLM sleep:
+                    #   - vLLM backend: score NOW, while the engine is still awake from gen
+                    #     (fast multi-LoRA prefill). Must run before the sleep below.
+                    #   - HF backend:   sleep first to free the KV-cache + weight memory,
+                    #     then score on the FSDP actor (issued async below, joined pre-update).
+                    # Either way old_log_prob / ref / update run with vLLM asleep, so the
+                    # actor forwards get the freed memory (avoids OOM at high util).
+                    score_with_vllm = (
+                        self.tafr_enabled
+                        and float(self.tafr_config.beta) > 0.0
+                        and self._tafr_can_score_with_vllm()
+                    )
+                    if score_with_vllm:
+                        with marked_timer("tafr_score_vllm", timing_raw, color="purple"):
+                            self._tafr_compute_anchor_and_replay_log_probs(batch)
+
+                    slept_after_gen = True
+                    self.checkpoint_manager.sleep_replicas()
+
+                    if self.tafr_enabled and float(self.tafr_config.beta) > 0.0 and not score_with_vllm:
+                        self._tafr_issue_anchor_replay_async(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -2288,8 +2423,10 @@ class RayPPOTrainer:
                         # in batch.batch, so this is just a join. If the thread raised,
                         # the exception is re-raised here so the trainer sees the failure.
                         self._tafr_join_anchor_replay(batch)
-                        # All vllm work is done — sleep now so the backward pass gets the freed KV cache memory.
-                        self.checkpoint_manager.sleep_replicas()
+                        # All vllm work is done — sleep now so the backward pass gets the
+                        # freed KV cache memory (unless we already slept right after gen).
+                        if not slept_after_gen:
+                            self.checkpoint_manager.sleep_replicas()
 
                     # update critic
                     if self.use_critic:
@@ -2334,14 +2471,22 @@ class RayPPOTrainer:
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
 
-                        # update weights from trainer to rollout
-                        with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
-
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                        # Run failure-SFT BEFORE the weight sync: at this point vLLM is
+                        # still asleep (slept after the GRPO update), so the SFT
+                        # forward/backward gets the freed rollout memory instead of OOMing
+                        # against an awake engine. Doing it here also means the subsequent
+                        # update_weights pushes the POST-SFT actor weights to vLLM, so the
+                        # next rollout reflects the SFT update.
                         metrics.update(self._tafr_run_failure_sft_if_due())
                         metrics.update(self._tafr_schedule_metrics(tafr_wrong_collected))
+
+                        # update weights from trainer to rollout (wakes vLLM, syncs the
+                        # post-GRPO + post-SFT actor weights)
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

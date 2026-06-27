@@ -727,12 +727,23 @@ class FSDPEngine(BaseEngine):
     def tafr_export_vllm_adapters(self, tafr_config: dict):
         self.tafr_init(tafr_config)
         if not self._tafr_uses_vllm_logprobs(tafr_config):
+            logger.warning(
+                "TAFR vLLM export disabled: _tafr_uses_vllm_logprobs=False "
+                f"(logprob_backend={tafr_config.get('logprob_backend')!r}, is_lora={self._is_lora})"
+            )
             return {"enabled": False}
         eta = float(tafr_config.get("mix_eta", 1.0))
         peft_config = self._tafr_peft_config_dict()
         anchor_tensors = self._tafr_mix_lora_states(self._tafr_grpo_lora_ema_state, eta)
         replay_tensors = self._tafr_mix_lora_states(self._tafr_fail_lora_ema_state, eta)
         if peft_config is None or not anchor_tensors or not replay_tensors:
+            logger.warning(
+                "TAFR vLLM export disabled: peft_config=%s anchor_tensors=%d replay_tensors=%d "
+                "ref_lora_keys=%d grpo_lora_ema_keys=%d (LoRA params not found for export)",
+                "None" if peft_config is None else "ok",
+                len(anchor_tensors), len(replay_tensors),
+                len(getattr(self, "_tafr_ref_lora_state", {})), len(self._tafr_grpo_lora_ema_state),
+            )
             return {"enabled": False}
         return {
             "enabled": True,
@@ -898,8 +909,43 @@ class FSDPEngine(BaseEngine):
         self._tafr_failure.gradient_checkpointing_enable()
         self._tafr_failure.train()
         torch.cuda.empty_cache()
-        for start in range(0, min(len(records), batch_size * max_updates), batch_size):
-            chunk = records[start : start + batch_size]
+        # Build micro-batches. When failure_sft_max_token_len_per_gpu > 0, pack records
+        # greedily by a padded-token budget (n_rows * max_len_in_batch) so each step
+        # fills the GPU rather than using a fixed row count; otherwise fall back to the
+        # fixed failure_sft_batch_size grouping. Either way cap at max_updates steps.
+        max_token_len = int(tafr_config.get("failure_sft_max_token_len_per_gpu", 0))
+        if max_token_len > 0:
+            lengths = [
+                len(
+                    tokenizer(
+                        str(r["prompt"]) + str(r["wrong_response"]),
+                        truncation=True,
+                        max_length=max_seq_len,
+                    )["input_ids"]
+                )
+                for r in records
+            ]
+            order = sorted(range(len(records)), key=lambda i: lengths[i])
+            micro_batches: list[list[dict]] = []
+            cur: list[int] = []
+            cur_max = 0
+            for i in order:
+                new_max = max(cur_max, lengths[i])
+                if cur and (len(cur) + 1) * new_max > max_token_len:
+                    micro_batches.append([records[j] for j in cur])
+                    cur, cur_max = [i], lengths[i]
+                else:
+                    cur.append(i)
+                    cur_max = new_max
+            if cur:
+                micro_batches.append([records[j] for j in cur])
+            micro_batches = micro_batches[:max_updates]
+        else:
+            micro_batches = [
+                records[start : start + batch_size]
+                for start in range(0, min(len(records), batch_size * max_updates), batch_size)
+            ]
+        for chunk in micro_batches:
             texts = [str(r["prompt"]) + str(r["wrong_response"]) for r in chunk]
             prompts = [str(r["prompt"]) for r in chunk]
             enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
@@ -931,11 +977,19 @@ class FSDPEngine(BaseEngine):
     def tafr_save_and_refresh(self, local_path: str, global_step: int, failure_model_changed: bool, tafr_config: dict):
         self.tafr_init(tafr_config)
         os.makedirs(local_path, exist_ok=True)
+        # Throttle heavy disk writes: the EMA refresh + vLLM adapter export below always
+        # run (the algorithm needs fresh anchor/replay every refresh), but the failure
+        # model / optimizer / tafr_state.pt are only written when due. Old global_step
+        # dirs are rotated away by the trainer, so the last save replaces the previous.
+        save_interval = int(tafr_config.get("save_to_disk_interval_grpo_steps", 0))
+        save_to_disk = save_interval <= 0 or (global_step % save_interval == 0)
+        save_optimizer = bool(tafr_config.get("save_failure_sft_optimizer", True))
         failure_dir = os.path.join(local_path, "failure_sft")
-        os.makedirs(failure_dir, exist_ok=True)
-        if self.rank == 0:
+        if save_to_disk and self.rank == 0:
+            os.makedirs(failure_dir, exist_ok=True)
             torch.save(self._tafr_failure.state_dict(), os.path.join(failure_dir, "pytorch_model.bin"))
-            torch.save(self._tafr_failure_optimizer.state_dict(), os.path.join(failure_dir, "optimizer.pt"))
+            if save_optimizer:
+                torch.save(self._tafr_failure_optimizer.state_dict(), os.path.join(failure_dir, "optimizer.pt"))
         gamma = float(tafr_config.get("ema_gamma", 0.9))
         eta = float(tafr_config.get("mix_eta", 1.0))
         actor_state = self._tafr_actor_state_cpu()
@@ -989,7 +1043,8 @@ class FSDPEngine(BaseEngine):
             if self._is_lora:
                 save_dict["grpo_lora_ema_state"] = self._tafr_grpo_lora_ema_state
                 save_dict["fail_lora_ema_state"] = self._tafr_fail_lora_ema_state
-            torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
+            if save_to_disk:
+                torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
         return {"tafr_refreshed": True, "tafr_failure_ema_updated": bool(failure_model_changed)}
 
     def tafr_load(self, local_path: str):
@@ -1790,8 +1845,43 @@ class FSDPEngineWithLMHead(FSDPEngine):
         self._tafr_failure.gradient_checkpointing_enable()
         self._tafr_failure.train()
         torch.cuda.empty_cache()
-        for start in range(0, min(len(records), batch_size * max_updates), batch_size):
-            chunk = records[start : start + batch_size]
+        # Build micro-batches. When failure_sft_max_token_len_per_gpu > 0, pack records
+        # greedily by a padded-token budget (n_rows * max_len_in_batch) so each step
+        # fills the GPU rather than using a fixed row count; otherwise fall back to the
+        # fixed failure_sft_batch_size grouping. Either way cap at max_updates steps.
+        max_token_len = int(tafr_config.get("failure_sft_max_token_len_per_gpu", 0))
+        if max_token_len > 0:
+            lengths = [
+                len(
+                    tokenizer(
+                        str(r["prompt"]) + str(r["wrong_response"]),
+                        truncation=True,
+                        max_length=max_seq_len,
+                    )["input_ids"]
+                )
+                for r in records
+            ]
+            order = sorted(range(len(records)), key=lambda i: lengths[i])
+            micro_batches: list[list[dict]] = []
+            cur: list[int] = []
+            cur_max = 0
+            for i in order:
+                new_max = max(cur_max, lengths[i])
+                if cur and (len(cur) + 1) * new_max > max_token_len:
+                    micro_batches.append([records[j] for j in cur])
+                    cur, cur_max = [i], lengths[i]
+                else:
+                    cur.append(i)
+                    cur_max = new_max
+            if cur:
+                micro_batches.append([records[j] for j in cur])
+            micro_batches = micro_batches[:max_updates]
+        else:
+            micro_batches = [
+                records[start : start + batch_size]
+                for start in range(0, min(len(records), batch_size * max_updates), batch_size)
+            ]
+        for chunk in micro_batches:
             texts = [str(r["prompt"]) + str(r["wrong_response"]) for r in chunk]
             prompts = [str(r["prompt"]) for r in chunk]
             enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
@@ -1823,11 +1913,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
     def tafr_save_and_refresh(self, local_path: str, global_step: int, failure_model_changed: bool, tafr_config: dict):
         self.tafr_init(tafr_config)
         os.makedirs(local_path, exist_ok=True)
+        # Throttle heavy disk writes: the EMA refresh + vLLM adapter export below always
+        # run (the algorithm needs fresh anchor/replay every refresh), but the failure
+        # model / optimizer / tafr_state.pt are only written when due. Old global_step
+        # dirs are rotated away by the trainer, so the last save replaces the previous.
+        save_interval = int(tafr_config.get("save_to_disk_interval_grpo_steps", 0))
+        save_to_disk = save_interval <= 0 or (global_step % save_interval == 0)
+        save_optimizer = bool(tafr_config.get("save_failure_sft_optimizer", True))
         failure_dir = os.path.join(local_path, "failure_sft")
-        os.makedirs(failure_dir, exist_ok=True)
-        if self.rank == 0:
+        if save_to_disk and self.rank == 0:
+            os.makedirs(failure_dir, exist_ok=True)
             torch.save(self._tafr_failure.state_dict(), os.path.join(failure_dir, "pytorch_model.bin"))
-            torch.save(self._tafr_failure_optimizer.state_dict(), os.path.join(failure_dir, "optimizer.pt"))
+            if save_optimizer:
+                torch.save(self._tafr_failure_optimizer.state_dict(), os.path.join(failure_dir, "optimizer.pt"))
         gamma = float(tafr_config.get("ema_gamma", 0.9))
         eta = float(tafr_config.get("mix_eta", 1.0))
         actor_state = self._tafr_actor_state_cpu()
@@ -1881,7 +1979,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if self._is_lora:
                 save_dict["grpo_lora_ema_state"] = self._tafr_grpo_lora_ema_state
                 save_dict["fail_lora_ema_state"] = self._tafr_fail_lora_ema_state
-            torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
+            if save_to_disk:
+                torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
         return {"tafr_refreshed": True, "tafr_failure_ema_updated": bool(failure_model_changed)}
 
     def tafr_load(self, local_path: str):
