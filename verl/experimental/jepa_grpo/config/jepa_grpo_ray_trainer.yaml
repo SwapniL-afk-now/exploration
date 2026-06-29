@@ -15,29 +15,23 @@ jepa:
   max_grad_norm: 0.5
   embed_micro_batch_size: 16
   min_valid_pairs: 2
-  sigreg_lambda: 0.1
   n_projections: 1024
   t_min: -5.0
   t_max: 5.0
   epps_pulley_s: 1.0
   code_system_prompt: "You are a Python programming expert. Solve the following math problem by writing a complete, executable Python program that prints the answer."
-  loss_type: jepa-separation-loss  # only supported ray/worker objective
+  loss_type: jepa-tcr-dual     # only supported ray/worker objective
   predictor_k: 0
-  # -- jepa-separation-loss / jepa-clreg-loss --
-  triplet_sigreg_lambda: 0.05  # SIGReg lambda for the separation loss
-  separation_margin: 0.1       # hinge margin (jepa-separation-loss only)
-  separation_w: 1.0
-  separation_tau: 0.5          # contrastive temperature (jepa-clreg-loss only)
-  separation_mode: dpo         # jepa-clreg-loss negative form: dpo | info
-  # -- jepa-tcr-loss only --
+  triplet_sigreg_lambda: 0.05  # SIGReg lambda for the jepa-tcr-dual loss
+  # -- jepa-tcr-dual teacher caches --
   teacher_cache_path: ""       # .pt of {dataset_index: (n_i,d)} teacher-correct targets
   n_targets_per_q: 4           # cap of cached targets used per question
   tcr_match: cycle             # anchor->target pairing: cycle | random
   jepa_anchor_set: correct     # anchors: correct | all | wrong (reward-stratified)
-  # -- jepa-tcr-reward only (teacher-alignment reward shaping; no aux loss) --
+  # -- jepa-tcr-dual teacher-alignment reward shaping --
   tcr_reward_beta: 0.5         # advantage-shaping strength (standardized score scale)
   tcr_reward_sigma_floor: 0.1  # min within-stratum std (noise guard)
-  # -- jepa-tcr-dual / jepa-tcr-reward-dual (CoT + Code dual-target) --
+  # -- jepa-tcr-dual (CoT + Code dual-target) --
   code_teacher_cache_path: ""  # .pt of {dataset_index: (n_i,d)} code-view teacher targets
   self_consist_w: 1.0          # weight of the self-consistency align term (dual differentiable)
   # -- auto-off on alignment plateau (gates both reward shaping and differentiable jepa) --
@@ -46,6 +40,7 @@ jepa:
   auto_off_patience: 10
   auto_off_min_delta: 0.002
   auto_off_warmup_steps: 20
+  auto_off_min_cos: 0.0        # plateau counter only starts once arm cosine >= this value (0.0 = disabled)
 
 # ── Algorithm (GRPO, no KL) ─────────────────────────────────────────────────
 algorithm:

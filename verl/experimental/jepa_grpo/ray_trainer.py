@@ -65,36 +65,31 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         self.jepa_cfg = JEPARayConfig.from_config(self.config.get("jepa", {}))
         self.jepa_cfg.validate(self.config.actor_rollout_ref.rollout.n)
 
-        # jepa-tcr-loss: load the offline teacher-target cache once. Keyed by the
+        # jepa-tcr-dual: load the offline CoT-view teacher-target cache once. Keyed by the
         # dataset row index (extra_info["index"]); each value is a (n_i, d) tensor
         # of L2-normalized teacher-correct target embeddings in student space.
         self.teacher_targets: dict[int, torch.Tensor] | None = None
-        if self.jepa_cfg.enable and self.jepa_cfg.loss_type in (
-            "jepa-tcr-loss", "jepa-tcr-reward", "jepa-tcr-hybrid", "jepa-tcr-dual",
-            "jepa-tcr-reward-dual"
-        ):
+        if self.jepa_cfg.enable:
             raw = torch.load(self.jepa_cfg.teacher_cache_path, map_location="cpu")
             self.teacher_targets = {
                 int(k): v.float() for k, v in raw.items() if v is not None and v.numel() > 0
             }
 
-        # Dual modes: a SECOND cache of Code-view teacher targets (coder model
-        # solutions encoded by the same frozen reference), same {index: (n_i, d)}
-        # format and shared 1536-d student space. Used by both the differentiable
-        # jepa-tcr-dual and the reward-shaping jepa-tcr-reward-dual.
         # Plateau-latch state for jepa.auto_off_enable (see _maybe_disable_jepa_signal).
-        # Per-arm plateau latches. Each tracked signal (cot/code/self for jepa-tcr-dual,
-        # or a single shaping/global signal for the reward modes) plateaus and latches
-        # INDEPENDENTLY, disabling only its own loss arm (and matching-view shaping).
-        # `_jepa_signal_off` (global) latches True only once EVERY tracked signal is off,
-        # at which point the whole JEPA block is skipped to save the forward.
+        # Per-arm plateau latches: cot/code/self each plateau and latch INDEPENDENTLY,
+        # disabling only their own loss arm (and matching-view shaping). `_jepa_signal_off`
+        # (global) latches True only once EVERY tracked signal is off, at which point the
+        # whole JEPA block is skipped to save the forward.
         self._jepa_signal_off = False
         self._off_arm: dict[str, bool] = {k: False for k in ("cot", "code", "self", "shaping", "global")}
         self._align_best: dict[str, float] = {k: float("-inf") for k in self._off_arm}
         self._align_stall: dict[str, int] = {k: 0 for k in self._off_arm}
 
+        # jepa-tcr-dual: a SECOND cache of Code-view teacher targets (coder-model
+        # solutions encoded by the same frozen reference), same {index: (n_i, d)}
+        # format and shared 1536-d student space.
         self.code_teacher_targets: dict[int, torch.Tensor] | None = None
-        if self.jepa_cfg.enable and self.jepa_cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-reward-dual"):
+        if self.jepa_cfg.enable:
             raw_code = torch.load(self.jepa_cfg.code_teacher_cache_path, map_location="cpu")
             self.code_teacher_targets = {
                 int(k): v.float() for k, v in raw_code.items() if v is not None and v.numel() > 0
@@ -221,548 +216,6 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             if cot_idxs and code_idxs and (rew[cot_idxs] > 0).any() and (rew[code_idxs] > 0).any():
                 valid_uids.append(u)
         return cot_by_uid, code_by_uid, valid_uids
-
-    def _build_jepa_batch(
-        self,
-        batch: DataProto,
-        reward_tensor: torch.Tensor,
-        view_tags: np.ndarray,
-    ) -> DataProto | None:
-        """Build per-prompt JEPA pairs from a combined CoT+Code rollout batch.
-
-        Only prompts where at least one CoT rollout AND at least one Code
-        rollout are correct are included.
-
-        The CoT view embedding uses the CoT PROMPT tokens (same for all
-        rollouts of the same prompt).  The Code view embedding uses the full
-        Code sequence (prompt + first correct response).
-
-        Returns None if fewer than min_valid_pairs pairs exist.
-        """
-        uids = batch.non_tensor_batch["uid"]
-        rew = reward_tensor.sum(dim=-1)  # (B,) summed over token dim
-
-        cot_by_uid, code_by_uid, valid_uids = self._group_rows_by_uid(uids, view_tags, rew)
-
-        if len(valid_uids) < self.jepa_cfg.min_valid_pairs:
-            return None
-
-        # -- CoT view: encode the CoT PROMPT tokens of each valid prompt --
-        # Take the first cot rollout's input_ids up to the prompt (response_mask tells us)
-        cot_input_ids = batch.batch["input_ids"]        # (B, L)
-        response_mask = batch.batch.get("response_mask", None)
-
-        cot_prompt_ids_list = []
-        cot_prompt_mask_list = []
-        cot_prompt_lengths = []
-        for u in valid_uids:
-            flat_idx = cot_by_uid[u][0]  # first cot rollout for this prompt
-            ids = cot_input_ids[flat_idx]  # (L,)
-            attn = batch.batch["attention_mask"][flat_idx]  # (L,)
-
-            if response_mask is not None:
-                # Prompt = positions where response_mask == 0 AND attention_mask == 1
-                prompt_end = int((response_mask[flat_idx] == 0).sum())
-                ids_p = ids[:prompt_end]
-                attn_p = attn[:prompt_end]
-            else:
-                ids_p = ids
-                attn_p = attn
-
-            cot_prompt_ids_list.append(ids_p)
-            cot_prompt_mask_list.append(attn_p)
-            cot_prompt_lengths.append(int(attn_p.sum()))
-
-        # Pad to same length
-        cot_max_len = max(t.shape[0] for t in cot_prompt_ids_list)
-        pad_id = self.tokenizer.pad_token_id or 0
-        cot_padded_ids = torch.stack([
-            torch.nn.functional.pad(t, (0, cot_max_len - t.shape[0]), value=pad_id)
-            for t in cot_prompt_ids_list
-        ])
-        cot_padded_mask = torch.stack([
-            torch.nn.functional.pad(t, (0, cot_max_len - t.shape[0]), value=0)
-            for t in cot_prompt_mask_list
-        ])
-
-        # -- Code view: full sequence (prompt + first correct response) --
-        code_input_ids = batch.batch["input_ids"]     # same combined batch
-        code_attn_mask = batch.batch["attention_mask"]
-
-        code_ids_list = []
-        code_mask_list = []
-        code_lengths = []
-        for u in valid_uids:
-            # Find first correct code rollout for this prompt
-            first_correct = None
-            for flat_idx in code_by_uid[u]:
-                if rew[flat_idx] > 0:
-                    first_correct = flat_idx
-                    break
-            if first_correct is None:
-                first_correct = code_by_uid[u][0]  # fallback (shouldn't happen)
-            ids = code_input_ids[first_correct]
-            attn = code_attn_mask[first_correct]
-            code_ids_list.append(ids)
-            code_mask_list.append(attn)
-            code_lengths.append(int(attn.sum()))
-
-        code_max_len = max(t.shape[0] for t in code_ids_list)
-        code_padded_ids = torch.stack([
-            torch.nn.functional.pad(t, (0, code_max_len - t.shape[0]), value=pad_id)
-            for t in code_ids_list
-        ])
-        code_padded_mask = torch.stack([
-            torch.nn.functional.pad(t, (0, code_max_len - t.shape[0]), value=0)
-            for t in code_mask_list
-        ])
-
-        jepa_batch = DataProto.from_single_dict({
-            "cot_input_ids": cot_padded_ids,
-            "cot_attn_mask": cot_padded_mask,
-            "cot_lengths": torch.tensor(cot_prompt_lengths, dtype=torch.long),
-            "code_input_ids": code_padded_ids,
-            "code_attn_mask": code_padded_mask,
-            "code_lengths": torch.tensor(code_lengths, dtype=torch.long),
-        })
-        return jepa_batch
-
-    # ------------------------------------ JEPA triplet batch construction ---
-    def _build_jepa_batch_triplet(
-        self,
-        batch: DataProto,
-        reward_tensor: torch.Tensor,
-        view_tags: np.ndarray,
-    ) -> DataProto | None:
-        """Build the jepa-separation-loss batch: full correct-CoT response, first
-        correct code response, and (when available) a "clean wrong" code
-        response per prompt.
-
-        Differs from `_build_jepa_batch` in two ways the triplet mode needs:
-          - the CoT view is the FULL sequence (prompt + response) of the
-            first CORRECT CoT rollout, not the bare prompt of rollout 0 — p^c
-            must be the predictor embedding of an actual reasoning trace.
-          - it additionally selects, per prompt, the first code rollout that
-            is a "clean wrong" one: a definite wrong answer was extracted
-            (`has_parseable_answer=True`, `is_correct=False` via
-            `compute_math_reward`), not a crash/parse failure.
-
-        Triplet-eligible prompts (have a clean-wrong rollout) are placed
-        FIRST in the returned batch; the wrong-code tensors are padded to
-        the same row count B as cot/code, with `wrong_lengths == 0` marking
-        the non-triplet rows (worker.jepa_update filters those out before
-        its forward — see `_extract_embeddings`'s existing `rlen==0` -> zero
-        embedding convention).
-
-        Returns None if fewer than min_valid_pairs (cot_correct AND
-        code_correct) pairs exist. T == 0 (no triplet-eligible prompts) is
-        allowed; the loss function handles it.
-        """
-        uids = batch.non_tensor_batch["uid"]
-        rew = reward_tensor.sum(dim=-1)
-
-        cot_by_uid, code_by_uid, valid_uids = self._group_rows_by_uid(uids, view_tags, rew)
-
-        if len(valid_uids) < self.jepa_cfg.min_valid_pairs:
-            return None
-
-        cot_input_ids = batch.batch["input_ids"]
-        cot_attn_mask = batch.batch["attention_mask"]
-        code_input_ids = batch.batch["input_ids"]
-        code_attn_mask = batch.batch["attention_mask"]
-        code_response_mask = batch.batch.get("response_mask", None)
-        reward_models = batch.non_tensor_batch.get("reward_model", [{}] * len(batch))
-        data_sources = batch.non_tensor_batch.get("data_source", [None] * len(batch))
-
-        pad_id = self.tokenizer.pad_token_id or 0
-
-        per_prompt = {}
-        triplet_eligible, others = [], []
-        for u in valid_uids:
-            # First correct CoT rollout (full sequence), and a count of how
-            # many CoT rollouts were correct (audit metric).
-            first_correct_cot = None
-            n_correct_cot = 0
-            for flat_idx in cot_by_uid[u]:
-                if rew[flat_idx] > 0:
-                    n_correct_cot += 1
-                    if first_correct_cot is None:
-                        first_correct_cot = flat_idx
-            cot_flat_idx = first_correct_cot
-
-            # First correct code rollout (full sequence)
-            code_flat_idx = None
-            for flat_idx in code_by_uid[u]:
-                if rew[flat_idx] > 0:
-                    code_flat_idx = flat_idx
-                    break
-
-            ground_truth = reward_models[code_flat_idx].get("ground_truth") if isinstance(
-                reward_models[code_flat_idx], dict
-            ) else None
-            dataset_kind = data_sources[code_flat_idx]
-
-            # First CLEAN-wrong code rollout: parseable answer extracted, but
-            # not correct. Filtered to definite-wrong BEFORE taking "first"
-            # (never let a crash/parse-failure stand in as e^w).
-            wrong_flat_idx = None
-            for cand_idx in code_by_uid[u]:
-                if rew[cand_idx] > 0:
-                    continue
-                if code_response_mask is not None:
-                    # response_mask is only the trailing `response_length` slice of
-                    # the full attention_mask (see compute_response_mask), not a
-                    # full-sequence-shaped mask — slice input_ids the same way before
-                    # applying it.
-                    response_length = code_response_mask.shape[-1]
-                    resp_ids_full = code_input_ids[cand_idx][-response_length:]
-                    resp_ids = resp_ids_full[code_response_mask[cand_idx].bool()]
-                else:
-                    resp_ids = code_input_ids[cand_idx][code_attn_mask[cand_idx].bool()]
-                if resp_ids.numel() == 0:
-                    continue
-                resp_text = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
-                result = compute_math_reward(resp_text, ground_truth, dataset_kind=dataset_kind)
-                if result.has_parseable_answer:
-                    wrong_flat_idx = cand_idx
-                    break
-
-            per_prompt[u] = (cot_flat_idx, code_flat_idx, wrong_flat_idx, n_correct_cot)
-            (triplet_eligible if wrong_flat_idx is not None else others).append(u)
-
-        ordered_uids = triplet_eligible + others   # T-prefix invariant
-        T = len(triplet_eligible)
-
-        def _real_tokens(ids_tensor, mask_tensor, flat_idx):
-            ids = ids_tensor[flat_idx]
-            attn = mask_tensor[flat_idx]
-            real = ids[attn.bool()]
-            return real, int(attn.sum())
-
-        cot_ids_list, cot_lengths = [], []
-        code_ids_list, code_lengths = [], []
-        wrong_ids_list, wrong_lengths = [], []
-        n_correct_cot_list = []
-        for u in ordered_uids:
-            cot_flat_idx, code_flat_idx, wrong_flat_idx, n_correct_cot = per_prompt[u]
-            ids, length = _real_tokens(cot_input_ids, cot_attn_mask, cot_flat_idx)
-            cot_ids_list.append(ids)
-            cot_lengths.append(length)
-            ids, length = _real_tokens(code_input_ids, code_attn_mask, code_flat_idx)
-            code_ids_list.append(ids)
-            code_lengths.append(length)
-            n_correct_cot_list.append(n_correct_cot)
-            if wrong_flat_idx is not None:
-                ids, length = _real_tokens(code_input_ids, code_attn_mask, wrong_flat_idx)
-            else:
-                ids, length = code_input_ids.new_zeros((1,)), 0
-            wrong_ids_list.append(ids)
-            wrong_lengths.append(length)
-
-        def _pad_stack(seqs, lengths_list):
-            max_len = max(s.shape[0] for s in seqs)
-            padded = torch.stack([
-                torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id)
-                for t in seqs
-            ])
-            mask = torch.stack([
-                torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, max_len - length))
-                for length in lengths_list
-            ])
-            return padded, mask
-
-        cot_padded_ids, cot_padded_mask = _pad_stack(cot_ids_list, cot_lengths)
-        code_padded_ids, code_padded_mask = _pad_stack(code_ids_list, code_lengths)
-        wrong_padded_ids, wrong_padded_mask = _pad_stack(wrong_ids_list, wrong_lengths)
-
-        jepa_batch = DataProto.from_single_dict({
-            "cot_input_ids": cot_padded_ids,
-            "cot_attn_mask": cot_padded_mask,
-            "cot_lengths": torch.tensor(cot_lengths, dtype=torch.long),
-            "code_input_ids": code_padded_ids,
-            "code_attn_mask": code_padded_mask,
-            "code_lengths": torch.tensor(code_lengths, dtype=torch.long),
-            "wrong_input_ids": wrong_padded_ids,
-            "wrong_attn_mask": wrong_padded_mask,
-            "wrong_lengths": torch.tensor(wrong_lengths, dtype=torch.long),
-        })
-        jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
-        jepa_batch.meta_info["n_triplets"] = T
-        return jepa_batch
-
-    # ------------------------------------ JEPA CLReg batch construction (v3) -
-    def _build_jepa_batch_clreg(
-        self,
-        batch: DataProto,
-        reward_tensor: torch.Tensor,
-        view_tags: np.ndarray,
-    ) -> DataProto | None:
-        """Build the jepa-clreg-loss batch: per GRPO group, ALL correct CoT
-        anchors, a per-anchor correct-code positive, and a per-anchor MATCHED
-        clean-wrong negative (cycled from that group's clean-wrong rollouts).
-
-        Layout (all three blocks have exactly A rows, aligned 1:1 by anchor):
-          - cot block: every CORRECT CoT rollout of every valid group is an anchor
-            (not just the first), so A >= number of groups.
-          - code block: anchor i paired with that group's correct code rollout
-            `correct_code[i mod n_correct_code]` (a genuine e^c_i per anchor).
-          - wrong block: anchor i paired with that group's clean-wrong code rollout
-            `group_wrongs[i mod n_group_wrongs]`; if the group has NO clean-wrong
-            rollout, that anchor's wrong row is empty (`wrong_lengths == 0`) and it
-            contributes no separation term. This is a MATCHED 1:1 pairing, not a
-            per-group cross product — the loss pairs anchor i only with wrong i.
-        worker.jepa_update filters wrong rows by `wrong_lengths > 0`; those W real
-        rows stay in anchor order, so they line up with `pred_text[wrong_mask]`.
-
-        Returns None if fewer than min_valid_pairs valid groups exist.
-        """
-        uids = batch.non_tensor_batch["uid"]
-        rew = reward_tensor.sum(dim=-1)
-
-        cot_by_uid, code_by_uid, valid_uids = self._group_rows_by_uid(uids, view_tags, rew)
-
-        if len(valid_uids) < self.jepa_cfg.min_valid_pairs:
-            return None
-
-        all_input_ids = batch.batch["input_ids"]
-        all_attn_mask = batch.batch["attention_mask"]
-        code_response_mask = batch.batch.get("response_mask", None)
-        reward_models = batch.non_tensor_batch.get("reward_model", [{}] * len(batch))
-        data_sources = batch.non_tensor_batch.get("data_source", [None] * len(batch))
-        pad_id = self.tokenizer.pad_token_id or 0
-
-        def _real_tokens(flat_idx):
-            ids = all_input_ids[flat_idx]
-            attn = all_attn_mask[flat_idx]
-            return ids[attn.bool()], int(attn.sum())
-
-        cot_ids_list, cot_lengths = [], []
-        code_ids_list, code_lengths = [], []
-        wrong_ids_list, wrong_lengths = [], []
-        n_correct_cot_list = []
-        for u in valid_uids:
-            correct_cot = [i for i in cot_by_uid[u] if rew[i] > 0]
-            correct_code = [i for i in code_by_uid[u] if rew[i] > 0]
-            if not correct_cot or not correct_code:
-                continue   # _group_rows_by_uid already guarantees both non-empty
-            n_correct_cot_list.append(len(correct_cot))
-
-            ground_truth = reward_models[correct_code[0]].get("ground_truth") if isinstance(
-                reward_models[correct_code[0]], dict
-            ) else None
-            dataset_kind = data_sources[correct_code[0]]
-
-            # This group's clean-wrong code rollouts (parseable answer, but wrong).
-            group_wrongs = []
-            for cand_idx in code_by_uid[u]:
-                if rew[cand_idx] > 0:
-                    continue
-                if code_response_mask is not None:
-                    response_length = code_response_mask.shape[-1]
-                    resp_ids_full = all_input_ids[cand_idx][-response_length:]
-                    resp_ids = resp_ids_full[code_response_mask[cand_idx].bool()]
-                else:
-                    resp_ids = all_input_ids[cand_idx][all_attn_mask[cand_idx].bool()]
-                if resp_ids.numel() == 0:
-                    continue
-                resp_text = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
-                result = compute_math_reward(resp_text, ground_truth, dataset_kind=dataset_kind)
-                if result.has_parseable_answer:
-                    group_wrongs.append(cand_idx)
-
-            # One row per anchor; code + wrong cycled within the group (matched pair).
-            for j, cot_idx in enumerate(correct_cot):
-                ids, length = _real_tokens(cot_idx)
-                cot_ids_list.append(ids)
-                cot_lengths.append(length)
-                ids, length = _real_tokens(correct_code[j % len(correct_code)])
-                code_ids_list.append(ids)
-                code_lengths.append(length)
-                if group_wrongs:
-                    ids, length = _real_tokens(group_wrongs[j % len(group_wrongs)])
-                else:
-                    ids, length = all_input_ids.new_zeros((1,)), 0
-                wrong_ids_list.append(ids)
-                wrong_lengths.append(length)
-
-        A = len(cot_ids_list)
-        W = int(sum(1 for length in wrong_lengths if length > 0))
-        if A < self.jepa_cfg.min_valid_pairs:
-            return None
-
-        def _pad_stack(seqs, lengths_list):
-            max_len = max(s.shape[0] for s in seqs)
-            rows = torch.stack([
-                torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in seqs
-            ])
-            masks = torch.stack([
-                torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, max_len - length))
-                for length in lengths_list
-            ])
-            return rows, masks
-
-        cot_padded_ids, cot_padded_mask = _pad_stack(cot_ids_list, cot_lengths)
-        code_padded_ids, code_padded_mask = _pad_stack(code_ids_list, code_lengths)
-        wrong_padded_ids, wrong_padded_mask = _pad_stack(wrong_ids_list, wrong_lengths)
-
-        jepa_batch = DataProto.from_single_dict({
-            "cot_input_ids": cot_padded_ids,
-            "cot_attn_mask": cot_padded_mask,
-            "cot_lengths": torch.tensor(cot_lengths, dtype=torch.long),
-            "code_input_ids": code_padded_ids,
-            "code_attn_mask": code_padded_mask,
-            "code_lengths": torch.tensor(code_lengths, dtype=torch.long),
-            "wrong_input_ids": wrong_padded_ids,
-            "wrong_attn_mask": wrong_padded_mask,
-            "wrong_lengths": torch.tensor(wrong_lengths, dtype=torch.long),
-        })
-        jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
-        jepa_batch.meta_info["n_anchors"] = A
-        jepa_batch.meta_info["n_wrong"] = W
-        return jepa_batch
-
-    def _build_jepa_batch_tcr(
-        self,
-        batch: DataProto,
-        reward_tensor: torch.Tensor,
-        view_tags: np.ndarray,
-    ) -> DataProto | None:
-        """Build the jepa-tcr-loss batch: correct student anchors from BOTH the
-        CoT and Code views, each paired with a PRECOMPUTED teacher-correct target
-        embedding.
-
-        Unlike the clreg/separation builders this has a single block:
-          - anchor block: every CORRECT rollout (rew>0), CoT *or* Code, of every
-            prompt whose dataset index has cached teacher targets is an anchor.
-            Both views are pulled toward the SAME teacher target under the single
-            TCR alpha, so they are drawn toward each other transitively — cross-view
-            consistency falls out without a separate term or a second weight. Wrong
-            rollouts are ignored unless jepa_anchor_set says otherwise (the teacher
-            target replaces e^c, and there is no separation term).
-          - teacher_target block: a (A, d) float tensor aligned 1:1 to the anchor
-            rows, drawn from this prompt's cached targets `Z_u` (n_u, d) by either
-            cycle (`j % n_u`) or random matching (jepa.tcr_match).
-
-        Prompts with no cached teacher targets contribute no anchors (their JEPA
-        signal is simply absent). Returns None if fewer than min_valid_pairs
-        anchors exist (worker also guards via min_valid_pairs).
-        """
-        assert self.teacher_targets is not None, "teacher target cache not loaded"
-        uids = batch.non_tensor_batch["uid"]
-        extra_infos = batch.non_tensor_batch["extra_info"]
-        rew = reward_tensor.sum(dim=-1)
-
-        all_input_ids = batch.batch["input_ids"]
-        all_attn_mask = batch.batch["attention_mask"]
-        pad_id = self.tokenizer.pad_token_id or 0
-
-        # Group anchor-eligible rows by uid AND view, preserving first-seen order.
-        # Record each uid's dataset index for the teacher-target cache lookup.
-        rows_by_uid: dict = defaultdict(lambda: {"cot": [], "code": []})
-        idx_by_uid: dict = {}
-        for i, (u, v) in enumerate(zip(uids, view_tags)):
-            if v not in ("cot", "code"):
-                continue
-            rows_by_uid[u][v].append(i)
-            if u not in idx_by_uid:
-                info = extra_infos[i]
-                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
-
-        anchor_set = self.jepa_cfg.jepa_anchor_set
-
-        def _select(idxs):
-            # Select anchors by reward according to jepa_anchor_set, then drop
-            # degenerate zero-length rows (they would yield a zero embedding and
-            # pollute the stratified means; normal rollouts always carry the prompt).
-            if anchor_set == "correct":
-                sel = [i for i in idxs if rew[i] > 0]
-            elif anchor_set == "wrong":
-                sel = [i for i in idxs if rew[i] <= 0]
-            else:  # "all"
-                sel = list(idxs)
-            return [i for i in sel if int(all_attn_mask[i].sum()) > 0]
-
-        cot_ids_list, cot_lengths, target_list = [], [], []
-        group_id_list, is_correct_list = [], []
-        crossview_pairs: list = []
-        n_correct_cot_list = []
-        group_counter = 0
-        for u in dict.fromkeys(uids):  # dedup, preserves first-seen order
-            ds_idx = idx_by_uid.get(u)
-            targets = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
-            if targets is None or targets.numel() == 0:
-                continue
-            cot_sel = _select(rows_by_uid[u]["cot"])
-            code_sel = _select(rows_by_uid[u]["code"])
-            if not cot_sel and not code_sel:
-                continue
-            n_u = targets.shape[0]
-            n_correct_cot_list.append(sum(1 for i in cot_sel + code_sel if rew[i] > 0))
-            gid = group_counter
-            group_counter += 1
-            # Pair the k-th correct CoT with the k-th correct Code and give the PAIR
-            # one SHARED teacher target. Minimizing both views' alignment to the same
-            # point pulls CoT and Code of this prompt together AND toward the teacher.
-            # When a slot has BOTH views present we also record the (CoT-row, Code-row)
-            # anchor positions in `crossview_pairs` so the worker can add the CoT<->Code
-            # alignment as another term in the TCR align slot. Unequal counts:
-            # leftover unpaired anchors still align to their slot's target but form no
-            # cross-view pair. All anchors share the [x, y_S, [PRED]] format.
-            n_slots = max(len(cot_sel), len(code_sel))
-            for k in range(n_slots):
-                if self.jepa_cfg.tcr_match == "random":
-                    t_row = int(torch.randint(n_u, (1,)).item())
-                else:  # cycle
-                    t_row = k % n_u
-                slot_pos = {}
-                for view, sel in (("cot", cot_sel), ("code", code_sel)):
-                    if k >= len(sel):
-                        continue
-                    idx = sel[k]
-                    ids = all_input_ids[idx][all_attn_mask[idx].bool()]
-                    slot_pos[view] = len(cot_ids_list)  # anchor-row position
-                    cot_ids_list.append(ids)
-                    cot_lengths.append(int(all_attn_mask[idx].sum()))
-                    target_list.append(targets[t_row])
-                    group_id_list.append(gid)
-                    is_correct_list.append(bool(rew[idx] > 0))
-                if "cot" in slot_pos and "code" in slot_pos:
-                    crossview_pairs.append((slot_pos["cot"], slot_pos["code"]))
-
-        A = len(cot_ids_list)
-        if A < self.jepa_cfg.min_valid_pairs:
-            return None
-
-        max_len = max(s.shape[0] for s in cot_ids_list)
-        cot_padded_ids = torch.stack([
-            torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in cot_ids_list
-        ])
-        cot_padded_mask = torch.stack([
-            torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, max_len - length))
-            for length in cot_lengths
-        ])
-        teacher_target = torch.nn.functional.normalize(torch.stack(target_list, dim=0).float(), dim=-1)
-
-        # Per-anchor cross-view partner row (or -1). Shape (A,) so it batches with the
-        # anchor rows; the worker reconstructs unordered (CoT,Code) pairs from it.
-        crossview_partner = torch.full((A,), -1, dtype=torch.long)
-        for a, b in crossview_pairs:
-            crossview_partner[a] = b
-            crossview_partner[b] = a
-
-        jepa_batch = DataProto.from_single_dict({
-            "cot_input_ids": cot_padded_ids,
-            "cot_attn_mask": cot_padded_mask,
-            "cot_lengths": torch.tensor(cot_lengths, dtype=torch.long),
-            "teacher_target": teacher_target,
-            "anchor_group_id": torch.tensor(group_id_list, dtype=torch.long),
-            "anchor_is_correct": torch.tensor(is_correct_list, dtype=torch.bool),
-            "crossview_partner": crossview_partner,
-        })
-        jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
-        jepa_batch.meta_info["n_anchors"] = A
-        jepa_batch.meta_info["n_crossview_pairs"] = len(crossview_pairs)
-        return jepa_batch
 
     def _build_jepa_batch_tcr_dual(
         self,
@@ -953,12 +406,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         reward_tensor: torch.Tensor,
         view_tags: np.ndarray,
     ) -> tuple[torch.Tensor, dict]:
-        """jepa-tcr-reward: teacher-alignment reward shaping (NO differentiable loss).
+        """jepa-tcr-dual teacher-alignment reward shaping (folded into token_level_rewards).
 
         Scores every CoT *and* Code rollout's [PRED] latent against its question's
         cached teacher-correct targets, standardizes the score WITHIN its
         (uid, view, is_correct) reward stratum, and returns a per-row additive
-        advantage term β·ŝ_i. Both views are shaped symmetrically with the dual-view
+        reward term β·ŝ_i. Both views are shaped symmetrically with the dual-view
         JEPA loss arm.
 
         Within-stratum centering makes the term (a) invariant to a global latent
@@ -980,10 +433,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         all_attn_mask = batch.batch["attention_mask"]
         pad_id = self.tokenizer.pad_token_id or 0
 
-        # Per-view target cache: in jepa-tcr-reward-dual, CODE rows are scored against
-        # the CODE teacher cache and COT rows against the COT cache (each rollout aligned
-        # to its own view's teacher). Other reward modes have no code cache and score
-        # both views against the single CoT cache (back-compat).
+        # Per-view target cache: CODE rows are scored against the CODE teacher cache and
+        # COT rows against the COT cache (each rollout aligned to its own view's teacher).
         code_cache = self.code_teacher_targets
 
         def _cache_for(view: str):
@@ -1072,18 +523,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
     def _tracked_signals(self) -> list[tuple[str, str]]:
         """(arm_name, metric_key) pairs to track for the plateau latch (higher=better).
 
-        jepa-tcr-dual tracks its three arms independently; the reward-shaping modes
-        track a single shaping signal; other differentiable modes track CoT alignment.
-        An explicit `auto_off_metric` override collapses to one global signal (legacy).
+        jepa-tcr-dual tracks its three arms (cot/code/self) independently. An explicit
+        `auto_off_metric` override collapses to one global signal (legacy).
         """
         if self.jepa_cfg.auto_off_metric:
             return [("global", self.jepa_cfg.auto_off_metric)]
-        lt = self.jepa_cfg.loss_type
-        if lt == "jepa-tcr-dual":
-            return [("cot", "jepa/cos_cot"), ("code", "jepa/cos_code"), ("self", "jepa/cos_self")]
-        if lt in ("jepa-tcr-reward", "jepa-tcr-reward-dual", "jepa-tcr-hybrid"):
-            return [("shaping", "shaping/s_mean_correct")]
-        return [("cot", "jepa/cos_cot")]
+        return [("cot", "jepa/cos_cot"), ("code", "jepa/cos_code"), ("self", "jepa/cos_self")]
 
     def _maybe_disable_jepa_signal(self, metrics: dict) -> None:
         """Latch each tracked JEPA signal OFF independently once it plateaus.
@@ -1113,6 +558,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 continue
             val = float(val)
             if val == 0.0:   # no anchors of this view this step -> not a real measurement
+                continue
+            # Gate: plateau counter does not start until this arm has crossed the
+            # minimum cosine threshold (auto_off_min_cos). Keeps the latch from
+            # firing during the early ramp before alignment is established.
+            if cfg.auto_off_min_cos > 0.0 and val < cfg.auto_off_min_cos:
+                metrics[f"jepa/align_best_{arm}"] = self._align_best[arm]
+                metrics[f"jepa/align_stall_{arm}"] = float(self._align_stall[arm])
                 continue
             if val > self._align_best[arm] + cfg.auto_off_min_delta:
                 self._align_best[arm] = val
@@ -1302,14 +754,73 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
-                # ── Step 2: rewards & advantages (full cot+code batch) ──
-                with simple_timer("cot_reward_adv", timing_raw):
+                # ── Step 2: rewards (full cot+code batch) ──
+                # Advantage is computed later (Step 2.7), AFTER TCR shaping is folded into
+                # token_level_rewards, so the shaping flows through the same per-group
+                # standardization as the raw reward.
+                with simple_timer("cot_reward", timing_raw):
                     if self.use_rm and "rm_scores" not in batch.batch.keys():
                         batch = batch.union(self._compute_reward_colocate(batch))
                     reward_tensor, reward_extra_infos = extract_reward(batch)
                     batch.batch["token_level_scores"] = reward_tensor
                     if not self.config.algorithm.use_kl_in_reward:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                # Sleep rollout replicas BEFORE the TCR-shaping forward (Step 2.5) and
+                # old_log_prob so vLLM releases its KV reservation before the actor runs the
+                # forward-only embedding pass / recomputes log-probs (the ~7 GiB lm_head logits
+                # block). Otherwise that block is allocated while vLLM still holds its full KV
+                # pool -> OOM near the card ceiling ("Tried to allocate 6.90 GiB ... 92.14 GiB
+                # in use"). Called exactly once per step; vLLM is woken again only at weight_sync_2.
+                #
+                # DRAIN GUARD: issuing a vLLM RPC (sleep_replicas IS one) immediately after
+                # generate_sequences() reproducibly segfaults vLLM's executor when there is no
+                # real wall-clock gap (see the same-class issue + _time.sleep(5) guard in the
+                # Step-1 cot/code generation block). Only the reward block (~15 ms) now sits
+                # between generation and the sleep, so we reinstate the documented short drain
+                # before the sleep RPC.
+                self._log_gpu_mem("after_gen_before_sleep")
+                import time as _time
+                _time.sleep(float(os.environ.get("JEPA_VLLM_DRAIN_S", "5")))
+                with simple_timer("sleep_replicas_1", timing_raw):
+                    self.checkpoint_manager.sleep_replicas()
+                self._log_gpu_mem("after_sleep")
+
+                # ── Step 2.5: TCR reward shaping (idea #2) ───────────────
+                # Fold teacher-alignment β·ŝ into token_level_rewards BEFORE compute_advantage,
+                # so the signal is standardized per group together with the raw reward — rather
+                # than riding post-hoc on the already-normalized advantage (which also double-
+                # counted under DAPO's norm_adv_by_std_in_grpo). vLLM is asleep and the actor
+                # FSDP is warm here, so the forward-only embedding pass is memory-safe.
+                if self.jepa_cfg.enable and not self._jepa_signal_off:
+                    with simple_timer("tcr_reward_shaping", timing_raw):
+                        view_tags_s = batch.non_tensor_batch["view"]
+                        shape_per_row, shaping_metrics = self._compute_tcr_reward_shaping(
+                            batch=batch, reward_tensor=reward_tensor, view_tags=view_tags_s,
+                        )
+                        # Per-view plateau latch: zero shaping for a view whose arm is off.
+                        if self._off_arm["cot"]:
+                            shape_per_row[torch.from_numpy(view_tags_s == "cot")] = 0.0
+                        if self._off_arm["code"]:
+                            shape_per_row[torch.from_numpy(view_tags_s == "code")] = 0.0
+                        # Add β·ŝ at each row's LAST valid response token (matching the sparse
+                        # token_level_scores layout), so GRPO's per-sequence reward sum gains
+                        # exactly β·ŝ — not β·ŝ × response_len (which spreading across the mask
+                        # would cause).
+                        tlr = batch.batch["token_level_rewards"]
+                        rmask = batch.batch["response_mask"]
+                        B_s, T_s = tlr.shape
+                        col_idx = torch.arange(T_s, device=tlr.device).unsqueeze(0).expand(B_s, T_s)
+                        masked_idx = torch.where(rmask.bool(), col_idx, torch.full_like(col_idx, -1))
+                        last_idx = masked_idx.max(dim=1).values  # (B,), -1 if no response token
+                        has_resp = last_idx >= 0
+                        shape_vec = shape_per_row.to(device=tlr.device, dtype=tlr.dtype)
+                        sel = has_resp.nonzero(as_tuple=True)[0]
+                        tlr[sel, last_idx[sel]] += shape_vec[sel]
+                        metrics.update(shaping_metrics)
+
+                # ── Step 2.7: advantages (over the SHAPED token_level_rewards) ──
+                with simple_timer("compute_adv", timing_raw):
                     batch = compute_advantage(
                         batch,
                         adv_estimator=self.config.algorithm.adv_estimator,
@@ -1319,27 +830,6 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
                         config=self.config.algorithm,
                     )
-
-                # Sleep rollout replicas BEFORE old_log_prob so vLLM releases its KV
-                # reservation before the actor recomputes log-probs (the ~7 GiB lm_head
-                # logits block). Previously the sleep sat AFTER old_log_prob, so that block
-                # was allocated while vLLM still held its full KV pool -> OOM near the card
-                # ceiling (logs: "Tried to allocate 6.90 GiB ... 92.14 GiB in use").
-                # Called exactly once per step; vLLM is woken again only at weight_sync_2.
-                #
-                # DRAIN GUARD: issuing a vLLM RPC (sleep_replicas IS one) immediately after
-                # generate_sequences() reproducibly segfaults vLLM's executor when there is no
-                # real wall-clock gap (see the same-class issue + _time.sleep(5) guard in the
-                # Step-1 cot/code generation block). The old ordering was safe only because
-                # old_log_prob (~14 s of FSDP work) sat between generation and the sleep; the
-                # reward/advantage block above is only ~15 ms, so we reinstate the documented
-                # short drain before the sleep RPC.
-                self._log_gpu_mem("after_gen_before_sleep")
-                import time as _time
-                _time.sleep(float(os.environ.get("JEPA_VLLM_DRAIN_S", "5")))
-                with simple_timer("sleep_replicas_1", timing_raw):
-                    self.checkpoint_manager.sleep_replicas()
-                self._log_gpu_mem("after_sleep")
 
                 # ── Step 3: Compute old log-probs & (optional) ref ──────
                 # Actor/FSDP-only (compute_log_prob); does NOT call vLLM. All rollout outputs
@@ -1353,35 +843,6 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         ref_log_prob = self._compute_ref_log_prob(batch)
                         batch = batch.union(ref_log_prob)
                 self._log_gpu_mem("after_old_log_prob")
-
-                # ── Step 3.5: TCR reward shaping (idea #2) ───────────────
-                # Fold teacher-alignment into the advantage BEFORE the actor update,
-                # so the signal rides the policy gradient (generation channel) rather
-                # than a separate latent-pull backward. vLLM is asleep and the actor
-                # FSDP is warm here, so the forward-only embedding pass is memory-safe.
-                if self.jepa_cfg.enable and not self._jepa_signal_off and self.jepa_cfg.loss_type in (
-                    "jepa-tcr-reward", "jepa-tcr-hybrid", "jepa-tcr-reward-dual", "jepa-tcr-dual"
-                ):
-                    with simple_timer("tcr_reward_shaping", timing_raw):
-                        view_tags_s = batch.non_tensor_batch["view"]
-                        shape_per_row, shaping_metrics = self._compute_tcr_reward_shaping(
-                            batch=batch, reward_tensor=reward_tensor, view_tags=view_tags_s,
-                        )
-                        # Per-view plateau latch: zero shaping for a view whose arm is off.
-                        # (jepa-tcr-dual only; reward modes use the single 'shaping' arm and
-                        # are gated wholesale by `_jepa_signal_off` at the block entry.)
-                        if self.jepa_cfg.loss_type == "jepa-tcr-dual":
-                            if self._off_arm["cot"]:
-                                shape_per_row[torch.from_numpy(view_tags_s == "cot")] = 0.0
-                            if self._off_arm["code"]:
-                                shape_per_row[torch.from_numpy(view_tags_s == "code")] = 0.0
-                        rmask = batch.batch["response_mask"]
-                        shape_term = shape_per_row.to(
-                            device=batch.batch["advantages"].device,
-                            dtype=batch.batch["advantages"].dtype,
-                        ).unsqueeze(-1) * rmask
-                        batch.batch["advantages"] = batch.batch["advantages"] + shape_term
-                        metrics.update(shaping_metrics)
 
                 # ── Step 4: GRPO actor update ────────────────────────────
                 with simple_timer("update_actor", timing_raw):
@@ -1399,45 +860,21 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 cot_mask_rows = (view_tags == "cot")
                 code_mask_rows = (view_tags == "code")
 
-                # jepa-tcr-reward AND jepa-tcr-reward-dual apply their signal purely as
-                # advantage shaping in Step 3.5 (no auxiliary loss / backward), so skip the
-                # JEPA loss block entirely. jepa-tcr-hybrid AND jepa-tcr-dual keep BOTH: the
-                # Step-3.5 shaping (beta) AND this differentiable loss arm.
-                if self.jepa_cfg.enable and not self._jepa_signal_off and self.jepa_cfg.loss_type not in (
-                    "jepa-tcr-reward", "jepa-tcr-reward-dual"
-                ):
+                # jepa-tcr-dual keeps BOTH the Step-2.5 reward shaping (beta) AND this
+                # differentiable dual loss arm (align_cot + align_code + self-consistency
+                # + SIGReg).
+                if self.jepa_cfg.enable and not self._jepa_signal_off:
                     metrics["jepa/n_cot"] = float(n_cot)
                     metrics["jepa/n_code"] = float(n_code)
 
-                    # Build JEPA pairs
+                    # Build JEPA pairs (jepa-tcr-dual: SEPARATE CoT and Code student
+                    # anchor blocks, each pulled toward its own cached teacher target).
                     with simple_timer("jepa_build_batch", timing_raw):
-                        # Both supported loss_types use a 3-view (cot/code/clean-wrong)
-                        # builder; clreg (v3) collects ALL anchors/wrongs per group
-                        # with group ids, the hinge mode one matched triplet per group.
-                        if self.jepa_cfg.loss_type == "jepa-tcr-dual":
-                            jepa_batch = self._build_jepa_batch_tcr_dual(
-                                batch=batch,
-                                reward_tensor=reward_tensor,
-                                view_tags=view_tags,
-                            )
-                        elif self.jepa_cfg.loss_type in ("jepa-tcr-loss", "jepa-tcr-hybrid"):
-                            jepa_batch = self._build_jepa_batch_tcr(
-                                batch=batch,
-                                reward_tensor=reward_tensor,
-                                view_tags=view_tags,
-                            )
-                        elif self.jepa_cfg.loss_type == "jepa-clreg-loss":
-                            jepa_batch = self._build_jepa_batch_clreg(
-                                batch=batch,
-                                reward_tensor=reward_tensor,
-                                view_tags=view_tags,
-                            )
-                        else:
-                            jepa_batch = self._build_jepa_batch_triplet(
-                                batch=batch,
-                                reward_tensor=reward_tensor,
-                                view_tags=view_tags,
-                            )
+                        jepa_batch = self._build_jepa_batch_tcr_dual(
+                            batch=batch,
+                            reward_tensor=reward_tensor,
+                            view_tags=view_tags,
+                        )
 
                     if jepa_batch is not None:
                         # JEPA update on worker (embedding extract + backward + EMA sync)

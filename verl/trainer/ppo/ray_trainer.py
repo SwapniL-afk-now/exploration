@@ -1143,25 +1143,14 @@ class RayPPOTrainer:
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
-    def _maybe_save_best_checkpoint(self, val_metrics: dict):
-        """Save a separate `best/` checkpoint snapshot whenever the combined
-        selection score across `trainer.best_ckpt_sources` improves. The score is
-        the equal-weight mean of two metrics, each averaged over the sources:
-          - avg@k  (`val-core/{source}/acc/mean@{k}`)  — mean per-sample accuracy
-          - pass@k (`val-core/{source}/acc/best@{k}/mean`) — best-of-k success rate
+    def _score_for_metric(self, metric: str, val_metrics: dict, best_ckpt_sources: list):
+        """Compute the scalar selection score for one metric string.
 
-        Using both guards against picking a checkpoint that looks good on only one
-        axis (e.g. high pass@k from a few lucky samples while avg@k regresses, or
-        vice versa). This mirrors the DeepScaleR/Dr.GRPO convention of selecting on
-        a held-out core math benchmark set, independent of the `latest` checkpoint
-        kept via `max_actor_ckpt_to_keep`.
+        Returns (score, avg_at_k, pass_at_k) or (None, None, None) if the
+        required keys are absent from val_metrics.
         """
-        best_ckpt_sources = self.config.trainer.get("best_ckpt_sources", None)
-        if not best_ckpt_sources:
-            return
-
-        avg_scores = []   # avg@k  per source (mean accuracy)
-        pass_scores = []  # pass@k per source (best-of-k)
+        avg_scores = []
+        pass_scores = []
         for source in best_ckpt_sources:
             avg_matches = [v for k, v in val_metrics.items() if k.startswith(f"val-core/{source}/acc/mean@")]
             pass_matches = [
@@ -1172,61 +1161,90 @@ class RayPPOTrainer:
                 avg_scores.append(avg_matches[0])
             if pass_matches:
                 pass_scores.append(pass_matches[0])
-        # Selection metric (trainer.best_ckpt_metric):
-        #   "combined" (default) = 0.5*(avg@k + pass@k)  — both axes, full k
-        #   "avg"                = mean avg@k across sources only (ignore pass@k)
-        #   "pass"               = mean pass@k across sources only (ignore avg@k)
-        #   "avg@N" / "pass@N"   = select on a SPECIFIC sub-budget N, read from the
-        #                          per-source `val/{source}/avg_at_N` / `pass_at_N`
-        #                          metrics (e.g. "avg@8" selects on avg accuracy over 8
-        #                          samples rather than the full @k).
-        metric = str(self.config.trainer.get("best_ckpt_metric", "combined")).lower()
+
         avg_at_k = sum(avg_scores) / len(avg_scores) if avg_scores else None
         pass_at_k = sum(pass_scores) / len(pass_scores) if pass_scores else None
+
         if "@" in metric and metric.split("@", 1)[0] in ("avg", "pass"):
             kind, _, budget = metric.partition("@")
-            field = f"{kind}_at_{budget}"  # avg_at_8 | pass_at_8
+            field = f"{kind}_at_{budget}"
             sub_scores = [
                 val_metrics[f"val/{source}/{field}"]
                 for source in best_ckpt_sources
                 if f"val/{source}/{field}" in val_metrics
             ]
             if not sub_scores:
-                return
-            combined = sum(sub_scores) / len(sub_scores)
+                return None, avg_at_k, pass_at_k
+            return sum(sub_scores) / len(sub_scores), avg_at_k, pass_at_k
         elif metric == "avg":
             if avg_at_k is None:
-                return
-            combined = avg_at_k
+                return None, avg_at_k, pass_at_k
+            return avg_at_k, avg_at_k, pass_at_k
         elif metric == "pass":
             if pass_at_k is None:
-                return
-            combined = pass_at_k
+                return None, avg_at_k, pass_at_k
+            return pass_at_k, avg_at_k, pass_at_k
         else:
-            # Combined needs BOTH present so the score is comparable across steps.
+            # combined: needs both
             if avg_at_k is None or pass_at_k is None:
-                return
-            combined = 0.5 * (avg_at_k + pass_at_k)
-        if combined > getattr(self, "best_val_score", float("-inf")):
-            self.best_val_score = combined
-            avg_s = f"{avg_at_k:.4f}" if avg_at_k is not None else "n/a"
-            pass_s = f"{pass_at_k:.4f}" if pass_at_k is not None else "n/a"
-            print(
-                f"New best checkpoint at step {self.global_steps}: "
-                f"metric={metric} score={combined:.4f} (avg@k={avg_s}, pass@k={pass_s}) "
-                f"over {best_ckpt_sources}"
-            )
-            best_local_path = os.path.join(self.config.trainer.default_local_dir, "best", "actor")
-            self.actor_rollout_wg.save_checkpoint(
-                best_local_path, None, self.global_steps, max_ckpt_to_keep=1, tag="best"
-            )
-            avg_w = f"{avg_at_k:.6f}" if avg_at_k is not None else "nan"
-            pass_w = f"{pass_at_k:.6f}" if pass_at_k is not None else "nan"
-            with open(os.path.join(self.config.trainer.default_local_dir, "best", "best_val_acc.txt"), "w") as f:
-                f.write(
-                    f"step={self.global_steps} metric={metric} score={combined:.6f} "
-                    f"avg_at_k={avg_w} pass_at_k={pass_w} sources={best_ckpt_sources}\n"
+                return None, avg_at_k, pass_at_k
+            return 0.5 * (avg_at_k + pass_at_k), avg_at_k, pass_at_k
+
+    def _maybe_save_best_checkpoint(self, val_metrics: dict):
+        """Save best/ checkpoint(s) whenever their selection score improves.
+
+        Supports two config shapes:
+          - trainer.best_ckpt_metric  (str, legacy): single metric, saves to best/
+          - trainer.best_ckpt_metrics (list[str]):   one dir per metric, saves to
+            best_{metric}/ (e.g. best_avg@8/ and best_pass@8/).  When this key is
+            present it takes precedence over best_ckpt_metric.
+
+        Selection metric strings:
+          "combined"  = 0.5*(avg@k + pass@k)
+          "avg"       = mean avg@k across sources
+          "pass"      = mean pass@k across sources
+          "avg@N"     = mean avg_at_N sub-budget score
+          "pass@N"    = mean pass_at_N sub-budget score
+        """
+        best_ckpt_sources = self.config.trainer.get("best_ckpt_sources", None)
+        if not best_ckpt_sources:
+            return
+
+        # Build list of (metric_str, dir_name) pairs to evaluate.
+        metrics_list = self.config.trainer.get("best_ckpt_metrics", None)
+        if metrics_list:
+            # Sanitise metric string for use as a directory name (@ -> _at_).
+            entries = [(str(m).lower(), f"best_{str(m).lower().replace('@', '_at_')}") for m in metrics_list]
+        else:
+            metric = str(self.config.trainer.get("best_ckpt_metric", "combined")).lower()
+            entries = [(metric, "best")]
+
+        for metric, dir_name in entries:
+            combined, avg_at_k, pass_at_k = self._score_for_metric(metric, val_metrics, best_ckpt_sources)
+            if combined is None:
+                continue
+
+            score_attr = f"_best_val_score_{dir_name}"
+            if combined > getattr(self, score_attr, float("-inf")):
+                setattr(self, score_attr, combined)
+                avg_s = f"{avg_at_k:.4f}" if avg_at_k is not None else "n/a"
+                pass_s = f"{pass_at_k:.4f}" if pass_at_k is not None else "n/a"
+                print(
+                    f"New best checkpoint [{dir_name}] at step {self.global_steps}: "
+                    f"metric={metric} score={combined:.4f} (avg@k={avg_s}, pass@k={pass_s}) "
+                    f"over {best_ckpt_sources}"
                 )
+                best_local_path = os.path.join(self.config.trainer.default_local_dir, dir_name, "actor")
+                self.actor_rollout_wg.save_checkpoint(
+                    best_local_path, None, self.global_steps, max_ckpt_to_keep=1, tag=dir_name
+                )
+                avg_w = f"{avg_at_k:.6f}" if avg_at_k is not None else "nan"
+                pass_w = f"{pass_at_k:.6f}" if pass_at_k is not None else "nan"
+                with open(os.path.join(self.config.trainer.default_local_dir, dir_name, "best_val_acc.txt"), "w") as f:
+                    f.write(
+                        f"step={self.global_steps} metric={metric} score={combined:.6f} "
+                        f"avg_at_k={avg_w} pass_at_k={pass_w} sources={best_ckpt_sources}\n"
+                    )
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
