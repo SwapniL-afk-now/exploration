@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Offline teacher-target precompute for jepa.loss_type='jepa-tcr-loss'.
+"""Offline teacher-target precompute for jepa.loss_type='jepa-tcr-dual'.
 
 Phase 1 of the two-phase TCR workflow (run this to completion BEFORE training):
 

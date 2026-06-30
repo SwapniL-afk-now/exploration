@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Phase 1 of the jepa-tcr-loss workflow: generate + verify + encode teacher targets.
-# Run this to completion BEFORE launching training with JEPA_LOSS_TYPE=jepa-tcr-loss;
+# Phase 1 of the jepa-tcr-dual workflow: generate + verify + encode teacher targets.
+# Run this to completion BEFORE launching training with JEPA_LOSS_TYPE=jepa-tcr-dual;
 # point that run's TEACHER_CACHE at the OUT path produced here.
 set -euo pipefail
 

@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # JEPA-GRPO (dual-cache) | Qwen2.5-1.5B-Instruct | Ray + FSDP + hybrid-engine vLLM
 #
-# Default JEPA_LOSS_TYPE=jepa-tcr-reward-dual: per-view TEACHER-ALIGNMENT REWARD SHAPING
-# (NO differentiable JEPA backward). Each rollout's [PRED] latent is scored against its
-# OWN view's teacher cache (CoT->CoT cache, code->code cache), standardized within its
-# (uid, view, is_correct) reward stratum, and added to the advantage as beta*s_hat. The
-# signal rides the GRPO policy gradient.
-#   L_total = L_DrGRPO(CoT+Code) over advantages shaped by beta*s_hat (per-view teacher align)
-#
-# Set JEPA_LOSS_TYPE=jepa-tcr-dual instead for the DIFFERENTIABLE variant (align_cot +
-# align_code + self-consistency + SIGReg as a separate alpha-weighted backward).
+# JEPA_LOSS_TYPE=jepa-tcr-dual (the only supported objective): the DIFFERENTIABLE dual loss
+# (align_cot + align_code + self-consistency + SIGReg as a separate alpha-weighted backward)
+# AND per-view teacher-alignment reward shaping. Each rollout's [PRED] latent is scored against
+# its OWN view's teacher cache (CoT->CoT cache, code->code cache), standardized within its
+# (uid, view, is_correct) reward stratum; beta*s_hat is folded into token_level_rewards BEFORE
+# the GRPO advantage. Set TCR_REWARD_BETA=0 to disable shaping (pure differentiable dual).
+#   L_total = L_DrGRPO(CoT+Code) + alpha * L_jepa-tcr-dual, advantages shaped by beta*s_hat
 #
 # Prereqs (build once, offline):
 #   - CoT  cache: precompute_teacher_targets.py --view cot  -> TEACHER_CACHE
@@ -117,7 +115,7 @@ JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-tcr-dual}
 # Tied-weight predictor tokens (paper §3.1). MUST be >0 for a real predictor
 # (k=0 => Pred(x)=x identity; the shaping score would then be on the raw last token).
 LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
-# Reward-shaping knobs (jepa-tcr-reward-dual): advantage term = beta * standardized score.
+# Reward-shaping knobs (jepa-tcr-dual): reward term = beta * standardized score.
 TCR_REWARD_BETA=${TCR_REWARD_BETA:-0.5}
 TCR_REWARD_SIGMA_FLOOR=${TCR_REWARD_SIGMA_FLOOR:-0.1}
 # Auto-disable the JEPA aux signal once teacher-alignment plateaus: after AUTO_OFF_WARMUP

@@ -180,7 +180,7 @@ rollout, not backward.
 
 ## 11. Proposed tuning experiments (staged)
 
-All edits are env vars on `run_deepseek_r1_distill_qwen_1_5b_ray.sh` unless noted.
+All edits are env vars on `run_qwen_1_5b_ray.sh` unless noted.
 
 | Exp | change | expected speed | expected memory | OOM risk | compare | success |
 |---|---|---|---|---|---|---|

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU unit tests for jepa-tcr-reward advantage shaping (idea #2).
+"""CPU unit tests for jepa-tcr-dual teacher-alignment reward shaping (idea #2).
 
 Targets the pure standardization helper `JEPARayPPOTrainer._stratified_shaping`,
 which carries the load-bearing invariants:
@@ -104,8 +104,8 @@ def test_sigma_floor_caps_amplification():
 
 
 def test_config_validation_beta_and_floor():
-    base = dict(enable=True, loss_type="jepa-tcr-reward",
-                teacher_cache_path="/x.pt", n_cot=8, n_code=0)
+    base = dict(enable=True, loss_type="jepa-tcr-dual",
+                teacher_cache_path="/x.pt", code_teacher_cache_path="/y.pt", n_cot=4, n_code=4)
     JEPARayConfig.from_config({**base, "tcr_reward_beta": 0.5}).validate(8)  # ok
     with pytest.raises(ValueError):
         JEPARayConfig.from_config({**base, "tcr_reward_beta": -1.0}).validate(8)

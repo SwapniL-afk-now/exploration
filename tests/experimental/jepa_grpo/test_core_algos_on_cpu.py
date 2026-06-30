@@ -17,7 +17,7 @@ sigreg_loss to zero-mean / unit per-dim variance first.
 import torch
 import torch.nn.functional as F
 
-from verl.experimental.jepa_grpo.core_algos import llm_jepa_clreg_loss, sigreg_loss
+from verl.experimental.jepa_grpo.core_algos import sigreg_loss
 
 
 def _isotropic_sphere(n, d, seed):
@@ -93,76 +93,3 @@ def test_sigreg_is_finite_on_total_collapse():
     loss = sigreg_loss(x, M=512)
     assert torch.isfinite(loss), loss.item()
     assert loss.item() > 0.0
-
-
-# --------------------------------------------------------------------------- #
-# CLReg matched-pair separation loss
-# --------------------------------------------------------------------------- #
-
-def _clreg_inputs(d=16, seed=0):
-    """3 anchors; anchors 0 and 2 have a matched wrong, anchor 1 does not
-    (wrong_mask=[T,F,T], so the no-matched-wrong path is exercised). e^w holds
-    the 2 matched negatives, aligned to the True positions of wrong_mask."""
-    g = torch.Generator().manual_seed(seed)
-    praw = torch.randn(3, d, generator=g, requires_grad=True)
-    ecraw = torch.randn(3, d, generator=g, requires_grad=True)
-    ewraw = torch.randn(2, d, generator=g, requires_grad=True)
-    wrong_mask = torch.tensor([True, False, True])
-    return praw, ecraw, ewraw, wrong_mask
-
-
-def _norm_pool(praw, ecraw, ewraw):
-    p, ec, ew = (F.normalize(t, dim=-1) for t in (praw, ecraw, ewraw))
-    return p, ec, ew, torch.cat([p, ec, ew], dim=0)
-
-
-def test_clreg_loss_finite_both_modes():
-    for mode in ("dpo", "info"):
-        praw, ecraw, ewraw, wm = _clreg_inputs()
-        p, ec, ew, pool = _norm_pool(praw, ecraw, ewraw)
-        loss, m = llm_jepa_clreg_loss(p, ec, ew, wm, pool, tau=0.5, mode=mode, M=64)
-        assert torch.isfinite(loss), (mode, loss.item())
-        assert m["jepa/n_pairs"] == 3
-        assert m["jepa/n_wrong"] == 2
-
-
-def test_clreg_gradient_flows_through_all_poles():
-    """LLM-JEPA has NO stop-gradient: Pred, Enc(Text), Enc(Code) are the same
-    shared encoder, so gradient flows through p AND e^c AND e^w simultaneously.
-    With lambda_=0 (SIGReg off) every pole that participates in align/separation
-    must receive a real gradient."""
-    for mode in ("dpo", "info"):
-        praw, ecraw, ewraw, wm = _clreg_inputs(seed=3)
-        p, ec, ew, _ = _norm_pool(praw, ecraw, ewraw)
-        loss, _ = llm_jepa_clreg_loss(
-            p, ec, ew, wm, torch.cat([p, ec, ew]), tau=0.5, mode=mode, lambda_=0.0, M=64
-        )
-        g_p, g_ec, g_ew = torch.autograd.grad(loss, [praw, ecraw, ewraw], allow_unused=True)
-        assert g_p is not None and g_p.abs().sum() > 0, (mode, "p got no grad")
-        assert g_ec is not None and g_ec.abs().sum() > 0, (mode, "e^c got no grad")
-        assert g_ew is not None and g_ew.abs().sum() > 0, (mode, "e^w got no grad")
-
-
-def test_clreg_matched_pairs_only():
-    """Separation pairs anchor i with wrong i only (matched), so e^w gradient is a
-    block-diagonal map: wrong row 0 (paired with anchor 0) must get gradient only
-    via anchor 0's predictor, never via anchor 2's."""
-    praw, ecraw, ewraw, wm = _clreg_inputs(seed=8)
-    p, ec, ew, _ = _norm_pool(praw, ecraw, ewraw)
-    # Loss recomputed from praw rows so we can probe per-anchor influence.
-    loss, _ = llm_jepa_clreg_loss(p, ec, ew, wm, torch.cat([p, ec, ew]), tau=0.5, lambda_=0.0, M=64)
-    # d loss / d ewraw[0] depends on praw[0] (anchor 0) but NOT praw[2] (anchor 2):
-    g_ew0 = torch.autograd.grad(loss, ewraw, create_graph=True)[0][0]   # (d,)
-    cross = torch.autograd.grad(g_ew0.sum(), praw, retain_graph=True)[0]
-    assert cross[0].abs().sum() > 0, "wrong 0 should couple to its matched anchor 0"
-    assert cross[2].abs().sum() == 0, "wrong 0 must not couple to unmatched anchor 2"
-
-
-def test_clreg_handles_no_wrongs():
-    praw, ecraw, _, _ = _clreg_inputs(seed=5)
-    p, ec = F.normalize(praw, dim=-1), F.normalize(ecraw, dim=-1)
-    ew = torch.zeros(0, p.shape[-1])
-    wm = torch.zeros(3, dtype=torch.bool)
-    loss, m = llm_jepa_clreg_loss(p, ec, ew, wm, torch.cat([p, ec, ew]), tau=0.5, mode="dpo", M=64)
-    assert torch.isfinite(loss)
-    assert m["jepa/separation_loss"] == 0.0

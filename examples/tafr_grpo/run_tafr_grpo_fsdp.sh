@@ -34,7 +34,7 @@ export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
 export WANDB_SILENT=${WANDB_SILENT:-true}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
 # Default model/data/benchmark settings mirror
-# examples/jepa_grpo_trainer/run_deepseek_r1_distill_qwen_1_5b_ray.sh so TAFR-GRPO
+# examples/jepa_grpo_trainer/run_qwen_1_5b_ray.sh so TAFR-GRPO
 # is an apples-to-apples comparison against the JEPA-GRPO runs.
 TAFR_VARIANT=${TAFR_VARIANT:-full}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-tafr_grpo_${TAFR_VARIANT}_qwen25math_1_5b-${RUN_TIMESTAMP}}

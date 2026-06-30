@@ -9,8 +9,9 @@
 #   - ActorRolloutRefWorker extended with EMA target encoder + JEPA update
 #   - RayPPOTrainer extended with Code-view rollout and LeJEPA loss step
 #
-# L_total = L_DrGRPO(CoT) + alpha * L_JEPA(...), where L_JEPA is selected by
-# JEPA_LOSS_TYPE below: lejepa | llm-jepa-loss | jepa-triplet-loss
+# L_total = L_DrGRPO(CoT+Code) + alpha * L_JEPA(jepa-tcr-dual): differentiable dual teacher
+# alignment (align_cot + align_code + self-consistency + SIGReg) plus per-view beta reward
+# shaping folded into the reward before the advantage.
 #
 # Before first run:
 #   hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --local-dir /workspace/models/DeepSeek-R1-Distill-Qwen-1.5B
@@ -161,88 +162,41 @@ ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}   # more parallel sequences d
 # backward much less diluted) — JEPA's update was dominating the shared LoRA
 # weights instead of the RL signal. 0.01 is a first attempt at parity; compare
 # jepa/grad_norm vs actor/grad_norm in this run to see if it lands closer.
-ALPHA=${ALPHA:-0.005}
+ALPHA=${ALPHA:-0.1}   # matches the jepa-tcr-dual reference (run_qwen25_1_5b_dual_ray.sh); lower toward 0.005 if jepa/grad_norm dominates actor/grad_norm
 EMA_DECAY=${EMA_DECAY:-0.99}
 EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-8}
 MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
-# JEPA objective (one of four; see verl/experimental/jepa_grpo/core_algos.py):
-#   "lejepa"             - squared-Euclidean align (live CoT vs EMA-target Code)
-#                          + SIGReg. Uses SIGREG_LAMBDA.
-#   "llm-jepa-loss"      - LLM-JEPA paper arXiv:2509.14252 cosine prediction loss
-#                          (one shared encoder, no EMA) + SIGReg. Uses SIGREG_LAMBDA.
-#   "jepa-triplet-loss"  - llm-jepa-loss + a hard-negative triplet term against a
-#                          "clean wrong" code rollout; see
-#                          jepa-llm-hard-neg-triplet-mode-AUDIT.md. Uses
-#                          TRIPLET_MARGIN/TRIPLET_W/TRIPLET_SIGREG_LAMBDA.
-#   "jepa-separation-loss" - llm-jepa-loss + a direct correct/wrong code-pair
-#                          separation hinge (creates the gap the triplet's
-#                          vanishing gradient cannot). Uses
-#                          SEPARATION_MARGIN/SEPARATION_W/TRIPLET_SIGREG_LAMBDA.
-#   "jepa-clreg-loss"    - v3 CLReg objective (jepa_separation_loss.md): replaces
-#                          the 1:1 hinge with a per-GRPO-group FULL cross product
-#                          of every correct anchor against EVERY wrong joint
-#                          embedding, scored by a DPO log-sigmoid at temperature
-#                          SEPARATION_TAU (or InfoNCE when SEPARATION_MODE=info).
-#                          Uses SEPARATION_TAU/SEPARATION_MODE/SEPARATION_W/
-#                          TRIPLET_SIGREG_LAMBDA (SEPARATION_MARGIN is ignored).
-#   "jepa-tcr-loss"      - Teacher-Correct Representation alignment (correct-only):
-#                          NO separation term. Each correct student CoT anchor is
-#                          pulled toward a PRECOMPUTED teacher-correct target (offline
-#                          3B teacher solution text encoded by a frozen student-size
-#                          reference model -> 1536-d student space, no projector),
-#                          + SIGReg over the student preds alone. Run
-#                          precompute_teacher_targets.py first; point TEACHER_CACHE at
-#                          its output. Uses TEACHER_CACHE/N_TARGETS_PER_Q/TCR_MATCH/
-#                          TRIPLET_SIGREG_LAMBDA (SEPARATION_* are ignored).
-JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-clreg-loss}
-case "${JEPA_LOSS_TYPE}" in
-    lejepa|llm-jepa-loss|jepa-triplet-loss|jepa-separation-loss|jepa-clreg-loss|jepa-tcr-loss|jepa-tcr-reward|jepa-tcr-hybrid) ;;
-    *) echo "ERROR: JEPA_LOSS_TYPE='${JEPA_LOSS_TYPE}' is invalid. Must be one of:" \
-            "lejepa | llm-jepa-loss | jepa-triplet-loss | jepa-separation-loss | jepa-clreg-loss | jepa-tcr-loss | jepa-tcr-reward | jepa-tcr-hybrid" >&2
-       exit 1 ;;
-esac
-# jepa-tcr-reward only: teacher-alignment REWARD SHAPING (no aux loss). Reuses
-# TEACHER_CACHE; JEPA_REWARD_BETA is the shaping strength, JEPA_SIGMA_FLOOR the
-# within-stratum std floor.
+# JEPA objective — the ray/worker path supports a single value:
+#   "jepa-tcr-dual" - Differentiable DUAL teacher alignment (align_cot + align_code +
+#                     self-consistency + SIGReg) AND per-view beta reward shaping, both
+#                     active. Requires BOTH the CoT cache (TEACHER_CACHE) and the Code
+#                     cache (CODE_TEACHER_CACHE), and n_code > 0. See
+#                     verl/experimental/jepa_grpo/core_algos.llm_jepa_tcr_dual_loss.
+JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-tcr-dual}
+# Teacher-alignment REWARD SHAPING strength. beta*s_hat is folded into token_level_rewards
+# BEFORE advantage normalization (ray_trainer.py Step 2.5). Set JEPA_REWARD_BETA=0 to disable.
 JEPA_REWARD_BETA=${JEPA_REWARD_BETA:-0.5}
-JEPA_SIGMA_FLOOR=${JEPA_SIGMA_FLOOR:-0.1}
-# jepa-tcr-loss only: offline teacher-target cache + per-question target controls.
-# TEACHER_CACHE is the .pt written by precompute_teacher_targets.py (keyed by dataset
-# index). TCR_MATCH is "cycle" (deterministic anchor->target) or "random".
+JEPA_SIGMA_FLOOR=${JEPA_SIGMA_FLOOR:-0.1}   # within-stratum std floor (noise guard)
+# Offline teacher-target caches (build with precompute_teacher_targets.py --view {cot,code}).
+# Both REQUIRED. TCR_MATCH is "cycle" (deterministic anchor->target) or "random".
 TEACHER_CACHE=${TEACHER_CACHE:-/workspace/jepa-grpo-cache/teacher_targets.pt}
+CODE_TEACHER_CACHE=${CODE_TEACHER_CACHE:-/workspace/jepa-grpo-cache/code_teacher_targets.pt}
 N_TARGETS_PER_Q=${N_TARGETS_PER_Q:-4}
 TCR_MATCH=${TCR_MATCH:-cycle}
-# Which student rollouts become JEPA anchors: "correct" (default; today's behavior),
-# "all" (correct + wrong, reward-stratified prompt-averaged), or "wrong" (ablation).
+# Self-consistency term weight: pred_CoT -> stop-grad Code_S boundary read.
+SELF_CONSIST_W=${SELF_CONSIST_W:-1.0}
+# Auto-disable the JEPA aux signal once teacher-alignment plateaus (PER-ARM cos_cot/cos_code/
+# cos_self). ON by default.
+AUTO_OFF_ENABLE=${AUTO_OFF_ENABLE:-True}
+AUTO_OFF_PATIENCE=${AUTO_OFF_PATIENCE:-10}
+AUTO_OFF_MIN_DELTA=${AUTO_OFF_MIN_DELTA:-0.002}
+AUTO_OFF_WARMUP=${AUTO_OFF_WARMUP:-20}
+# Which student rollouts become JEPA anchors: "correct" (default), "all", or "wrong".
 JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
-# SIGReg anti-collapse weight for the modes that read the GENERAL lambda
-# (lejepa, llm-jepa-loss). The triplet/separation modes use TRIPLET_SIGREG_LAMBDA
-# instead (see worker.py: lambda_=cfg.triplet_sigreg_lambda there vs
-# cfg.sigreg_lambda here). Pretrained LLMs need far more SIGReg weight than
-# LeJEPA's from-scratch default (0.1) to fight their anisotropy prior.
-SIGREG_LAMBDA=${SIGREG_LAMBDA:-0.5}
-# Number of LLM-JEPA tied-weight predictor tokens (paper §3.1). Only used when
-# JEPA_LOSS_TYPE=llm-jepa-loss or jepa-triplet-loss; k=0 is the identity predictor,
-# Pred(x) = x.
+# Number of tied-weight predictor tokens (paper §3.1); must be > 0 for a real predictor.
 LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
-# Hard-negative triplet hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-triplet-loss.
-TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.1}
-TRIPLET_W=${TRIPLET_W:-1.0}
-TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.3}   # SIGReg must both replace the dropped LLM-JEPA NTP anti-collapse leg AND fight the pretrained LLM's anisotropy prior, so it needs far more weight than LeJEPA's from-scratch default (0.05/0.1); 0.3 still lost (pos/neg re-converged, margin went negative by step ~24)
-# Separation-loss hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-separation-loss.
-# L_sep = (1/T) Σ relu(SEPARATION_MARGIN - (1 - <e^c,e^w>)); creates the correct/wrong
-# gap the triplet's vanishing (e^c-e^w) gradient could not. e^w is added to the SIGReg
-# pool here so it cannot collapse. SEPARATION_W=1.0 => unweighted negative term.
-SEPARATION_MARGIN=${SEPARATION_MARGIN:-0.1}
-SEPARATION_W=${SEPARATION_W:-0.0}   # 0.0 => separation/CLReg negative term OFF (align + SIGReg only)
-# CLReg (v3) hyperparameters. Only used when JEPA_LOSS_TYPE=jepa-clreg-loss
-# (SEPARATION_MARGIN is ignored in that mode). SEPARATION_TAU is the contrastive
-# temperature replacing the hinge margin; SEPARATION_MODE selects the negative
-# form: "dpo" (averaged-pairwise log-sigmoid, doc default) or "info" (InfoNCE).
-# Re-tune SEPARATION_W once live (bounded hinge -> unbounded log-sigmoid); sweep
-# SEPARATION_TAU in {0.1,0.3,0.5,0.7,0.9}.
-SEPARATION_TAU=${SEPARATION_TAU:-0.5}
-SEPARATION_MODE=${SEPARATION_MODE:-dpo}
+# SIGReg lambda for the jepa-tcr-dual loss.
+TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.05}
 # Number of random projection directions for SIGReg's Epps-Pulley statistic.
 # Each direction is a random unit vector in R^d, where d is the encoder's final
 # hidden size (DeepSeek-R1-Distill-Qwen-1.5B: hidden_size=1536; d is read off the
@@ -284,6 +238,15 @@ BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["aime24","aime25","aime26","amc23"]'}
 USE_KL_LOSS=${USE_KL_LOSS:-false}   # anchors policy to the reference model; false -> drop KL entirely
 KL_COEF=${KL_COEF:-0.001}   # NOTE: 0.0 previously caused a grad_norm/ppo_kl blowup in this exact script — watch actor/ppo_kl and actor/grad_norm closely
 ########################### end user-adjustable ###########################
+
+# jepa-tcr-dual needs BOTH teacher caches; fail fast if either is missing.
+for c in "${TEACHER_CACHE}" "${CODE_TEACHER_CACHE}"; do
+    if [[ ! -f "${c}" ]]; then
+        echo "ERROR: teacher-target cache not found: ${c}" >&2
+        echo "Build it with examples/jepa_grpo_trainer/precompute_teacher_targets.py --view {cot,code}" >&2
+        exit 1
+    fi
+done
 
 DATA=(
     data.train_files="$TRAIN_FILE"
@@ -344,6 +307,7 @@ ROLLOUT=(
 )
 
 JEPA=(
+    jepa.enable=True
     jepa.n_cot=${N_COT}
     jepa.n_code=${N_CODE}
     jepa.alpha=${ALPHA}
@@ -352,21 +316,22 @@ JEPA=(
     jepa.min_valid_pairs=${MIN_VALID_PAIRS}
     jepa.loss_type=${JEPA_LOSS_TYPE}
     jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
-    jepa.sigreg_lambda=${SIGREG_LAMBDA}
     jepa.triplet_sigreg_lambda=${TRIPLET_SIGREG_LAMBDA}
-    jepa.separation_margin=${SEPARATION_MARGIN}
-    jepa.separation_w=${SEPARATION_W}
-    jepa.separation_tau=${SEPARATION_TAU}
-    jepa.separation_mode=${SEPARATION_MODE}
     jepa.n_projections=${N_PROJECTIONS}
     jepa.alpha_warmup_steps=${ALPHA_WARMUP_STEPS}
     jepa.max_grad_norm=${JEPA_MAX_GRAD_NORM}
     jepa.teacher_cache_path=${TEACHER_CACHE}
+    jepa.code_teacher_cache_path=${CODE_TEACHER_CACHE}
     jepa.n_targets_per_q=${N_TARGETS_PER_Q}
     jepa.tcr_match=${TCR_MATCH}
     jepa.jepa_anchor_set=${JEPA_ANCHOR_SET}
+    jepa.self_consist_w=${SELF_CONSIST_W}
     jepa.tcr_reward_beta=${JEPA_REWARD_BETA}
     jepa.tcr_reward_sigma_floor=${JEPA_SIGMA_FLOOR}
+    jepa.auto_off_enable=${AUTO_OFF_ENABLE}
+    jepa.auto_off_patience=${AUTO_OFF_PATIENCE}
+    jepa.auto_off_min_delta=${AUTO_OFF_MIN_DELTA}
+    jepa.auto_off_warmup_steps=${AUTO_OFF_WARMUP}
 )
 
 TRAINER=(

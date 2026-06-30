@@ -4,7 +4,7 @@
 > (the one the live training run uses), which is a **single-GPU, HYBRID, colocated
 > FSDP-actor + vLLM** setup with LoRA and **no KL / no reference model**.
 
-Relevant config (from `examples/jepa_grpo_trainer/run_deepseek_r1_distill_qwen_1_5b_ray.sh`,
+Relevant config (from `examples/jepa_grpo_trainer/run_qwen_1_5b_ray.sh`,
 `config/jepa_grpo_ray_trainer.yaml`, `config/jepa_grpo_ray_qwen25_1_5b.yaml`):
 - `trainer.n_gpus_per_node=1`, model = Qwen2.5-Math-1.5B-Instruct (bf16 ≈ 3 GB).
 - LoRA rank 512, `target_modules=all-linear`, **no merge** → `lora_as_adapter = True`.

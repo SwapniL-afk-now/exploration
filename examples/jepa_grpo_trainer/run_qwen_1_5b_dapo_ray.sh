@@ -229,7 +229,7 @@ AUTO_OFF_MIN_DELTA=${AUTO_OFF_MIN_DELTA:-0.002}
 AUTO_OFF_WARMUP=${AUTO_OFF_WARMUP:-20}
 # Plateau counter only starts once every arm's cosine similarity reaches this value.
 # Prevents the latch from firing before alignment is genuinely established.
-AUTO_OFF_MIN_COS=${AUTO_OFF_MIN_COS:-0.8}
+AUTO_OFF_MIN_COS=${AUTO_OFF_MIN_COS:-0.0}
 # Which student rollouts become JEPA anchors: "correct" (default), "all" (correct + wrong,
 # reward-stratified prompt-averaged), or "wrong" (ablation).
 JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
