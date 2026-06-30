@@ -364,7 +364,7 @@ ROLLOUT=(
 )
 
 JEPA=(
-    jepa.enable=True
+    jepa.enable=${JEPA_ENABLE:-True}
     jepa.n_cot=${N_COT}
     jepa.n_code=${N_CODE}
     jepa.alpha=${ALPHA}
